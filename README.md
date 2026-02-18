@@ -12,19 +12,19 @@ This pipeline predicts NMR backbone chemical shifts from protein structures usin
 4. Combines structural encoding with retrieved neighbor shifts through cross-attention and query-conditioned transfer
 5. Predicts per-residue backbone chemical shifts with calibrated confidence estimates
 
-## Key Improvements Over Prior Pipeline
+## Features
 
-### 1. Outlier Filtering with Provenance Tracking
-Physical range filters (e.g., CA: 40-70 ppm, N: 100-140 ppm) remove approximately 3,266 impossible shift values. Every removed value is logged with its protein ID, residue ID, column, original value, and the rule that triggered removal. The `FilterLog` class in `data_quality.py` provides full audit trails saved to CSV.
+### Outlier Filtering with Provenance Tracking
+Physical range filters (e.g., CA: 40-70 ppm, N: 100-140 ppm) remove impossible shift values. Every removed value is logged with its protein ID, residue ID, column, original value, and the rule that triggered removal. The `FilterLog` class in `data_quality.py` provides full audit trails saved to CSV.
 
-### 2. Dense Distance Features
-The original pipeline computed 863 distance columns from all backbone+sidechain atom pairs, most of which were sparse (>50% NaN). This pipeline uses only 7 backbone/near-backbone atoms (C, CA, CB, H, HA, N, O) producing approximately 21 dense atom pair distances per residue. An attention mechanism over these distance features replaces the sparse matrix approach.
+### Dense Distance Features
+Uses 7 backbone/near-backbone atoms (C, CA, CB, H, HA, N, O) producing approximately 21 dense atom pair distances per residue. An attention mechanism over these distance features learns which pairwise distances matter most.
 
-### 3. PDB Quality Selection with Provenance
-`01_select_pdb_structures.py` evaluates multiple PDB structures per BMRB entry and selects the best based on resolution, R-factor, sequence identity to the BMRB sequence, and completeness. Every selection decision is logged: which PDBs were considered, why each was accepted or rejected, and the final choice.
+### PDB Quality Selection
+`01_select_pdb_structures.py` evaluates multiple PDB structures per BMRB entry and selects the best based on resolution, R-factor, sequence identity to the BMRB sequence, and completeness. Every selection decision is logged.
 
-### 4. Physics-Inspired Features
-New features computed in `physics_features.py`:
+### Physics-Based Features
+Computed in `physics_features.py`:
 - **Ring current effects**: Estimated ring current shifts for H and HA from nearby aromatic residues (PHE, TYR, TRP, HIS)
 - **Half-sphere exposure (HSE)**: Upper and lower hemisphere CA neighbor counts, providing a continuous measure of burial
 - **BLOSUM62 scores**: 20-dimensional evolutionary profile encoding per residue
@@ -33,8 +33,8 @@ New features computed in `physics_features.py`:
 
 These are encoded by a 2-layer MLP (`PhysicsFeatureEncoder` in `model.py`) producing a 64-dimensional vector concatenated with the structural encoding.
 
-### 5. Random Coil Correction in Retrieval Transfer
-When transferring chemical shifts from retrieved neighbors to the query residue, the `QueryConditionedTransfer` module applies random coil correction BEFORE weighted averaging:
+### Random Coil Correction in Retrieval Transfer
+When transferring chemical shifts from retrieved neighbors to the query residue, the `QueryConditionedTransfer` module applies random coil correction before weighted averaging:
 
 ```
 corrected = RC[query_aa] + (retrieved_shift - RC[retrieved_aa])
@@ -42,9 +42,9 @@ corrected = RC[query_aa] + (retrieved_shift - RC[retrieved_aa])
 
 This preserves the structural (secondary) shift contribution while adjusting for the intrinsic chemical shift difference between amino acid types. Random coil values are from Schwarzinger et al. (2001) and Wishart et al. (1995).
 
-### 6. Shift Imputation Model
+### Shift Imputation Model
 `08_train_imputation.py` trains a second-stage model (`imputation_model.py`) that leverages partially observed chemical shifts to predict missing ones. It combines three information sources:
-- **Structural encoding**: Same distance attention + CNN + spatial attention as the structure-only model
+- **Structural encoding**: Distance attention + CNN + spatial attention
 - **Observed shift context**: A 1D CNN over the residue's known shifts (with masking), so available measurements inform the prediction
 - **Shift-aware retrieval**: Retrieved neighbor shifts are re-weighted based on observed shift similarity
 
@@ -147,7 +147,7 @@ See `requirements.txt`. Core dependencies:
 After running the full pipeline:
 
 ```
-homologies_better_data/
+shift_prediction/
 ├── 00_fetch_bmrb_shifts.py        # Step 0: BMRB data download
 ├── 01_select_pdb_structures.py    # Step 1: PDB quality selection
 ├── 02_compile_dataset.py          # Step 2: Dataset compilation
