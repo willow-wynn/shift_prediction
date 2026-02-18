@@ -1,0 +1,30 @@
+# Core deep learning
+torch>=2.0
+numpy>=1.24
+pandas>=1.5
+scipy>=1.10
+
+# Bioinformatics
+biopython>=1.80
+
+# Protein language model
+fair-esm
+
+# Approximate nearest neighbor search (install ONE of these)
+faiss-cpu
+# faiss-gpu  # uncomment if using GPU FAISS
+
+# Embedding storage
+h5py>=3.0
+
+# Machine learning utilities
+scikit-learn>=1.2
+
+# Visualization
+matplotlib>=3.6
+
+# Experiment tracking (optional but recommended)
+wandb
+
+# Progress bars
+tqdm
