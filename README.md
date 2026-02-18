@@ -7,7 +7,7 @@ Retrieval-augmented deep learning pipeline for predicting backbone chemical shif
 This pipeline predicts NMR backbone chemical shifts from protein structures using a retrieval-augmented architecture. Given a protein's PDB structure and sequence, it:
 
 1. Extracts structural features (distances, angles, DSSP, spatial neighbors)
-2. Computes physics-based features (ring currents, half-sphere exposure, BLOSUM62 scores, hydrogen bond geometry)
+2. Computes physics-based features (ring currents, half-sphere exposure, hydrogen bond geometry)
 3. Uses ESM-2 embeddings to retrieve similar residues from a training database via FAISS
 4. Combines structural encoding with retrieved neighbor shifts through cross-attention and query-conditioned transfer
 5. Predicts per-residue backbone chemical shifts with calibrated confidence estimates
@@ -27,9 +27,7 @@ Uses 7 backbone/near-backbone atoms (C, CA, CB, H, HA, N, O) producing approxima
 Computed in `physics_features.py`:
 - **Ring current effects**: Estimated ring current shifts for H and HA from nearby aromatic residues (PHE, TYR, TRP, HIS)
 - **Half-sphere exposure (HSE)**: Upper and lower hemisphere CA neighbor counts, providing a continuous measure of burial
-- **BLOSUM62 scores**: 20-dimensional evolutionary profile encoding per residue
 - **Hydrogen bond geometry**: Distances and energies from DSSP H-bond assignments
-- **Order parameter**: Backbone rigidity estimate from B-factors
 
 These are encoded by a 2-layer MLP (`PhysicsFeatureEncoder` in `model.py`) producing a 64-dimensional vector concatenated with the structural encoding.
 
@@ -48,7 +46,7 @@ This preserves the structural (secondary) shift contribution while adjusting for
 - **Observed shift context**: A 1D CNN over the residue's known shifts (with masking), so available measurements inform the prediction
 - **Shift-aware retrieval**: Retrieved neighbor shifts are re-weighted based on observed shift similarity
 
-Training uses curriculum masking: initially only the target shift is masked, then random additional shifts are progressively masked to improve robustness. Each sample is a (residue, shift_type) pair predicting a single scalar.
+Each sample is a (residue, shift_type) pair predicting a single scalar.
 
 ## Pipeline Steps
 
@@ -62,19 +60,19 @@ Training uses curriculum masking: initially only the target shift is masked, the
 | 05 | `05_build_training_cache.py` | Pre-compute retrieval results and save memory-mapped cache for fast training I/O |
 | 06 | `06_train.py` | Train the retrieval-augmented model with 5-fold cross-validation |
 | 07 | `07_evaluate.py` | Comprehensive evaluation: per-shift metrics, baselines, retrieval analysis, plots |
-| 08 | `08_train_imputation.py` | Train shift imputation model (structure + observed shifts + retrieval) with curriculum masking |
+| 08 | `08_train_imputation.py` | Train shift imputation model (structure + observed shifts + retrieval) |
 | 09 | `09_eval_imputation.py` | Evaluate imputation model against structure-only, mean, and random coil baselines |
 
 ## Utility Modules
 
 | Module | Description |
 |--------|-------------|
-| `config.py` | Central configuration: paths, amino acid mappings, shift ranges, hyperparameters, BLOSUM62 matrix |
+| `config.py` | Central configuration: paths, amino acid mappings, shift ranges, hyperparameters |
 | `model.py` | Neural network: distance attention, CNN encoder, spatial attention, physics encoder, retrieval cross-attention, query-conditioned transfer with random coil correction |
 | `dataset.py` | Memory-efficient cached dataset with disk-mapped retrieval data and physics features |
 | `data_quality.py` | `FilterLog` class and filtering functions (outliers, duplicates, non-standard residues) with full provenance |
 | `random_coil.py` | Random coil shift tables (Schwarzinger 2001, Wishart 1995) and correction functions |
-| `physics_features.py` | Ring current estimation, HSE computation, BLOSUM62 encoding, H-bond features |
+| `physics_features.py` | Ring current estimation, HSE computation, H-bond features |
 | `distance_features.py` | Dense backbone distance computation from PDB coordinates |
 | `spatial_neighbors.py` | K-nearest spatial neighbor finder with minimum sequence separation |
 | `alignment.py` | Biopython-based sequence alignment for BMRB-to-PDB residue mapping |

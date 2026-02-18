@@ -67,21 +67,6 @@ WANDB_PROJECT = "shift-imputation-v2"
 NUM_WORKERS = 4
 PREFETCH = 2
 
-# Curriculum masking schedule
-CURRICULUM_START_EPOCH = 50    # Start ramping extra masking
-CURRICULUM_END_EPOCH = 350     # Reach max extra masking
-CURRICULUM_MAX_MASK_RATE = 0.00  # Max fraction of extra shifts to mask (Disabled for now)
-
-
-def get_curriculum_mask_rate(epoch):
-    """Compute extra masking rate based on curriculum schedule."""
-    if epoch < CURRICULUM_START_EPOCH:
-        return 0.0
-    if epoch >= CURRICULUM_END_EPOCH:
-        return CURRICULUM_MAX_MASK_RATE
-    progress = (epoch - CURRICULUM_START_EPOCH) / (CURRICULUM_END_EPOCH - CURRICULUM_START_EPOCH)
-    return CURRICULUM_MAX_MASK_RATE * progress
-
 
 # ============================================================================
 # Outlier Handling (same as 06_train.py)
@@ -288,9 +273,6 @@ def main():
     print(f"Fold: {args.fold}")
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
-    print(f"Curriculum masking: epochs {CURRICULUM_START_EPOCH}-{CURRICULUM_END_EPOCH}, "
-          f"max {CURRICULUM_MAX_MASK_RATE:.0%}")
-
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ========== Load base datasets ==========
@@ -486,9 +468,6 @@ def main():
                 'n_params': n_params,
                 'train_samples': len(train_dataset),
                 'test_samples': len(test_dataset),
-                'curriculum_start': CURRICULUM_START_EPOCH,
-                'curriculum_end': CURRICULUM_END_EPOCH,
-                'curriculum_max_mask': CURRICULUM_MAX_MASK_RATE,
             },
         )
 
@@ -503,11 +482,7 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
 
-        # Update curriculum masking
-        mask_rate = get_curriculum_mask_rate(epoch)
-        train_dataset.set_extra_mask_rate(mask_rate)
-
-        print(f"\nEpoch {epoch}/{args.epochs} (extra_mask: {mask_rate:.1%})")
+        print(f"\nEpoch {epoch}/{args.epochs}")
 
         train_loss = train_epoch(
             model, train_loader, optimizer, device, scaler,
@@ -549,8 +524,6 @@ def main():
         # Evaluate periodically
         eval_results = None
         if epoch % 5 == 0 or epoch == args.epochs:
-            # Disable extra masking for evaluation
-            test_dataset.set_extra_mask_rate(0.0)
             eval_results = evaluate(
                 model, test_loader, device, stats, shift_cols,
                 delta=args.huber_delta,
@@ -562,7 +535,6 @@ def main():
                     'test/loss': eval_results['loss'],
                     'test/mae': eval_results['mae'],
                     'lr': current_lr,
-                    'curriculum/mask_rate': mask_rate,
                 }
                 for col, mae in eval_results['per_shift_mae'].items():
                     log[f'test/mae_{col}'] = mae
@@ -591,7 +563,6 @@ def main():
             wandb.log({
                 'train/loss': train_loss,
                 'lr': current_lr,
-                'curriculum/mask_rate': mask_rate,
             }, step=epoch)
 
     if use_wandb:

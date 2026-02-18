@@ -43,9 +43,6 @@ class ImputationDataset(Dataset):
     - Sample index: (global_idx, prot_idx, shift_type_idx)
     - __getitem__ masks the target shift from context before returning
 
-    Curriculum masking:
-    - extra_mask_rate: fraction of additional shifts to randomly mask (beyond target)
-    - Set via set_extra_mask_rate() during training for curriculum schedule
     """
 
     def __init__(
@@ -54,14 +51,12 @@ class ImputationDataset(Dataset):
         imputation_cache_dir: str,
         n_shifts: int,
         context_window: int = 5,
-        extra_mask_rate: float = 0.0,
     ):
         self.base = base_dataset
         self.cache_dir = Path(imputation_cache_dir)
         self.n_shifts = n_shifts
         self.context_window = context_window
         self.window_size = 2 * context_window + 1
-        self.extra_mask_rate = extra_mask_rate
 
         # Load imputation-specific data
         self.shift_values = torch.from_numpy(
@@ -77,10 +72,6 @@ class ImputationDataset(Dataset):
         self._shift_type_templates = torch.zeros(n_shifts, n_shifts, dtype=torch.float32)
         for i in range(n_shifts):
             self._shift_type_templates[i, i] = 1.0
-
-    def set_extra_mask_rate(self, rate: float):
-        """Set the curriculum extra masking rate (0.0 to 1.0)."""
-        self.extra_mask_rate = rate
 
     def __len__(self):
         return len(self.samples)
@@ -127,14 +118,6 @@ class ImputationDataset(Dataset):
         # Mask the target shift at center position
         context_observed_shifts[center, shift_type_idx] = 0.0
         context_shift_masks[center, shift_type_idx] = 0.0
-
-        # Curriculum: randomly mask additional shifts
-        if self.extra_mask_rate > 0 and self.extra_mask_rate < 1.0:
-            extra_mask = torch.rand(W, self.n_shifts) < self.extra_mask_rate
-            # Don't double-mask the target (already masked)
-            extra_mask[center, shift_type_idx] = False
-            context_observed_shifts[extra_mask] = 0.0
-            context_shift_masks[extra_mask] = 0.0
 
         # Center observed shifts (for retrieval conditioning)
         center_observed_shifts = context_observed_shifts[center].clone()

@@ -346,9 +346,6 @@ def main():
     test_dataset = load_imputation_dataset(
         test_base, test_imp_cache, n_shifts, context_window=CONTEXT_WINDOW,
     )
-    # No extra masking during evaluation
-    test_dataset.set_extra_mask_rate(0.0)
-
     print(f"  Test samples: {len(test_dataset):,}")
 
     loader = DataLoader(
