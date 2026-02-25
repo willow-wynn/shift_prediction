@@ -12,7 +12,7 @@ Key design differences from model.py:
 - Shift context as a first-class input stream via 1D CNN
 - Shift-type conditioning: predicts one shift at a time (like src/train_imputation.py)
 - Observed shifts fed into retrieval attention for shift-aware re-ranking
-- No BLOSUM62 features (redundant with residue embedding)
+- No per-residue evolutionary features (redundant with residue embedding)
 - No per-shift prediction heads (single output head conditioned on shift_type)
 
 Reuses from model.py:

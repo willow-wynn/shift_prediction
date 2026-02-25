@@ -52,7 +52,6 @@ from config import (
     WEIGHT_DECAY, OUTLIER_STD_THRESHOLD,
     CONTEXT_WINDOW, K_SPATIAL_NEIGHBORS, K_RETRIEVED,
     MAX_VALID_DISTANCES,
-    SHIFT_RANGES,
 )
 from dataset import (
     CachedRetrievalDataset,

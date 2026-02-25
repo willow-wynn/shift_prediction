@@ -40,7 +40,6 @@ from config import (
     ESM_EMBED_DIM,
     ESM_REPR_LAYER,
     AA_3_TO_1,
-    NONSTANDARD_MAP,
 )
 
 # ESM imports
@@ -57,16 +56,11 @@ except ImportError:
 def three_to_one(residue_code: str) -> str:
     """Convert three-letter amino acid code to single letter.
 
-    Handles standard residues, known non-standard residues, and unknowns.
+    Handles standard residues and unknowns.
     """
     code = str(residue_code).upper().strip()
-    # Direct standard lookup
     if code in AA_3_TO_1:
         return AA_3_TO_1[code]
-    # Non-standard mapping (e.g. MSE -> MET -> M)
-    mapped = NONSTANDARD_MAP.get(code)
-    if mapped and mapped in AA_3_TO_1:
-        return AA_3_TO_1[mapped]
     return 'X'
 
 

@@ -5,7 +5,7 @@ Chemical Shift Predictor with Retrieval Augmentation (Better Data Pipeline)
 Adapted from homologies/model_with_retrieval.py with the following modifications:
 
 1. NEW PhysicsFeatureEncoder module:
-   - Encodes physics features (ring currents, HSE, BLOSUM62, H-bonds, order param)
+   - Encodes physics features (ring currents, HSE, H-bonds, order param)
    - Simple MLP: Linear -> GELU -> Dropout -> Linear producing 64-dim output
    - Output concatenated with base encoder, expanding base_encoder_dim by 64
 
@@ -222,14 +222,13 @@ class PhysicsFeatureEncoder(nn.Module):
     """
     Encode physics-based features into a fixed-dim representation.
 
-    Input features (~28 dimensions):
+    Input features (~8 dimensions):
         - ring_current_h, ring_current_ha (2)
         - hse_up, hse_down, hse_ratio (3)
-        - blosum62_0 .. blosum62_19 (20)
         - hbond_dist_1, hbond_energy_1 (2)
         - hbond_dist_2, hbond_energy_2 (2) [currently unused placeholders -- kept for compat]
         - order_parameter (1)
-        Total: ~28 (flexible, determined at init)
+        Total: ~8 (flexible, determined at init)
 
     Output: 64-dim vector concatenated with the base encoder.
     """
@@ -857,7 +856,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
 
     Architecture:
     1. Base encoder: Distance attention + CNN + Spatial attention
-    2. Physics encoder: MLP over ring currents, HSE, BLOSUM62, H-bonds
+    2. Physics encoder: MLP over ring currents, HSE, H-bonds
     3. Retrieval branch: Cross-attention to retrieved neighbors + direct transfer
     4. Fusion: Combine structural, physics, and retrieval features
     5. Per-shift prediction heads

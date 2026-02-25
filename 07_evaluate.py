@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 from config import (
     N_RESIDUE_TYPES, N_SS_TYPES, N_MISMATCH_TYPES, DSSP_COLS,
-    SHIFT_RANGES, K_RETRIEVED, STANDARD_RESIDUES, AA_3_TO_1,
+    K_RETRIEVED, STANDARD_RESIDUES, AA_3_TO_1,
 )
 from dataset import CachedRetrievalDataset
 from model import ShiftPredictorWithRetrieval

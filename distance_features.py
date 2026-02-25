@@ -1,66 +1,66 @@
 """
-Dense distance feature computation.
+Distance feature computation using all resolved atoms.
 
-Instead of computing all 863 pairwise distances (88% NaN), we compute only:
-1. ~21 backbone atom pair distances (C, CA, CB, H, HA, N, O -- all pairs = 21)
-2. 5 sidechain summary statistics per residue
+Computes pairwise intra-residue distances with the following rules:
+  - Heavy-heavy: all pairwise distances between non-hydrogen atoms
+  - H-to-heavy: distances from each hydrogen to each heavy atom
+  - No H-H distances
 
-This gives ~26 features with much lower NaN rates.
+Also retains sidechain summary statistics from the previous approach.
 """
 
 import numpy as np
-from config import DISTANCE_ATOMS
+from pdb_utils import classify_atom
 
 
-def get_distance_column_names():
-    """Get the list of dense distance column names.
+def calc_all_distances(atoms):
+    """Calculate distances between all atom pairs obeying H-heavy rules.
 
-    Returns:
-        List of column name strings like 'dist_C_CA', 'dist_C_CB', etc.
-    """
-    atoms = sorted(DISTANCE_ATOMS)
-    cols = []
-    for i, a1 in enumerate(atoms):
-        for a2 in atoms[i+1:]:
-            cols.append(f'dist_{a1}_{a2}')
-    return cols
-
-
-def get_sidechain_summary_names():
-    """Get column names for sidechain summary statistics."""
-    return [
-        'sc_n_resolved',      # Number of resolved sidechain atoms
-        'sc_mean_dist_ca',    # Mean distance of SC atoms from CA
-        'sc_compactness',     # Std of SC atom distances from CA (how compact)
-        'sc_max_extent',      # Max distance of any SC atom from CA
-        'sc_centroid_dist',   # Distance from CA to SC centroid
-    ]
-
-
-def calc_dense_distances(atoms):
-    """Calculate distances between dense backbone/near-backbone atom pairs.
+    Rules:
+      - heavy-heavy: include
+      - hydrogen-heavy: include
+      - hydrogen-hydrogen: exclude
 
     Args:
         atoms: Dict mapping atom_name -> np.array([x, y, z])
 
     Returns:
-        Dict mapping 'dist_A1_A2' -> float distance
+        Dict mapping 'dist_{A1}_{A2}' -> float distance
+        (A1 < A2 lexicographically to avoid duplicates)
     """
-    distance_atoms = sorted(DISTANCE_ATOMS)
+    names = sorted(atoms.keys())
+    heavy = [n for n in names if classify_atom(n) == 'heavy']
+    hydrogen = [n for n in names if classify_atom(n) == 'hydrogen']
+
     dists = {}
 
-    for i, a1 in enumerate(distance_atoms):
-        if a1 not in atoms:
+    # Heavy-heavy pairs
+    for i, a1 in enumerate(heavy):
+        coord1 = atoms[a1]
+        if not np.all(np.isfinite(coord1)):
             continue
-        for a2 in distance_atoms[i+1:]:
-            if a2 not in atoms:
+        for a2 in heavy[i + 1:]:
+            coord2 = atoms[a2]
+            if not np.all(np.isfinite(coord2)):
                 continue
-            try:
-                d = np.linalg.norm(atoms[a1] - atoms[a2])
-                if np.isfinite(d):
-                    dists[f'dist_{a1}_{a2}'] = float(d)
-            except Exception:
-                pass
+            d = float(np.linalg.norm(coord1 - coord2))
+            if np.isfinite(d):
+                dists[f'dist_{a1}_{a2}'] = d
+
+    # Hydrogen-to-heavy pairs
+    for h in hydrogen:
+        coord_h = atoms[h]
+        if not np.all(np.isfinite(coord_h)):
+            continue
+        for hv in heavy:
+            coord_hv = atoms[hv]
+            if not np.all(np.isfinite(coord_hv)):
+                continue
+            d = float(np.linalg.norm(coord_h - coord_hv))
+            if np.isfinite(d):
+                # Ensure consistent key ordering
+                key_a, key_b = sorted([h, hv])
+                dists[f'dist_{key_a}_{key_b}'] = d
 
     return dists
 
@@ -82,7 +82,6 @@ def calc_sidechain_summary(atoms, backbone_set=None):
     if ca is None or not np.all(np.isfinite(ca)):
         return {}
 
-    # Collect sidechain atom coordinates
     sc_coords = []
     for name, coord in atoms.items():
         if name not in backbone_set and np.all(np.isfinite(coord)):
@@ -94,23 +93,31 @@ def calc_sidechain_summary(atoms, backbone_set=None):
         return result
 
     sc_coords = np.array(sc_coords)
-
-    # Distances from CA to each sidechain atom
     dists_from_ca = np.linalg.norm(sc_coords - ca, axis=1)
 
     result['sc_mean_dist_ca'] = float(np.mean(dists_from_ca))
     result['sc_compactness'] = float(np.std(dists_from_ca)) if len(dists_from_ca) > 1 else 0.0
     result['sc_max_extent'] = float(np.max(dists_from_ca))
 
-    # Centroid distance
     centroid = np.mean(sc_coords, axis=0)
     result['sc_centroid_dist'] = float(np.linalg.norm(centroid - ca))
 
     return result
 
 
+def get_sidechain_summary_names():
+    """Get column names for sidechain summary statistics."""
+    return [
+        'sc_n_resolved',
+        'sc_mean_dist_ca',
+        'sc_compactness',
+        'sc_max_extent',
+        'sc_centroid_dist',
+    ]
+
+
 def compute_all_distance_features(atoms):
-    """Compute both dense distances and sidechain summaries.
+    """Compute all distance features + sidechain summaries.
 
     Args:
         atoms: Dict mapping atom_name -> np.array([x, y, z])
@@ -119,6 +126,6 @@ def compute_all_distance_features(atoms):
         Dict of all distance features
     """
     features = {}
-    features.update(calc_dense_distances(atoms))
+    features.update(calc_all_distances(atoms))
     features.update(calc_sidechain_summary(atoms))
     return features

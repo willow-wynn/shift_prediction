@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import numpy as np
 import pandas as pd
-from config import AA_3_TO_1, NONSTANDARD_MAP, DSSP_PATH
+from config import AA_3_TO_1, DSSP_PATH
 
 
 def parse_pdb(pdb_path, chain_id=None):
@@ -64,10 +64,6 @@ def parse_pdb(pdb_path, chain_id=None):
                 z = float(line[46:54])
             except (ValueError, IndexError):
                 continue
-
-            # Map non-standard residues
-            if res_name in NONSTANDARD_MAP:
-                res_name = NONSTANDARD_MAP[res_name]
 
             key = (chain, res_seq)
             if key not in residues:
@@ -270,3 +266,85 @@ def extract_bfactors(pdb_path, chain_id=None):
                 continue
 
     return bfactors
+
+
+def resolve_pdb_path(pdb_id, search_dirs, chain_id=None, bmrb_id=None):
+    """Find a PDB file across multiple directories and naming conventions.
+
+    Args:
+        pdb_id: PDB identifier (e.g. '1UBQ')
+        search_dirs: List of directories to search
+        chain_id: Optional chain ID for chain-suffixed filenames
+        bmrb_id: Optional BMRB ID for rcsb_{bmrb_id}.pdb naming
+
+    Returns:
+        Path to PDB file, or None if not found
+    """
+    pdb_upper = pdb_id.upper()
+    pdb_lower = pdb_id.lower()
+
+    patterns = [
+        f'{pdb_upper}.pdb',
+        f'{pdb_lower}.pdb',
+    ]
+    if chain_id:
+        patterns.extend([
+            f'{pdb_upper}{chain_id}.pdb',
+            f'{pdb_lower}{chain_id}.pdb',
+        ])
+    if bmrb_id:
+        patterns.append(f'rcsb_{bmrb_id}.pdb')
+
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in patterns:
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                return path
+
+    return None
+
+
+def lookup_with_chain_fallback(data_dict, chain, res_id):
+    """Look up a (chain, res_id) key with empty-chain fallbacks.
+
+    Tries (chain, res_id), then ('', res_id), then (' ', res_id).
+
+    Args:
+        data_dict: Dict keyed by (chain, residue_id)
+        chain: Chain letter
+        res_id: Residue ID
+
+    Returns:
+        Value from dict, or None if not found
+    """
+    for key in [(chain, res_id), ('', res_id), (' ', res_id)]:
+        if key in data_dict:
+            return data_dict[key]
+    return None
+
+
+def classify_atom(atom_name):
+    """Classify a PDB atom name as 'heavy' or 'hydrogen'.
+
+    In PDB format, hydrogen atoms have names starting with 'H' or
+    a digit followed by 'H'. This handles standard naming conventions.
+
+    Args:
+        atom_name: Atom name string (e.g. 'CA', 'H', 'HB2', '1HG1')
+
+    Returns:
+        'hydrogen' if the atom is a hydrogen, 'heavy' otherwise
+    """
+    name = atom_name.strip()
+    if not name:
+        return 'heavy'
+    # Standard: H atoms start with H (but not HG for mercury in rare cases)
+    # In protein PDB files, all H* atoms are hydrogens
+    if name[0] == 'H':
+        return 'hydrogen'
+    # Old-style PDB naming: digit prefix (e.g. 1HG1, 2HB)
+    if len(name) >= 2 and name[0].isdigit() and name[1] == 'H':
+        return 'hydrogen'
+    return 'heavy'

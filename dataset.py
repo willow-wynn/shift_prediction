@@ -104,15 +104,8 @@ def get_dssp_columns(df_columns):
 PHYSICS_COLS = [
     'ring_current_h', 'ring_current_ha',
     'hse_up', 'hse_down', 'hse_ratio',
-    # BLOSUM62 features (20 columns)
-    'blosum62_0', 'blosum62_1', 'blosum62_2', 'blosum62_3', 'blosum62_4',
-    'blosum62_5', 'blosum62_6', 'blosum62_7', 'blosum62_8', 'blosum62_9',
-    'blosum62_10', 'blosum62_11', 'blosum62_12', 'blosum62_13', 'blosum62_14',
-    'blosum62_15', 'blosum62_16', 'blosum62_17', 'blosum62_18', 'blosum62_19',
-    # H-bond features
     'hbond_dist_1', 'hbond_energy_1',
     'hbond_dist_2', 'hbond_energy_2',
-    # Order parameter
     'order_parameter',
 ]
 
