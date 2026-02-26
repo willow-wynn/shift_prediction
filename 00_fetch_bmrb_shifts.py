@@ -341,13 +341,29 @@ def main():
         df = pivot_shift_data(all_rows)
 
     else:
-        # Try default location
+        # Try default location, auto-download if missing
         default_input = os.path.join(output_dir, 'chemical_shifts.csv')
         df = load_existing_shifts(default_input)
         if df is None:
-            print("  No existing shift data found.")
-            print("  Use --download to fetch from BMRB, or --input to specify a file.")
-            sys.exit(1)
+            print("  No existing shift data found. Auto-downloading from BMRB...")
+            checkpoint_dir = resolve(args.checkpoint_dir)
+
+            print("\n[Step 1] Fetching BMRB entry list...")
+            entry_ids = get_all_bmrb_entry_ids()
+            if not entry_ids:
+                print("  ERROR: Could not fetch BMRB entry list.")
+                sys.exit(1)
+            print(f"  Found {len(entry_ids):,} entries")
+
+            print("\n[Step 2] Downloading shift data (with checkpoints)...")
+            all_rows = download_all_shifts(entry_ids, checkpoint_dir)
+
+            if not all_rows:
+                print("  ERROR: No shift data downloaded.")
+                sys.exit(1)
+
+            print("\n[Step 3] Pivoting to one-row-per-residue format...")
+            df = pivot_shift_data(all_rows)
 
     # Ensure bmrb_id is string
     df['bmrb_id'] = df['bmrb_id'].astype(str)

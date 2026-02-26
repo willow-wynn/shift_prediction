@@ -48,14 +48,85 @@ from rcsb_search import search_pdb_by_sequence, extract_sequence_from_shifts
 from structure_selection import select_best_chain
 from alphafold_utils import get_uniprot_for_bmrb, download_alphafold_structure
 
+import csv
+import io
+import json
+import urllib.request
+
+# ============================================================================
+# BMRB->PDB pairs download (always available, regardless of old module)
+# ============================================================================
+
+BMRB_PAIRS_URL = (
+    'https://bmrb.io/search/query_grid/index.php'
+    '?output=csv&data_types[]=pdb_ids&polymer_join_type=AND'
+)
+
+
+def download_pairs_file(output_path, retries=3):
+    """Download BMRB->PDB mapping from the BMRB query grid API.
+
+    The raw CSV has many columns; we extract just Entry_ID and pdb_ids.
+    """
+    print(f"  Downloading BMRB->PDB mapping from BMRB...")
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(BMRB_PAIRS_URL)
+            req.add_header('User-Agent', 'he_lab_pipeline/1.0')
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw = resp.read().decode('utf-8')
+            break
+        except Exception as e:
+            if attempt < retries - 1:
+                print(f"    Attempt {attempt + 1} failed: {e}, retrying...")
+                time.sleep(2 ** attempt)
+            else:
+                print(f"    ERROR: Failed to download pairs after {retries} attempts: {e}")
+                return False
+
+    # Parse CSV and extract Entry_ID, pdb_ids
+    reader = csv.DictReader(io.StringIO(raw))
+    # Clean column names (BMRB adds whitespace/quotes)
+    fieldnames = [f.strip().strip('"') for f in reader.fieldnames]
+    reader.fieldnames = fieldnames
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    n_written = 0
+    with open(output_path, 'w', newline='') as out:
+        writer = csv.writer(out)
+        writer.writerow(['Entry_ID', 'pdb_ids'])
+        for row in reader:
+            entry_id = row.get('Entry_ID', '').strip()
+            pdb_ids = row.get('pdb_ids', '').strip()
+            if entry_id and pdb_ids:
+                writer.writerow([entry_id, pdb_ids])
+                n_written += 1
+
+    print(f"  Saved {n_written:,} BMRB->PDB mappings to {output_path}")
+    return True
+
+
+def load_pairs_file(pairs_path):
+    """Load BMRB->PDB mapping from pairs.csv."""
+    if not os.path.exists(pairs_path):
+        return {}
+    pairs_df = pd.read_csv(pairs_path, dtype={'Entry_ID': str})
+    mapping = {}
+    for _, row in pairs_df.iterrows():
+        bmrb_id = str(row['Entry_ID'])
+        pdb_ids_str = str(row.get('pdb_ids', ''))
+        if pd.isna(row.get('pdb_ids')) or pdb_ids_str == 'nan':
+            continue
+        pdb_list = [p.strip().upper() for p in pdb_ids_str.split(',') if p.strip()]
+        if pdb_list:
+            mapping[bmrb_id] = pdb_list
+    return mapping
+
+
 # Reuse API helpers from old 01_select_pdb_structures if available
 from importlib import util as importlib_util
 _old_01_spec = importlib_util.find_spec('01_select_pdb_structures')
 if _old_01_spec is None:
-    # Define minimal versions of what we need
-    import json
-    import urllib.request
-
     def lookup_pdb_ids_for_bmrb(bmrb_id):
         url = f'https://api.bmrb.io/v2/search/get_pdb_ids_from_bmrb_id/{bmrb_id}'
         try:
@@ -88,27 +159,11 @@ if _old_01_spec is None:
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
         return False
-
-    def load_pairs_file(pairs_path):
-        if not os.path.exists(pairs_path):
-            return {}
-        pairs_df = pd.read_csv(pairs_path, dtype={'Entry_ID': str})
-        mapping = {}
-        for _, row in pairs_df.iterrows():
-            bmrb_id = str(row['Entry_ID'])
-            pdb_ids_str = str(row.get('pdb_ids', ''))
-            if pd.isna(row.get('pdb_ids')) or pdb_ids_str == 'nan':
-                continue
-            pdb_list = [p.strip().upper() for p in pdb_ids_str.split(',') if p.strip()]
-            if pdb_list:
-                mapping[bmrb_id] = pdb_list
-        return mapping
 else:
     from importlib import import_module as _imp
     _old_01 = _imp('01_select_pdb_structures')
     lookup_pdb_ids_for_bmrb = _old_01.lookup_pdb_ids_for_bmrb
     download_pdb_file = _old_01.download_pdb_file
-    load_pairs_file = _old_01.load_pairs_file
 
 
 # ============================================================================
@@ -743,10 +798,17 @@ def main():
     print(f"  Remaining: {len(valid_bmrb_ids):,}")
     bmrb_ids = valid_bmrb_ids
 
-    # Load pairs mapping
-    pairs_mapping = load_pairs_file(pairs_file) if os.path.exists(pairs_file) else {}
+    # Load pairs mapping (auto-download from BMRB if missing)
+    if not os.path.exists(pairs_file):
+        print(f"\n  pairs.csv not found at {pairs_file}, downloading from BMRB...")
+        download_pairs_file(pairs_file)
+
+    pairs_mapping = load_pairs_file(pairs_file)
     if pairs_mapping:
         print(f"  Loaded {len(pairs_mapping):,} BMRB->PDB mappings from pairs.csv")
+    else:
+        print("  WARNING: No BMRB->PDB mappings available. "
+              "Structure finding will rely on BMRB API and BLAST.")
 
     # ------------------------------------------------------------------
     # Step 1: Find PDB structures
