@@ -2,8 +2,6 @@
 """
 Step 01: Build training datasets from chemical shifts + structures.
 
-Replaces the old 01_select_pdb_structures.py + 02_compile_dataset.py.
-
 Pipeline:
   1. Find PDB structures for each protein (pairs.csv + BMRB API + BLAST fallback)
   2. Select best chain via RMSD-based analysis
@@ -123,47 +121,45 @@ def load_pairs_file(pairs_path):
     return mapping
 
 
-# Reuse API helpers from old 01_select_pdb_structures if available
-from importlib import util as importlib_util
-_old_01_spec = importlib_util.find_spec('01_select_pdb_structures')
-if _old_01_spec is None:
-    def lookup_pdb_ids_for_bmrb(bmrb_id):
-        url = f'https://api.bmrb.io/v2/search/get_pdb_ids_from_bmrb_id/{bmrb_id}'
+# ============================================================================
+# BMRB / RCSB API helpers
+# ============================================================================
+
+def lookup_pdb_ids_for_bmrb(bmrb_id):
+    """Look up PDB IDs associated with a BMRB entry via the BMRB REST API."""
+    url = f'https://api.bmrb.io/v2/search/get_pdb_ids_from_bmrb_id/{bmrb_id}'
+    try:
+        req = urllib.request.Request(url)
+        req.add_header('Accept', 'application/json')
+        req.add_header('User-Agent', 'he_lab_pipeline/1.0')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        if isinstance(data, list):
+            return [str(p).upper().strip() for p in data if p]
+        if isinstance(data, dict):
+            for key in ('data', 'pdb_ids', 'result'):
+                if key in data and isinstance(data[key], list):
+                    return [str(p).upper().strip() for p in data[key] if p]
+        return []
+    except Exception:
+        return []
+
+
+def download_pdb_file(pdb_id, output_path, retries=3):
+    """Download a PDB file from RCSB."""
+    url = f'https://files.rcsb.org/download/{pdb_id.upper()}.pdb'
+    for attempt in range(retries):
         try:
             req = urllib.request.Request(url)
-            req.add_header('Accept', 'application/json')
             req.add_header('User-Agent', 'he_lab_pipeline/1.0')
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-            if isinstance(data, list):
-                return [str(p).upper().strip() for p in data if p]
-            if isinstance(data, dict):
-                for key in ('data', 'pdb_ids', 'result'):
-                    if key in data and isinstance(data[key], list):
-                        return [str(p).upper().strip() for p in data[key] if p]
-            return []
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                with open(output_path, 'wb') as f:
+                    f.write(resp.read())
+            return True
         except Exception:
-            return []
-
-    def download_pdb_file(pdb_id, output_path, retries=3):
-        url = f'https://files.rcsb.org/download/{pdb_id.upper()}.pdb'
-        for attempt in range(retries):
-            try:
-                req = urllib.request.Request(url)
-                req.add_header('User-Agent', 'he_lab_pipeline/1.0')
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    with open(output_path, 'wb') as f:
-                        f.write(resp.read())
-                return True
-            except Exception:
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-        return False
-else:
-    from importlib import import_module as _imp
-    _old_01 = _imp('01_select_pdb_structures')
-    lookup_pdb_ids_for_bmrb = _old_01.lookup_pdb_ids_for_bmrb
-    download_pdb_file = _old_01.download_pdb_file
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return False
 
 
 # ============================================================================
