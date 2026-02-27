@@ -103,7 +103,22 @@ def download_bmrb_entry(bmrb_id, max_retries=3):
 
     rows = []
     try:
-        for saveframe in data.get('data', []):
+        # API returns {bmrb_id: {saveframes: [...]}} — extract the entry dict
+        entry = data.get(str(bmrb_id)) or data.get('data')
+        if entry is None:
+            # Try the first dict value if neither key matches
+            for v in data.values():
+                if isinstance(v, dict) and 'saveframes' in v:
+                    entry = v
+                    break
+        if entry is None:
+            return rows
+
+        saveframes = entry.get('saveframes', []) if isinstance(entry, dict) else entry
+        if not isinstance(saveframes, list):
+            return rows
+
+        for saveframe in saveframes:
             if not isinstance(saveframe, dict):
                 continue
             loops = saveframe.get('loops', [])

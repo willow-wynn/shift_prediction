@@ -2,6 +2,8 @@
 """
 Step 01: Build training datasets from chemical shifts + structures.
 
+Replaces the old 01_select_pdb_structures.py + 02_compile_dataset.py.
+
 Pipeline:
   1. Find PDB structures for each protein (pairs.csv + BMRB API + BLAST fallback)
   2. Select best chain via RMSD-based analysis
@@ -23,6 +25,7 @@ import hashlib
 import time
 import traceback
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
@@ -83,9 +86,15 @@ def download_pairs_file(output_path, retries=3):
                 return False
 
     # Parse CSV and extract Entry_ID, pdb_ids
+    # BMRB response may have leading blank lines; strip them
+    lines = raw.split('\n')
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    raw = '\n'.join(lines)
+
     reader = csv.DictReader(io.StringIO(raw))
     # Clean column names (BMRB adds whitespace/quotes)
-    fieldnames = [f.strip().strip('"') for f in reader.fieldnames]
+    fieldnames = [f.strip().strip('"') for f in (reader.fieldnames or [])]
     reader.fieldnames = fieldnames
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -121,18 +130,14 @@ def load_pairs_file(pairs_path):
     return mapping
 
 
-# ============================================================================
-# BMRB / RCSB API helpers
-# ============================================================================
-
 def lookup_pdb_ids_for_bmrb(bmrb_id):
-    """Look up PDB IDs associated with a BMRB entry via the BMRB REST API."""
+    """Look up PDB IDs for a BMRB entry via REST API."""
     url = f'https://api.bmrb.io/v2/search/get_pdb_ids_from_bmrb_id/{bmrb_id}'
     try:
         req = urllib.request.Request(url)
         req.add_header('Accept', 'application/json')
         req.add_header('User-Agent', 'he_lab_pipeline/1.0')
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode('utf-8'))
         if isinstance(data, list):
             return [str(p).upper().strip() for p in data if p]
@@ -263,8 +268,64 @@ def has_nucleotides(residues):
 # Step 1: Find PDB structures
 # ============================================================================
 
+def _get_chains_fast(pdb_path):
+    """Extract chain IDs from a PDB file without full coordinate parsing.
+
+    ~100x faster than parse_pdb since it only reads chain letters from ATOM
+    records, skipping all coordinate parsing and numpy array construction.
+    """
+    chains = set()
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            rec = line[:6]
+            if rec.startswith('ENDMDL'):
+                break
+            if rec.startswith('ATOM') or rec.startswith('HETATM'):
+                ch = line[21].strip()
+                if ch:
+                    chains.add(ch)
+    return sorted(chains)
+
+
+def _find_pdb_for_one_protein(bmrb_id, pdb_ids, pdb_dir, search_dirs, online):
+    """Worker: resolve paths and extract chain IDs for one protein's PDB IDs.
+
+    Returns:
+        (bmrb_id, protein_candidates, local_counters)
+    """
+    local_counters = defaultdict(int)
+    protein_candidates = []
+
+    for pdb_id in sorted(pdb_ids):
+        pdb_path = resolve_pdb_path(pdb_id, search_dirs)
+        if pdb_path is None:
+            pdb_path = os.path.join(pdb_dir, f'{pdb_id}.pdb')
+            if not os.path.exists(pdb_path):
+                if online:
+                    success = download_pdb_file(pdb_id, pdb_path)
+                    if not success:
+                        continue
+                    local_counters['downloaded'] += 1
+                else:
+                    continue
+
+        try:
+            chains = _get_chains_fast(pdb_path)
+            if chains:
+                protein_candidates.append((pdb_path, chains))
+        except Exception:
+            continue
+
+    if protein_candidates:
+        local_counters['found'] += 1
+    else:
+        local_counters['no_valid_pdb'] += 1
+
+    return bmrb_id, protein_candidates, local_counters
+
+
 def find_pdb_structures(bmrb_ids, shifts_df, pairs_mapping, pdb_dir,
-                        search_dirs, online=False):
+                        search_dirs, online=False, max_workers=8):
     """Find candidate PDB structures for each protein.
 
     Sources:
@@ -275,68 +336,89 @@ def find_pdb_structures(bmrb_ids, shifts_df, pairs_mapping, pdb_dir,
     Returns:
         dict: bmrb_id -> list of (pdb_path, [chain_ids])
     """
-    candidates = {}
+    # Phase 1: gather PDB IDs per protein
+    bmrb_to_pdb_ids = {}
     counters = defaultdict(int)
 
-    for bmrb_id in tqdm(bmrb_ids, desc="Finding PDB structures"):
-        pdb_ids = set()
-
-        # Source 1: pairs.csv
+    # 1a: instant dict lookups from pairs.csv
+    need_api = []
+    for bmrb_id in bmrb_ids:
         if bmrb_id in pairs_mapping:
-            for pid in pairs_mapping[bmrb_id]:
-                pdb_ids.add(pid.upper())
-
-        # Source 2: BMRB API
-        if online and not pdb_ids:
-            api_pdbs = lookup_pdb_ids_for_bmrb(bmrb_id)
-            for pid in api_pdbs:
-                pdb_ids.add(pid.upper())
-
-        # Source 3: BLAST fallback
-        if online and not pdb_ids:
-            prot_shifts = shifts_df[shifts_df['bmrb_id'] == bmrb_id]
-            seq = extract_sequence_from_shifts(prot_shifts)
-            if seq:
-                hits = search_pdb_by_sequence(seq)
-                for hit in hits:
-                    pdb_ids.add(hit['pdb_id'].upper())
-                if hits:
-                    counters['blast_found'] += 1
-
-        if not pdb_ids:
-            counters['no_mapping'] += 1
-            continue
-
-        # Resolve paths and download if needed
-        protein_candidates = []
-        for pdb_id in sorted(pdb_ids):
-            pdb_path = resolve_pdb_path(pdb_id, search_dirs)
-            if pdb_path is None:
-                # Try downloading
-                pdb_path = os.path.join(pdb_dir, f'{pdb_id}.pdb')
-                if not os.path.exists(pdb_path):
-                    if online:
-                        success = download_pdb_file(pdb_id, pdb_path)
-                        if not success:
-                            continue
-                        counters['downloaded'] += 1
-                    else:
-                        continue
-
-            # Parse to find available chains
-            try:
-                residues = parse_pdb(pdb_path)
-                chains = sorted(set(ch for ch, _ in residues.keys()))
-                if chains:
-                    protein_candidates.append((pdb_path, chains))
-            except Exception:
-                continue
-
-        if protein_candidates:
-            candidates[bmrb_id] = protein_candidates
-            counters['found'] += 1
+            pdb_ids = {pid.upper() for pid in pairs_mapping[bmrb_id]}
+            bmrb_to_pdb_ids[bmrb_id] = pdb_ids
         else:
-            counters['no_valid_pdb'] += 1
+            need_api.append(bmrb_id)
+
+    print(f"  {len(bmrb_to_pdb_ids):,} from pairs.csv, "
+          f"{len(need_api):,} need API lookup")
+
+    # 1b: parallel BMRB API lookups for the rest
+    if online and need_api:
+        def _api_lookup(bmrb_id):
+            return bmrb_id, lookup_pdb_ids_for_bmrb(bmrb_id)
+
+        with ThreadPoolExecutor(max_workers=32) as api_pool:
+            futures = {api_pool.submit(_api_lookup, bid): bid for bid in need_api}
+            need_blast = []
+            for future in tqdm(as_completed(futures), total=len(futures),
+                               desc="BMRB API lookups"):
+                bmrb_id, api_pdbs = future.result()
+                if api_pdbs:
+                    bmrb_to_pdb_ids[bmrb_id] = {p.upper() for p in api_pdbs}
+                else:
+                    need_blast.append(bmrb_id)
+
+        # 1c: BLAST fallback for proteins with no mapping at all
+        if need_blast:
+            shifts_by_protein = dict(tuple(shifts_df.groupby('bmrb_id')))
+
+            def _blast_lookup(bmrb_id):
+                prot_shifts = shifts_by_protein.get(bmrb_id)
+                if prot_shifts is None:
+                    return bmrb_id, []
+                seq = extract_sequence_from_shifts(prot_shifts)
+                if not seq:
+                    return bmrb_id, []
+                hits = search_pdb_by_sequence(seq)
+                return bmrb_id, [h['pdb_id'].upper() for h in hits]
+
+            print(f"  {len(need_blast):,} proteins need BLAST fallback")
+            with ThreadPoolExecutor(max_workers=16) as blast_pool:
+                futures = {blast_pool.submit(_blast_lookup, bid): bid
+                           for bid in need_blast}
+                for future in tqdm(as_completed(futures), total=len(futures),
+                                   desc="BLAST lookups"):
+                    bmrb_id, blast_pdbs = future.result()
+                    if blast_pdbs:
+                        bmrb_to_pdb_ids[bmrb_id] = set(blast_pdbs)
+                        counters['blast_found'] += 1
+
+    counters['no_mapping'] = len(bmrb_ids) - len(bmrb_to_pdb_ids)
+    print(f"  {len(bmrb_to_pdb_ids):,} proteins have PDB IDs, "
+          f"{counters['no_mapping']:,} have no mapping")
+
+    # Phase 2: resolve paths + extract chain IDs (parallel)
+    # ProcessPoolExecutor bypasses the GIL for CPU-bound file parsing;
+    # ThreadPoolExecutor is better when downloads dominate (online mode).
+    candidates = {}
+    Executor = ThreadPoolExecutor if online else ProcessPoolExecutor
+
+    with Executor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _find_pdb_for_one_protein,
+                bmrb_id, pdb_ids, pdb_dir, search_dirs, online,
+            ): bmrb_id
+            for bmrb_id, pdb_ids in bmrb_to_pdb_ids.items()
+        }
+
+        for future in tqdm(as_completed(futures), total=len(futures),
+                           desc="Resolving PDB structures"):
+            bmrb_id, protein_candidates, local_counters = future.result()
+            if protein_candidates:
+                candidates[bmrb_id] = protein_candidates
+            for k, v in local_counters.items():
+                counters[k] += v
 
     print(f"\n  PDB structure search results:")
     print(f"    Found structures: {counters['found']:,}")
@@ -365,8 +447,17 @@ def select_structures(candidates, shifts_df):
     """
     selections = {}
 
+    # Pre-index shifts for the proteins we need
+    shifts_by_protein = {
+        bid: grp for bid, grp in shifts_df[
+            shifts_df['bmrb_id'].isin(candidates.keys())
+        ].groupby('bmrb_id')
+    }
+
     for bmrb_id in tqdm(sorted(candidates.keys()), desc="Selecting best chains"):
-        prot_shifts = shifts_df[shifts_df['bmrb_id'] == bmrb_id]
+        prot_shifts = shifts_by_protein.get(bmrb_id)
+        if prot_shifts is None:
+            continue
         shift_seq = get_shift_sequence(prot_shifts)
         if shift_seq is None:
             continue
@@ -781,18 +872,15 @@ def main():
 
     # Pre-filter: discard proteins with nonstandard residues
     print("\n--- Pre-filtering: nonstandard residues ---")
-    valid_bmrb_ids = []
-    n_nonstandard = 0
     standard_set = set(STANDARD_RESIDUES) - {'UNK'}
-    for bmrb_id in bmrb_ids:
-        prot_shifts = shifts_df[shifts_df['bmrb_id'] == bmrb_id]
-        if has_nonstandard_residues(prot_shifts):
-            n_nonstandard += 1
-        else:
-            valid_bmrb_ids.append(bmrb_id)
-    print(f"  Discarded {n_nonstandard} proteins with nonstandard residues")
-    print(f"  Remaining: {len(valid_bmrb_ids):,}")
-    bmrb_ids = valid_bmrb_ids
+    nonstandard_proteins = (
+        shifts_df[~shifts_df['residue_code'].str.upper().isin(standard_set)]
+        ['bmrb_id'].unique()
+    )
+    nonstandard_set = set(nonstandard_proteins)
+    bmrb_ids = [bid for bid in bmrb_ids if bid not in nonstandard_set]
+    print(f"  Discarded {len(nonstandard_set)} proteins with nonstandard residues")
+    print(f"  Remaining: {len(bmrb_ids):,}")
 
     # Load pairs mapping (auto-download from BMRB if missing)
     if not os.path.exists(pairs_file):
@@ -862,6 +950,16 @@ def main():
     # Build log rows
     log_rows = []
 
+    # Pre-index shifts once for all datasets
+    all_dataset_bmrb_ids = set()
+    for selections in dataset_configs.values():
+        all_dataset_bmrb_ids.update(selections.keys())
+    shifts_by_protein = {
+        bid: grp for bid, grp in shifts_df[
+            shifts_df['bmrb_id'].isin(all_dataset_bmrb_ids)
+        ].groupby('bmrb_id')
+    }
+
     for dataset_name, selections in dataset_configs.items():
         print(f"\n  Compiling {dataset_name} dataset...")
 
@@ -872,7 +970,9 @@ def main():
         for bmrb_id in tqdm(sorted(selections.keys()),
                             desc=f"  {dataset_name}", unit="protein"):
             pdb_path, chain_id = selections[bmrb_id]
-            prot_shifts = shifts_df[shifts_df['bmrb_id'] == bmrb_id]
+            prot_shifts = shifts_by_protein.get(bmrb_id)
+            if prot_shifts is None:
+                continue
 
             try:
                 rows = process_protein(bmrb_id, prot_shifts, pdb_path, chain_id)
