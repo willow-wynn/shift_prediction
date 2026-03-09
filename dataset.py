@@ -330,6 +330,12 @@ class CachedRetrievalDataset(Dataset):
         neighbor_ss_idx = torch.full((self.k_spatial,), N_SS_TYPES, dtype=torch.long)
         neighbor_angles = torch.zeros(self.k_spatial, 4, dtype=torch.float32)
 
+        # Distance features for spatial neighbors
+        neighbor_atom1_idx = torch.full((self.k_spatial, M), self.n_atom_types, dtype=torch.long)
+        neighbor_atom2_idx = torch.full((self.k_spatial, M), self.n_atom_types, dtype=torch.long)
+        neighbor_distances = torch.zeros(self.k_spatial, M, dtype=torch.float32)
+        neighbor_dist_mask = torch.zeros(self.k_spatial, M, dtype=torch.bool)
+
         for k in range(self.k_spatial):
             nb_res_id = spatial_res_ids[k].item()
             if nb_res_id >= 0:
@@ -340,6 +346,20 @@ class CachedRetrievalDataset(Dataset):
                         neighbor_res_idx[k] = self.flat_residue_idx[nb_global]
                         neighbor_ss_idx[k] = self.flat_ss_idx[nb_global]
                         neighbor_angles[k] = self.flat_angles[nb_global]
+
+                        # Look up distance features for this neighbor
+                        n_valid = self.flat_dist_count[nb_global].item()
+                        if n_valid > 0:
+                            neighbor_atom1_idx[k, :n_valid] = torch.from_numpy(
+                                self.flat_dist_atom1[nb_global, :n_valid].astype(np.int64)
+                            )
+                            neighbor_atom2_idx[k, :n_valid] = torch.from_numpy(
+                                self.flat_dist_atom2[nb_global, :n_valid].astype(np.int64)
+                            )
+                            neighbor_distances[k, :n_valid] = torch.from_numpy(
+                                self.flat_dist_values[nb_global, :n_valid].astype(np.float32)
+                            )
+                            neighbor_dist_mask[k, :n_valid] = True
                     else:
                         neighbor_valid[k] = False
                 else:
@@ -418,6 +438,10 @@ class CachedRetrievalDataset(Dataset):
             'neighbor_seq_sep': spatial_seq_sep,
             'neighbor_angles': neighbor_angles,
             'neighbor_valid': neighbor_valid,
+            'neighbor_atom1_idx': neighbor_atom1_idx,
+            'neighbor_atom2_idx': neighbor_atom2_idx,
+            'neighbor_distances': neighbor_distances,
+            'neighbor_dist_mask': neighbor_dist_mask,
 
             # Targets
             'shift_target': shift_target,

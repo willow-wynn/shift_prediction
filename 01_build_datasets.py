@@ -5,15 +5,16 @@ Step 01: Build training datasets from chemical shifts + structures.
 Replaces the old 01_select_pdb_structures.py + 02_compile_dataset.py.
 
 Pipeline:
-  1. Find PDB structures for each protein (pairs.csv + BMRB API + BLAST fallback)
-  2. Select best chain via RMSD-based analysis
+  1. Find PDB structures for each protein (pairs.csv + BMRB API)
+  2. Select best chain via alignment identity
   3. Get AlphaFold structures (BMRB -> UniProt -> AlphaFold DB)
-  4. Compile features for 3 datasets
-  5. Quality filtering (nonstandard discard, nucleotide removal, outlier detection)
+  4. For NMR structures: select median-representative model
+  5. Compile features for 3 datasets
+  6. Quality filtering (nonstandard discard, nucleotide removal, outlier detection)
 
 Outputs:
-  data/structure_data_experimental.csv   -- proteins with experimental PDB structures
-  data/structure_data_hybrid.csv         -- experimental where available, AlphaFold otherwise
+  data/structure_data_hybrid.csv         -- experimental where available, AlphaFold otherwise (all BMRB + AlphaFold)
+  data/structure_data_experimental.csv   -- experimental PDB structures only
   data/structure_data_alphafold.csv      -- all AlphaFold structures
   data/build_log.csv                     -- provenance log
 """
@@ -36,17 +37,18 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     DATA_DIR, PDB_DIR, DSSP_COLS, AA_3_TO_1, NUCLEOTIDES,
     K_SPATIAL_NEIGHBORS, STANDARD_RESIDUES, OUTLIER_STD_THRESHOLD,
-    ALPHAFOLD_DIR,
+    ALPHAFOLD_DIR, MIN_SEQUENCE_IDENTITY,
 )
 from pdb_utils import (
-    parse_pdb, run_dssp, resolve_pdb_path, lookup_with_chain_fallback, classify_atom,
+    parse_pdb, parse_pdb_all_models, run_dssp, resolve_pdb_path,
+    lookup_with_chain_fallback, classify_atom,
 )
 from alignment import align_sequences, to_single_letter
 from distance_features import compute_all_distance_features, get_sidechain_summary_names
 from spatial_neighbors import find_neighbors
 from physics_features import compute_all_physics_features, get_physics_feature_names
-from rcsb_search import search_pdb_by_sequence, extract_sequence_from_shifts
-from structure_selection import select_best_chain
+from rcsb_search import extract_sequence_from_shifts
+from structure_selection import select_best_chain, kabsch_superimpose
 from alphafold_utils import get_uniprot_for_bmrb, download_alphafold_structure
 
 import csv
@@ -235,6 +237,22 @@ def alignment_to_mapping(alignment, struct_seq, shift_seq):
                 'shift_res_id': shift_rid,
                 'mismatch_type': mtype,
             })
+        elif c1 != '-' and c2 == '-':
+            # Structure residue has no shift counterpart
+            struct_rid = struct_seq['residue_ids'][i1]
+            mappings.append({
+                'struct_res_id': struct_rid,
+                'shift_res_id': np.nan,
+                'mismatch_type': 'gap_in_cs',
+            })
+        elif c1 == '-' and c2 != '-':
+            # Shift residue has no structure counterpart
+            shift_rid = shift_seq['residue_ids'][i2]
+            mappings.append({
+                'struct_res_id': np.nan,
+                'shift_res_id': shift_rid,
+                'mismatch_type': 'gap_in_structure',
+            })
         if c1 != '-':
             i1 += 1
         if c2 != '-':
@@ -331,7 +349,8 @@ def find_pdb_structures(bmrb_ids, shifts_df, pairs_mapping, pdb_dir,
     Sources:
       1. pairs.csv local mapping
       2. BMRB API lookup (if online)
-      3. BLAST via RCSB sequence search (if online, as fallback)
+
+    Proteins with no PDB mapping go straight to AlphaFold-only.
 
     Returns:
         dict: bmrb_id -> list of (pdb_path, [chain_ids])
@@ -368,31 +387,6 @@ def find_pdb_structures(bmrb_ids, shifts_df, pairs_mapping, pdb_dir,
                 else:
                     need_blast.append(bmrb_id)
 
-        # 1c: BLAST fallback for proteins with no mapping at all
-        if need_blast:
-            shifts_by_protein = dict(tuple(shifts_df.groupby('bmrb_id')))
-
-            def _blast_lookup(bmrb_id):
-                prot_shifts = shifts_by_protein.get(bmrb_id)
-                if prot_shifts is None:
-                    return bmrb_id, []
-                seq = extract_sequence_from_shifts(prot_shifts)
-                if not seq:
-                    return bmrb_id, []
-                hits = search_pdb_by_sequence(seq)
-                return bmrb_id, [h['pdb_id'].upper() for h in hits]
-
-            print(f"  {len(need_blast):,} proteins need BLAST fallback")
-            with ThreadPoolExecutor(max_workers=16) as blast_pool:
-                futures = {blast_pool.submit(_blast_lookup, bid): bid
-                           for bid in need_blast}
-                for future in tqdm(as_completed(futures), total=len(futures),
-                                   desc="BLAST lookups"):
-                    bmrb_id, blast_pdbs = future.result()
-                    if blast_pdbs:
-                        bmrb_to_pdb_ids[bmrb_id] = set(blast_pdbs)
-                        counters['blast_found'] += 1
-
     counters['no_mapping'] = len(bmrb_ids) - len(bmrb_to_pdb_ids)
     print(f"  {len(bmrb_to_pdb_ids):,} proteins have PDB IDs, "
           f"{counters['no_mapping']:,} have no mapping")
@@ -425,7 +419,6 @@ def find_pdb_structures(bmrb_ids, shifts_df, pairs_mapping, pdb_dir,
     print(f"    No mapping:       {counters['no_mapping']:,}")
     print(f"    No valid PDB:     {counters['no_valid_pdb']:,}")
     if online:
-        print(f"    BLAST found:      {counters['blast_found']:,}")
         print(f"    Downloaded:       {counters['downloaded']:,}")
 
     return candidates
@@ -564,6 +557,81 @@ def get_alphafold_structures(bmrb_ids, shifts_df, alphafold_dir, online=False):
 # Step 4: Compile features for one protein
 # ============================================================================
 
+def select_best_nmr_model(pdb_path, chain_id):
+    """Select the NMR model closest to the median structure.
+
+    For multi-model PDB files (NMR):
+      1. Parse all models
+      2. Superimpose all onto Model 1 via Kabsch on shared CA atoms
+      3. Compute median CA coordinates
+      4. Return the model with lowest RMSD from median
+
+    For single-model files, returns the model directly.
+
+    Args:
+        pdb_path: Path to PDB file
+        chain_id: Chain to use
+
+    Returns:
+        residues dict for the best model, or None on failure
+    """
+    models = parse_pdb_all_models(pdb_path, chain_id=chain_id)
+    if not models:
+        return None
+    if len(models) == 1:
+        return models[0]
+
+    # Extract CA coords from each model
+    # Use residue IDs from model 0 as reference
+    ref_keys = []
+    for key in sorted(models[0].keys()):
+        if 'CA' in models[0][key].get('atoms', {}):
+            ref_keys.append(key)
+
+    if len(ref_keys) < 10:
+        return models[0]
+
+    # Find keys present in ALL models with CA
+    common_keys = set(ref_keys)
+    for model in models[1:]:
+        model_ca_keys = {k for k in model if 'CA' in model[k].get('atoms', {})}
+        common_keys &= model_ca_keys
+
+    common_keys = sorted(common_keys)
+    if len(common_keys) < 10:
+        return models[0]
+
+    n_models = len(models)
+    n_pos = len(common_keys)
+
+    # Extract CA coordinate matrices (n_models x n_pos x 3)
+    all_coords = np.zeros((n_models, n_pos, 3))
+    for mi, model in enumerate(models):
+        for pi, key in enumerate(common_keys):
+            all_coords[mi, pi, :] = model[key]['atoms']['CA']
+
+    # Superimpose all models onto model 0
+    ref_coords = all_coords[0]
+    aligned_coords = np.zeros_like(all_coords)
+    aligned_coords[0] = ref_coords
+
+    for mi in range(1, n_models):
+        rot, trans = kabsch_superimpose(all_coords[mi], ref_coords)
+        aligned_coords[mi] = all_coords[mi] @ rot + trans
+
+    # Compute median coordinates
+    median_coords = np.median(aligned_coords, axis=0)
+
+    # Compute per-model RMSD from median
+    rmsds = np.zeros(n_models)
+    for mi in range(n_models):
+        diff = aligned_coords[mi] - median_coords
+        rmsds[mi] = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
+
+    best_idx = int(np.argmin(rmsds))
+    return models[best_idx]
+
+
 def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
     """Process a single protein: parse PDB, align, compute features.
 
@@ -572,8 +640,8 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
     """
     rows = []
 
-    # Parse PDB
-    residues = parse_pdb(pdb_path, chain_id=chain_id)
+    # For NMR structures (multi-model), select the median-representative model
+    residues = select_best_nmr_model(pdb_path, chain_id)
     if not residues:
         return rows
 
@@ -608,6 +676,12 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
     if not mapping:
         return rows
 
+    # Compute sequence identity and reject below threshold
+    n_aligned = sum(1 for m in mapping if m['mismatch_type'] not in ('gap_in_cs', 'gap_in_structure'))
+    n_match = sum(1 for m in mapping if m['mismatch_type'] in ('match', 'protein_edge'))
+    if n_aligned == 0 or (n_match / n_aligned) < MIN_SEQUENCE_IDENTITY:
+        return rows
+
     # Spatial neighbors
     neighbors = find_neighbors(struct_data)
 
@@ -632,32 +706,46 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
         shift_rid = m['shift_res_id']
         mismatch_type = m['mismatch_type']
 
-        if shift_rid not in shift_indexed.index:
+        # For gap_in_cs: no shift data, only structural features
+        has_shift = not (isinstance(shift_rid, float) and np.isnan(shift_rid))
+        has_struct = not (isinstance(struct_rid, float) and np.isnan(struct_rid))
+
+        if has_shift and shift_rid not in shift_indexed.index:
             continue
 
-        shift_row = shift_indexed.loc[shift_rid]
-        if isinstance(shift_row, pd.DataFrame):
-            shift_row = shift_row.iloc[0]
-
-        residue_code = shift_row.get('residue_code', 'UNK')
-        if pd.isna(residue_code):
-            residue_code = 'UNK'
+        # Get shift data if available
+        if has_shift:
+            shift_row = shift_indexed.loc[shift_rid]
+            if isinstance(shift_row, pd.DataFrame):
+                shift_row = shift_row.iloc[0]
+            residue_code = shift_row.get('residue_code', 'UNK')
+            if pd.isna(residue_code):
+                residue_code = 'UNK'
+        else:
+            shift_row = None
+            # Use struct residue name for gap_in_cs rows
+            if has_struct and struct_rid in struct_data:
+                rname = struct_data[struct_rid].get('residue_name', 'UNK')
+                residue_code = rname if rname in AA_3_TO_1 else 'UNK'
+            else:
+                residue_code = 'UNK'
 
         row = {
             'bmrb_id': str(bmrb_id),
-            'residue_id': struct_rid,
+            'residue_id': struct_rid if has_struct else shift_rid,
             'residue_code': residue_code,
             'mismatch_type': mismatch_type,
         }
 
-        # Chemical shifts
-        for col in shift_cols + ambig_cols:
-            val = shift_row.get(col)
-            if val is not None and not pd.isna(val):
-                row[col] = val
+        # Chemical shifts (only if shift data exists)
+        if shift_row is not None:
+            for col in shift_cols + ambig_cols:
+                val = shift_row.get(col)
+                if val is not None and not pd.isna(val):
+                    row[col] = val
 
         # Structural features
-        if struct_rid in struct_data:
+        if has_struct and struct_rid in struct_data:
             rdata = struct_data[struct_rid]
             atoms = rdata.get('atoms', {})
 
@@ -670,7 +758,10 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
             row.update(dist_feats)
 
         # DSSP data
-        dssp_entry = lookup_with_chain_fallback(dssp_data, chain_used or '', struct_rid)
+        if has_struct:
+            dssp_entry = lookup_with_chain_fallback(dssp_data, chain_used or '', struct_rid)
+        else:
+            dssp_entry = None
         if dssp_entry is not None:
             row['secondary_structure'] = dssp_entry.get('secondary_structure', 'C')
             phi_val = dssp_entry.get('phi')
@@ -693,7 +784,7 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
             row.update(phys_feats)
 
         # Spatial neighbors
-        if struct_rid in neighbors:
+        if has_struct and struct_rid in neighbors:
             nb = neighbors[struct_rid]
             for i in range(K_SPATIAL_NEIGHBORS):
                 row[f'spatial_neighbor_{i}_id'] = nb['ids'][i]
@@ -731,7 +822,7 @@ def filter_nonstandard_proteins(df):
 
 
 def filter_outliers_by_group(df, sd_threshold=None):
-    """Set outlier shift values to NaN per (atom_type, secondary_structure) group.
+    """Set outlier shift values to NaN per (residue_code, shift_col) group.
 
     For each group, computes mean and std, then sets values > threshold SDs
     from the mean to NaN.
@@ -740,10 +831,10 @@ def filter_outliers_by_group(df, sd_threshold=None):
         sd_threshold = OUTLIER_STD_THRESHOLD
 
     shift_cols = [c for c in df.columns if c.endswith('_shift')]
-    ss_col = 'secondary_structure'
+    group_col = 'residue_code'
 
-    if ss_col not in df.columns:
-        # Fallback: no grouping by SS
+    if group_col not in df.columns:
+        # Fallback: no grouping
         for col in shift_cols:
             valid = df[col].dropna()
             if len(valid) < 10:
@@ -761,7 +852,7 @@ def filter_outliers_by_group(df, sd_threshold=None):
     total_outliers = 0
 
     for col in shift_cols:
-        for ss_type, group in df.groupby(ss_col):
+        for res_code, group in df.groupby(group_col):
             valid = group[col].dropna()
             if len(valid) < 10:
                 continue
@@ -779,7 +870,7 @@ def filter_outliers_by_group(df, sd_threshold=None):
                 total_outliers += n_outliers
 
     print(f"    Set {total_outliers:,} outlier shift values to NaN "
-          f"(>{sd_threshold} SD per atom_type x secondary_structure)")
+          f"(>{sd_threshold} SD per residue_code x shift_col)")
 
     return df
 
@@ -906,7 +997,7 @@ def main():
     # ------------------------------------------------------------------
     # Step 2: Select best chains via RMSD
     # ------------------------------------------------------------------
-    print("\n--- Step 2: Selecting best chains (RMSD) ---")
+    print("\n--- Step 2: Selecting best chains (alignment identity) ---")
     experimental_selections = select_structures(pdb_candidates, shifts_df)
 
     # ------------------------------------------------------------------
@@ -923,13 +1014,13 @@ def main():
     print("\n--- Step 4: Compiling features ---")
 
     # Build dataset configs
-    # Dataset 1: experimental only
-    # Dataset 2: hybrid (experimental where available, AlphaFold otherwise)
-    # Dataset 3: AlphaFold only
+    # Dataset 1 (hybrid): all BMRB + AlphaFold — experimental where available, AlphaFold otherwise
+    # Dataset 2 (experimental): experimental PDB structures only
+    # Dataset 3 (alphafold): all AlphaFold structures
 
     dataset_configs = {
-        'experimental': {},
         'hybrid': {},
+        'experimental': {},
         'alphafold': {},
     }
 
@@ -943,8 +1034,8 @@ def main():
         if bmrb_id in af_selections:
             dataset_configs['alphafold'][bmrb_id] = af_selections[bmrb_id]
 
+    print(f"  Hybrid:       {len(dataset_configs['hybrid']):,} proteins (primary dataset)")
     print(f"  Experimental: {len(dataset_configs['experimental']):,} proteins")
-    print(f"  Hybrid:       {len(dataset_configs['hybrid']):,} proteins")
     print(f"  AlphaFold:    {len(dataset_configs['alphafold']):,} proteins")
 
     # Build log rows
@@ -1055,7 +1146,7 @@ def main():
     print(f"{'=' * 70}")
     print(f"  Time: {elapsed:.1f}s")
 
-    for dataset_name in ['experimental', 'hybrid', 'alphafold']:
+    for dataset_name in ['hybrid', 'experimental', 'alphafold']:
         path = os.path.join(output_dir, f'structure_data_{dataset_name}.csv')
         if os.path.exists(path):
             df = pd.read_csv(path, usecols=['bmrb_id'], dtype={'bmrb_id': str})

@@ -107,4 +107,4 @@ MAX_VALID_DISTANCES = 400
 RCSB_SEARCH_URL = 'https://search.rcsb.org/rcsbsearch/v2/query'
 ALPHAFOLD_DB_URL = 'https://alphafold.ebi.ac.uk/files'
 ALPHAFOLD_DIR = 'data/alphafold'
-BLAST_IDENTITY_CUTOFF = 0.30
+MIN_SEQUENCE_IDENTITY = 0.80

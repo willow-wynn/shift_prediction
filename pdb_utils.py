@@ -77,6 +77,74 @@ def parse_pdb(pdb_path, chain_id=None):
     return residues
 
 
+def parse_pdb_all_models(pdb_path, chain_id=None):
+    """Parse ALL models from a PDB file (for NMR structures).
+
+    Args:
+        pdb_path: Path to PDB file
+        chain_id: Chain to extract (None = all chains)
+
+    Returns:
+        List of dicts, one per model. Each dict maps
+        (chain, residue_id) -> {'residue_name': str, 'atoms': {atom_name: np.array([x,y,z])}}
+        Returns a list with one element for single-model files.
+    """
+    models = []
+    current_model = {}
+    in_model = False
+
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            record = line[:6].strip()
+
+            if record == 'MODEL':
+                in_model = True
+                current_model = {}
+                continue
+
+            if record == 'ENDMDL':
+                if current_model:
+                    models.append(current_model)
+                current_model = {}
+                continue
+
+            if record not in ('ATOM', 'HETATM'):
+                continue
+
+            atom_name = line[12:16].strip()
+            alt_loc = line[16].strip()
+            res_name = line[17:20].strip()
+            chain = line[21].strip()
+
+            if chain_id is not None and chain_id != '_' and chain != chain_id:
+                continue
+
+            if alt_loc and alt_loc not in ('A', '1'):
+                continue
+
+            try:
+                res_seq = int(line[22:26].strip())
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except (ValueError, IndexError):
+                continue
+
+            key = (chain, res_seq)
+            if key not in current_model:
+                current_model[key] = {
+                    'residue_name': res_name,
+                    'atoms': {},
+                }
+            current_model[key]['atoms'][atom_name] = np.array([x, y, z])
+
+    # Handle single-model files (no MODEL/ENDMDL records)
+    if not models and current_model:
+        models.append(current_model)
+
+    return models
+
+
 def clean_pdb_for_dssp(pdb_path, output_path):
     """Clean PDB file for DSSP compatibility.
 

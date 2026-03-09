@@ -122,6 +122,7 @@ class Retriever:
     The retriever automatically excludes:
     1. Residues from the held-out test fold
     2. Residues from the same protein as the query
+    3. Residues from proteins with >90% sequence identity to the query protein
     """
 
     def __init__(
@@ -170,6 +171,17 @@ class Retriever:
         with open(os.path.join(index_dir, 'shift_cols.json'), 'r') as f:
             self.shift_cols = json.load(f)
 
+        # Load identity exclusion map (>90% sequence identity clusters)
+        self.identity_exclusion = {}
+        exclusion_path = os.path.join(index_dir, 'identity_clusters_90.json')
+        if os.path.exists(exclusion_path):
+            with open(exclusion_path, 'r') as f:
+                self.identity_exclusion = json.load(f)
+            n_with = sum(1 for v in self.identity_exclusion.values() if v)
+            print(f"  Loaded identity exclusion map: {n_with} proteins with >90% identity neighbors")
+        else:
+            print("  WARNING: No identity exclusion map found. Only same-protein exclusion active.")
+
         # Build protein ID lookup for fast exclusion
         self._build_protein_lookup()
 
@@ -191,6 +203,21 @@ class Retriever:
 
         for k in self.bmrb_to_indices:
             self.bmrb_to_indices[k] = set(self.bmrb_to_indices[k])
+
+    def _get_exclusion_set(self, query_bmrb):
+        """Get the full set of FAISS indices to exclude for a query protein.
+
+        Includes the query protein itself plus all proteins with >90% identity.
+        """
+        # Start with same-protein exclusion
+        exclude_set = set(self.bmrb_to_indices.get(query_bmrb, set()))
+
+        # Add proteins with >90% sequence identity
+        similar_proteins = self.identity_exclusion.get(query_bmrb, [])
+        for similar_bmrb in similar_proteins:
+            exclude_set.update(self.bmrb_to_indices.get(similar_bmrb, set()))
+
+        return exclude_set
 
     def retrieve(
         self,
@@ -238,10 +265,10 @@ class Retriever:
         out_shifts = np.zeros((n_queries, k, n_shifts), dtype=np.float32)
         out_shift_masks = np.zeros((n_queries, k, n_shifts), dtype=bool)
 
-        # Filter same-protein matches
+        # Filter same-protein and >90% identity matches
         for q in range(n_queries):
             query_bmrb = str(query_bmrb_ids[q])
-            exclude_set = self.bmrb_to_indices.get(query_bmrb, set())
+            exclude_set = self._get_exclusion_set(query_bmrb)
 
             count = 0
             for i in range(k_extra):

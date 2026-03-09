@@ -1,12 +1,13 @@
 """
-RMSD-based structure/chain selection using Kabsch superposition.
+Alignment-identity-based structure/chain selection with Kabsch superposition.
 
 For proteins with multiple candidate PDB structures or chains, selects the
 single best chain by:
   1. Aligning each candidate chain's sequence to the shift sequence
-  2. Superimposing all chains onto a common reference using Kabsch on shared CA atoms
-  3. Computing median coordinates and per-chain RMSD from median
-  4. Selecting the chain with lowest RMSD
+  2. Computing sequence identity (n_match / n_aligned)
+  3. Picking the chain with highest identity
+
+Also provides Kabsch superposition utilities for NMR model selection.
 """
 
 import numpy as np
@@ -92,43 +93,33 @@ def _extract_chain_sequence(residues, chain_id):
     return ''.join(seq_chars), res_ids, ca_coords
 
 
-def _get_common_ca(alignment, struct_rids, struct_ca, shift_rids):
-    """From an alignment, get the mapping of shift residue positions to CA coords.
+def _compute_alignment_identity(alignment):
+    """Compute sequence identity from an alignment.
 
-    Returns list of (shift_pos_index, ca_coord) for matched positions that have CA.
+    Returns:
+        (n_match, n_aligned, identity) where identity = n_match / n_aligned
     """
     a1, a2 = str(alignment[0]), str(alignment[1])
-    i1, i2 = 0, 0
-    matched = []
-
+    n_match = 0
+    n_aligned = 0
     for c1, c2 in zip(a1, a2):
         if c1 != '-' and c2 != '-':
-            srid = struct_rids[i1]
-            if srid in struct_ca:
-                matched.append((i2, struct_ca[srid]))
-        if c1 != '-':
-            i1 += 1
-        if c2 != '-':
-            i2 += 1
-
-    return matched
+            n_aligned += 1
+            if c1 == c2:
+                n_match += 1
+    if n_aligned == 0:
+        return 0, 0, 0.0
+    return n_match, n_aligned, n_match / n_aligned
 
 
 def select_best_chain(candidates, shift_sequence):
-    """Select the best PDB chain from multiple candidates via RMSD analysis.
+    """Select the best PDB chain from multiple candidates via alignment identity.
 
     For each candidate chain:
       1. Align its sequence to shift_sequence
-      2. Extract CA coordinates at aligned positions
+      2. Compute sequence identity
 
-    Then across all chains:
-      3. Find positions present in ALL chains
-      4. Superimpose all chains onto the first using Kabsch
-      5. Compute median coordinates per position
-      6. Compute per-chain RMSD from median
-      7. Return the chain with lowest RMSD
-
-    If only one candidate, returns it directly.
+    Pick the chain with the highest sequence identity.
 
     Args:
         candidates: list of (pdb_path, chain_id) tuples
@@ -141,8 +132,8 @@ def select_best_chain(candidates, shift_sequence):
     if not candidates or not shift_sequence:
         return None, None, None
 
-    # Collect aligned CA coords for each candidate
-    chain_data = []  # list of (pdb_path, chain_id, alignment, {shift_pos: ca_coord})
+    # Collect alignment data for each candidate
+    chain_data = []  # list of (pdb_path, chain_id, alignment, identity, n_aligned)
 
     for pdb_path, chain_id in candidates:
         try:
@@ -151,13 +142,13 @@ def select_best_chain(candidates, shift_sequence):
             continue
 
         seq, rids, ca_coords = _extract_chain_sequence(residues, chain_id)
-        if seq is None or not ca_coords:
+        if seq is None:
             # Try without chain filter if chain_id didn't match
             all_chains = set(ch for ch, _ in residues.keys())
             if chain_id not in all_chains and all_chains:
                 chain_id = sorted(all_chains)[0]
                 seq, rids, ca_coords = _extract_chain_sequence(residues, chain_id)
-                if seq is None or not ca_coords:
+                if seq is None:
                     continue
             else:
                 continue
@@ -166,12 +157,11 @@ def select_best_chain(candidates, shift_sequence):
         if alignment is None:
             continue
 
-        matched = _get_common_ca(alignment, rids, ca_coords, list(range(len(shift_sequence))))
-        if len(matched) < 10:
+        n_match, n_aligned, identity = _compute_alignment_identity(alignment)
+        if n_aligned < 10:
             continue
 
-        pos_to_ca = {pos: coord for pos, coord in matched}
-        chain_data.append((pdb_path, chain_id, alignment, pos_to_ca))
+        chain_data.append((pdb_path, chain_id, alignment, identity, n_aligned))
 
     if not chain_data:
         return None, None, None
@@ -179,43 +169,6 @@ def select_best_chain(candidates, shift_sequence):
     if len(chain_data) == 1:
         return chain_data[0][0], chain_data[0][1], chain_data[0][2]
 
-    # Find positions common to ALL chains
-    common_positions = set(chain_data[0][3].keys())
-    for _, _, _, pos_map in chain_data[1:]:
-        common_positions &= set(pos_map.keys())
-
-    common_positions = sorted(common_positions)
-    if len(common_positions) < 10:
-        # Not enough overlap; return chain with most aligned positions
-        best = max(chain_data, key=lambda x: len(x[3]))
-        return best[0], best[1], best[2]
-
-    # Extract coordinate matrices (N_chains x N_positions x 3)
-    n_chains = len(chain_data)
-    n_pos = len(common_positions)
-    all_coords = np.zeros((n_chains, n_pos, 3))
-
-    for ci, (_, _, _, pos_map) in enumerate(chain_data):
-        for pi, pos in enumerate(common_positions):
-            all_coords[ci, pi, :] = pos_map[pos]
-
-    # Superimpose all chains onto the first
-    ref_coords = all_coords[0]
-    aligned_coords = np.zeros_like(all_coords)
-    aligned_coords[0] = ref_coords
-
-    for ci in range(1, n_chains):
-        rot, trans = kabsch_superimpose(all_coords[ci], ref_coords)
-        aligned_coords[ci] = all_coords[ci] @ rot + trans
-
-    # Compute median coordinates per position
-    median_coords = np.median(aligned_coords, axis=0)
-
-    # Compute per-chain RMSD from median
-    rmsds = np.zeros(n_chains)
-    for ci in range(n_chains):
-        diff = aligned_coords[ci] - median_coords
-        rmsds[ci] = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-
-    best_idx = int(np.argmin(rmsds))
-    return chain_data[best_idx][0], chain_data[best_idx][1], chain_data[best_idx][2]
+    # Pick chain with highest identity, breaking ties by n_aligned
+    best = max(chain_data, key=lambda x: (x[3], x[4]))
+    return best[0], best[1], best[2]

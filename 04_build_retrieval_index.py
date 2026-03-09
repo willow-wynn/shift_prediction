@@ -395,6 +395,17 @@ def main():
     )
     elapsed = time.time() - t0
 
+    # Copy identity exclusion map if it exists
+    exclusion_src = os.path.join(args.data_dir, 'identity_clusters_90.json')
+    exclusion_dst = os.path.join(args.output_dir, 'identity_clusters_90.json')
+    if os.path.exists(exclusion_src):
+        import shutil
+        shutil.copy2(exclusion_src, exclusion_dst)
+        print(f"\nCopied identity exclusion map to {exclusion_dst}")
+    else:
+        print(f"\nWARNING: No identity exclusion map found at {exclusion_src}")
+        print("  Run cluster_sequences.py first for >90% identity exclusion.")
+
     # Save config + full provenance
     config = {
         'embed_dim': ESM_EMBED_DIM,
@@ -402,6 +413,7 @@ def main():
         'shift_cols': shift_cols,
         'faiss_nprobe': FAISS_NPROBE,
         'k_retrieved': K_RETRIEVED,
+        'has_identity_exclusion': os.path.exists(exclusion_dst),
     }
     config_path = os.path.join(args.output_dir, 'config.json')
     with open(config_path, 'w') as f:

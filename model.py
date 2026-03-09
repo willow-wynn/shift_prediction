@@ -126,10 +126,18 @@ class DistanceAttentionPerPosition(nn.Module):
 
 
 class SpatialNeighborAttention(nn.Module):
-    """Attention over k spatially proximate residues."""
+    """Attention over k spatially proximate residues.
+
+    Each neighbor contributes:
+    - Residue type embedding
+    - Secondary structure embedding
+    - Continuous features (CA distance, sequence separation, phi/psi angles)
+    - Structural embedding from distance features (via a shared DistanceAttentionPerPosition)
+    """
 
     def __init__(self, n_residue_types, n_ss_types, k_neighbors=5,
-                 embed_dim=64, hidden_dim=256, dropout=0.30):
+                 embed_dim=64, hidden_dim=256, dropout=0.30,
+                 dist_attn_hidden=None):
         super().__init__()
 
         self.k = k_neighbors
@@ -139,7 +147,15 @@ class SpatialNeighborAttention(nn.Module):
 
         self.continuous_proj = nn.Linear(6, embed_dim // 2)
 
-        combined_dim = embed_dim + embed_dim // 2 + embed_dim // 2
+        # dist_attn_hidden is the output dim of the distance attention module
+        # It will be projected down to embed_dim for combining
+        self.dist_attn_hidden = dist_attn_hidden
+        if dist_attn_hidden is not None and dist_attn_hidden > 0:
+            self.dist_proj = nn.Linear(dist_attn_hidden, embed_dim // 2)
+            combined_dim = embed_dim + embed_dim // 2 + embed_dim // 2 + embed_dim // 2
+        else:
+            self.dist_proj = None
+            combined_dim = embed_dim + embed_dim // 2 + embed_dim // 2
 
         self.attn_score = nn.Sequential(
             nn.Linear(combined_dim, hidden_dim // 2),
@@ -160,7 +176,18 @@ class SpatialNeighborAttention(nn.Module):
 
     def forward(self, neighbor_res_idx, neighbor_ss_idx,
                 neighbor_dist, neighbor_seq_sep, neighbor_angles,
-                neighbor_valid):
+                neighbor_valid,
+                neighbor_dist_embeddings=None):
+        """
+        Args:
+            neighbor_res_idx: (B, K) residue type indices
+            neighbor_ss_idx: (B, K) secondary structure indices
+            neighbor_dist: (B, K) CA distances
+            neighbor_seq_sep: (B, K) sequence separations
+            neighbor_angles: (B, K, 4) sin/cos of phi/psi
+            neighbor_valid: (B, K) validity mask
+            neighbor_dist_embeddings: (B, K, dist_attn_hidden) structural embeddings from distance features
+        """
         B = neighbor_res_idx.size(0)
 
         res_emb = self.residue_embed(neighbor_res_idx)
@@ -179,7 +206,11 @@ class SpatialNeighborAttention(nn.Module):
         ], dim=-1)
         cont_emb = self.continuous_proj(continuous)
 
-        combined = torch.cat([res_emb, ss_emb, cont_emb], dim=-1)
+        if self.dist_proj is not None and neighbor_dist_embeddings is not None:
+            dist_emb_proj = self.dist_proj(neighbor_dist_embeddings)
+            combined = torch.cat([res_emb, ss_emb, cont_emb, dist_emb_proj], dim=-1)
+        else:
+            combined = torch.cat([res_emb, ss_emb, cont_emb], dim=-1)
 
         any_valid = neighbor_valid.any(dim=1)
 
@@ -941,7 +972,8 @@ class ShiftPredictorWithRetrieval(nn.Module):
             k_neighbors=k_spatial,
             embed_dim=64,
             hidden_dim=spatial_hidden,
-            dropout=0.30
+            dropout=0.30,
+            dist_attn_hidden=dist_attn_hidden,
         )
 
         # ========== NEW: Physics feature encoder ==========
@@ -1021,10 +1053,13 @@ class ShiftPredictorWithRetrieval(nn.Module):
         neighbor_res_idx, neighbor_ss_idx,
         neighbor_dist, neighbor_seq_sep, neighbor_angles,
         neighbor_valid,
+        # Spatial neighbor distance features
+        neighbor_atom1_idx=None, neighbor_atom2_idx=None,
+        neighbor_distances=None, neighbor_dist_mask=None,
         # Retrieval inputs
-        query_residue_code,
-        retrieved_shifts, retrieved_shift_masks,
-        retrieved_residue_codes, retrieved_distances, retrieved_valid,
+        query_residue_code=None,
+        retrieved_shifts=None, retrieved_shift_masks=None,
+        retrieved_residue_codes=None, retrieved_distances=None, retrieved_valid=None,
         # NEW: Physics features
         physics_features=None,
         # Allow forwards/backwards compatibility with extra fields
@@ -1033,7 +1068,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
         """Forward pass with retrieval augmentation and physics features."""
         B = distances.size(0)
 
-        # ========== Base encoder (unchanged) ==========
+        # ========== Base encoder ==========
         dist_emb = self.distance_attention(
             atom1_idx, atom2_idx, distances, dist_mask
         )
@@ -1057,10 +1092,24 @@ class ShiftPredictorWithRetrieval(nn.Module):
         center_idx = x.size(1) // 2
         x_center = x[:, center_idx, :]
 
+        # Compute distance embeddings for spatial neighbors
+        neighbor_dist_embeddings = None
+        if neighbor_atom1_idx is not None and neighbor_distances is not None:
+            K_sp = neighbor_atom1_idx.size(1)
+            M_sp = neighbor_atom1_idx.size(2)
+            # Reshape (B, K, M) -> (B*K, 1, M) to reuse DistanceAttentionPerPosition
+            nb_a1 = neighbor_atom1_idx.view(B * K_sp, 1, M_sp)
+            nb_a2 = neighbor_atom2_idx.view(B * K_sp, 1, M_sp)
+            nb_d = neighbor_distances.view(B * K_sp, 1, M_sp)
+            nb_m = neighbor_dist_mask.view(B * K_sp, 1, M_sp)
+            nb_dist_emb = self.distance_attention(nb_a1, nb_a2, nb_d, nb_m)  # (B*K, 1, hidden)
+            neighbor_dist_embeddings = nb_dist_emb.squeeze(1).view(B, K_sp, -1)  # (B, K, hidden)
+
         x_spatial = self.spatial_attention(
             neighbor_res_idx, neighbor_ss_idx,
             neighbor_dist, neighbor_seq_sep, neighbor_angles,
-            neighbor_valid
+            neighbor_valid,
+            neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
 
         # ========== NEW: Physics encoding ==========

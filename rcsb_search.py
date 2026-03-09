@@ -10,7 +10,10 @@ import json
 import urllib.request
 import time
 
-from config import RCSB_SEARCH_URL, BLAST_IDENTITY_CUTOFF, AA_3_TO_1
+from config import RCSB_SEARCH_URL, AA_3_TO_1
+
+# Default identity cutoff for RCSB sequence search (kept local since BLAST fallback is removed)
+_DEFAULT_IDENTITY_CUTOFF = 0.30
 
 
 def search_pdb_by_sequence(sequence, identity_cutoff=None, evalue_cutoff=1.0, max_results=10):
@@ -18,7 +21,7 @@ def search_pdb_by_sequence(sequence, identity_cutoff=None, evalue_cutoff=1.0, ma
 
     Args:
         sequence: Single-letter amino acid sequence
-        identity_cutoff: Minimum sequence identity (default from config)
+        identity_cutoff: Minimum sequence identity (default 0.30)
         evalue_cutoff: Maximum E-value (default 1.0)
         max_results: Maximum number of results to return
 
@@ -27,7 +30,7 @@ def search_pdb_by_sequence(sequence, identity_cutoff=None, evalue_cutoff=1.0, ma
         Empty list on failure.
     """
     if identity_cutoff is None:
-        identity_cutoff = BLAST_IDENTITY_CUTOFF
+        identity_cutoff = _DEFAULT_IDENTITY_CUTOFF
 
     if not sequence or len(sequence) < 10:
         return []
