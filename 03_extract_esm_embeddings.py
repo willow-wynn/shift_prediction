@@ -338,7 +338,7 @@ def main():
     # Locate compiled CSV
     # Try common dataset names in order of preference
     csv_path = None
-    for name in ['structure_data.csv', 'compiled_dataset.csv', 'sidechain_structure_data.csv', 'small_structure_data.csv']:
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'compiled_dataset.csv', 'sidechain_structure_data.csv', 'small_structure_data.csv']:
         candidate = os.path.join(args.data_dir, name)
         if os.path.exists(candidate):
             csv_path = candidate

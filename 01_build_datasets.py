@@ -47,7 +47,6 @@ from alignment import align_sequences, to_single_letter
 from distance_features import compute_all_distance_features, get_sidechain_summary_names
 from spatial_neighbors import find_neighbors
 from physics_features import compute_all_physics_features, get_physics_feature_names
-from rcsb_search import extract_sequence_from_shifts
 from structure_selection import select_best_chain, kabsch_superimpose
 from alphafold_utils import get_uniprot_for_bmrb, download_alphafold_structure
 
@@ -500,35 +499,47 @@ def get_alphafold_structures(bmrb_ids, shifts_df, alphafold_dir, online=False):
     Returns:
         dict: bmrb_id -> (af_pdb_path, chain_id)
     """
+    # BMRB->UniProt mapping cache for offline mode
+    mapping_cache_path = os.path.join(alphafold_dir, 'bmrb_uniprot_mapping.json')
+
     if not online:
-        # Check for existing AlphaFold files
+        # Offline: use cached BMRB->UniProt mapping + existing AlphaFold PDBs
+        from alphafold_utils import AF_MODEL_VERSION
         af_structures = {}
-        if os.path.isdir(alphafold_dir):
+        if os.path.isdir(alphafold_dir) and os.path.exists(mapping_cache_path):
+            with open(mapping_cache_path) as f:
+                mapping = json.load(f)
             for bmrb_id in bmrb_ids:
-                # Try to find an existing AlphaFold file
-                for fname in os.listdir(alphafold_dir):
-                    if fname.endswith('.pdb') and fname.startswith('AF-'):
-                        # Can't map without UniProt info in offline mode
-                        pass
+                uniprot_id = mapping.get(str(bmrb_id))
+                if uniprot_id is None:
+                    continue
+                af_path = os.path.join(alphafold_dir, f'AF-{uniprot_id}-F1-{AF_MODEL_VERSION}.pdb')
+                if os.path.exists(af_path):
+                    af_structures[bmrb_id] = (af_path, 'A')
+            if af_structures:
+                print(f"  Offline: found {len(af_structures)} cached AlphaFold structures")
+        else:
+            print("  Offline mode: no AlphaFold mapping cache found. Run with --online first.")
         return af_structures
 
     os.makedirs(alphafold_dir, exist_ok=True)
     af_structures = {}
     counters = defaultdict(int)
+    bmrb_uniprot_mapping = {}
+
+    # Load existing mapping cache to avoid redundant API calls
+    if os.path.exists(mapping_cache_path):
+        with open(mapping_cache_path) as f:
+            bmrb_uniprot_mapping = json.load(f)
 
     for bmrb_id in tqdm(bmrb_ids, desc="Fetching AlphaFold structures"):
-        # Step 1: Map BMRB -> UniProt
-        uniprot_id = get_uniprot_for_bmrb(bmrb_id)
-
-        # Fallback: sequence search
-        if uniprot_id is None:
-            prot_shifts = shifts_df[shifts_df['bmrb_id'] == bmrb_id]
-            seq = extract_sequence_from_shifts(prot_shifts)
-            if seq and len(seq) >= 20:
-                from alphafold_utils import search_uniprot_by_sequence
-                uniprot_id = search_uniprot_by_sequence(seq)
-                if uniprot_id:
-                    counters['uniprot_via_sequence'] += 1
+        # Step 1: Map BMRB -> UniProt (check cache first)
+        if str(bmrb_id) in bmrb_uniprot_mapping:
+            uniprot_id = bmrb_uniprot_mapping[str(bmrb_id)]
+        else:
+            uniprot_id = get_uniprot_for_bmrb(bmrb_id)
+            if uniprot_id is not None:
+                bmrb_uniprot_mapping[str(bmrb_id)] = uniprot_id
 
         if uniprot_id is None:
             counters['no_uniprot'] += 1
@@ -543,12 +554,15 @@ def get_alphafold_structures(bmrb_ids, shifts_df, alphafold_dir, online=False):
         af_structures[bmrb_id] = (af_path, 'A')  # AlphaFold always uses chain A
         counters['af_downloaded'] += 1
 
+    # Save mapping cache for offline use
+    with open(mapping_cache_path, 'w') as f:
+        json.dump(bmrb_uniprot_mapping, f, indent=2)
+
     print(f"\n  AlphaFold structure results:")
     print(f"    Downloaded:          {counters['af_downloaded']:,}")
     print(f"    No UniProt mapping:  {counters['no_uniprot']:,}")
     print(f"    AF not available:    {counters['af_not_available']:,}")
-    if counters['uniprot_via_sequence']:
-        print(f"    UniProt via seq:     {counters['uniprot_via_sequence']:,}")
+    print(f"    BMRB->UniProt mappings cached: {len(bmrb_uniprot_mapping):,}")
 
     return af_structures
 

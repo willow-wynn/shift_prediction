@@ -392,21 +392,16 @@ def main():
 
     # ========== Load data ==========
     print("\nLoading data...")
-    data_file = os.path.join(args.data_dir, 'structure_data.csv')
-    if not os.path.exists(data_file):
-        # Try alternative name
-        candidates = [
-            os.path.join(args.data_dir, 'small_structure_data.csv'),
-            os.path.join(args.data_dir, 'sidechain_structure_data.csv'),
-        ]
-        for c in candidates:
-            if os.path.exists(c):
-                data_file = c
-                break
-        else:
-            print(f"ERROR: No data file found in {args.data_dir}")
-            print(f"  Tried: structure_data.csv, small_structure_data.csv, sidechain_structure_data.csv")
-            sys.exit(1)
+    data_file = None
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'small_structure_data.csv', 'sidechain_structure_data.csv']:
+        candidate = os.path.join(args.data_dir, name)
+        if os.path.exists(candidate):
+            data_file = candidate
+            break
+    if data_file is None:
+        print(f"ERROR: No data file found in {args.data_dir}")
+        print(f"  Tried: structure_data_hybrid.csv, structure_data.csv, small_structure_data.csv, sidechain_structure_data.csv")
+        sys.exit(1)
 
     df = pd.read_csv(data_file, dtype={'bmrb_id': str})
     print(f"  Loaded {len(df):,} residues from {df['bmrb_id'].nunique():,} proteins")

@@ -1,5 +1,8 @@
 """Central configuration for the clean chemical shift prediction pipeline."""
 
+import os
+import shutil
+
 import numpy as np
 
 # ============================================================================
@@ -7,7 +10,7 @@ import numpy as np
 # ============================================================================
 DATA_DIR = 'data'
 PDB_DIR = 'data/pdbs'
-DSSP_PATH = '/opt/homebrew/bin/dssp'
+DSSP_PATH = os.environ.get('DSSP_PATH') or shutil.which('mkdssp') or shutil.which('dssp') or 'mkdssp'
 
 # ============================================================================
 # Amino Acid Mappings
