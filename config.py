@@ -7,7 +7,7 @@ import numpy as np
 # ============================================================================
 DATA_DIR = 'data'
 PDB_DIR = 'data/pdbs'
-DSSP_PATH = '/opt/homebrew/bin/dssp'
+DSSP_PATH = '/home/brooks/Programs/localcolabfold/conda/envs/ucbshift/bin/mkdssp'
 
 # ============================================================================
 # Amino Acid Mappings

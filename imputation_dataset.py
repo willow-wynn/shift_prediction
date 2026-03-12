@@ -382,7 +382,3 @@ def load_imputation_dataset(
         n_shifts=n_shifts,
         context_window=context_window,
     )
-
-
-# Need numpy for _get_structural_and_retrieval
-import numpy as np  # noqa: E402 (already imported at top, but making dependency explicit)

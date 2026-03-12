@@ -253,13 +253,8 @@ class PhysicsFeatureEncoder(nn.Module):
     """
     Encode physics-based features into a fixed-dim representation.
 
-    Input features (~8 dimensions):
-        - ring_current_h, ring_current_ha (2)
-        - hse_up, hse_down, hse_ratio (3)
-        - hbond_dist_1, hbond_energy_1 (2)
-        - hbond_dist_2, hbond_energy_2 (2) [currently unused placeholders -- kept for compat]
-        - order_parameter (1)
-        Total: ~8 (flexible, determined at init)
+    Input features are derived from DSSP H-bond geometry. The exact
+    dimensionality is determined at runtime (n_physics parameter).
 
     Output: 64-dim vector concatenated with the base encoder.
     """

@@ -4,7 +4,6 @@ AlphaFold Database utilities.
 Handles:
   - Mapping BMRB IDs to UniProt accessions (via BMRB REST API)
   - Downloading AlphaFold predicted structures
-  - Fallback UniProt sequence search
 """
 
 import os
@@ -16,7 +15,12 @@ from config import ALPHAFOLD_DB_URL, ALPHAFOLD_DIR
 
 
 BMRB_ENTRY_URL = 'https://api.bmrb.io/v2/entry/{bmrb_id}?format=json'
-UNIPROT_SEARCH_URL = 'https://rest.uniprot.org/uniprotkb/search'
+
+# UniProt database name variants found in BMRB entries
+UNIPROT_DB_NAMES = {'UNIPROT', 'UNP', 'SP', 'SWISSPROT', 'SWISS-PROT', 'TREMBL'}
+
+# AlphaFold model version (v4 as of 2024)
+AF_MODEL_VERSION = 'model_v4'
 
 
 def _fetch_json(url, retries=3, timeout=30):
@@ -43,6 +47,25 @@ def _fetch_json(url, retries=3, timeout=30):
     return None
 
 
+def _extract_saveframes(data, bmrb_id):
+    """Extract saveframes list from BMRB API JSON response.
+
+    The API returns {bmrb_id: {saveframes: [...]}}. This matches the
+    parsing pattern used in 00_fetch_bmrb_shifts.py.
+    """
+    entry = data.get(str(bmrb_id)) or data.get('data')
+    if entry is None:
+        for v in data.values():
+            if isinstance(v, dict) and 'saveframes' in v:
+                entry = v
+                break
+    if entry is None:
+        return []
+
+    saveframes = entry.get('saveframes', []) if isinstance(entry, dict) else entry
+    return saveframes if isinstance(saveframes, list) else []
+
+
 def get_uniprot_for_bmrb(bmrb_id):
     """Look up UniProt accession for a BMRB entry via BMRB REST API.
 
@@ -60,8 +83,9 @@ def get_uniprot_for_bmrb(bmrb_id):
         return None
 
     try:
-        # Navigate NMR-STAR JSON to find database references
-        for saveframe in data.get('data', []):
+        saveframes = _extract_saveframes(data, bmrb_id)
+
+        for saveframe in saveframes:
             if not isinstance(saveframe, dict):
                 continue
             loops = saveframe.get('loops', [])
@@ -69,26 +93,18 @@ def get_uniprot_for_bmrb(bmrb_id):
                 tags = loop.get('tags', [])
                 loop_data = loop.get('data', [])
 
-                # Look for database link loops
+                # Normalize tag names (strip NMR-STAR prefix like "Entity_db_link.")
                 tag_names = [t.split('.')[-1] if '.' in t else t for t in tags]
 
+                # Find database code and accession columns
+                # BMRB uses both Database_code/Accession_code and Entry_code
                 db_name_idx = None
                 acc_idx = None
                 for i, t in enumerate(tag_names):
-                    if t in ('Database_code', 'Accession_code', 'database_code',
-                             'accession_code'):
-                        if 'atabase' in t.lower() and 'code' in t.lower() and 'ccession' not in t.lower():
-                            db_name_idx = i
-                        elif 'ccession' in t.lower():
-                            acc_idx = i
-                    elif t in ('Type', 'type'):
-                        pass
-
-                # Alternative: look for exact tag positions
-                for i, t in enumerate(tag_names):
-                    if t == 'Database_code' or t == 'database_code':
+                    if t in ('Database_code', 'database_code'):
                         db_name_idx = i
-                    if t == 'Accession_code' or t == 'accession_code':
+                    if t in ('Accession_code', 'accession_code',
+                             'Entry_code', 'entry_code'):
                         acc_idx = i
 
                 if db_name_idx is None or acc_idx is None:
@@ -96,9 +112,9 @@ def get_uniprot_for_bmrb(bmrb_id):
 
                 for row_data in loop_data:
                     try:
-                        db_name = str(row_data[db_name_idx]).upper()
+                        db_name = str(row_data[db_name_idx]).strip().upper()
                         accession = str(row_data[acc_idx]).strip()
-                        if db_name in ('UNIPROT', 'UNP', 'SP', 'SWISSPROT', 'TREMBL') and accession and accession != '.':
+                        if db_name in UNIPROT_DB_NAMES and accession and accession != '.':
                             return accession
                     except (IndexError, TypeError):
                         continue
@@ -124,11 +140,11 @@ def download_alphafold_structure(uniprot_id, output_dir=None):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    output_path = os.path.join(output_dir, f'AF-{uniprot_id}-F1-model_v4.pdb')
+    output_path = os.path.join(output_dir, f'AF-{uniprot_id}-F1-{AF_MODEL_VERSION}.pdb')
     if os.path.exists(output_path):
         return output_path
 
-    url = f'{ALPHAFOLD_DB_URL}/AF-{uniprot_id}-F1-model_v4.pdb'
+    url = f'{ALPHAFOLD_DB_URL}/AF-{uniprot_id}-F1-{AF_MODEL_VERSION}.pdb'
 
     for attempt in range(3):
         try:
@@ -150,39 +166,5 @@ def download_alphafold_structure(uniprot_id, output_dir=None):
                 time.sleep(2 ** attempt)
             else:
                 return None
-
-    return None
-
-
-def search_uniprot_by_sequence(sequence, identity_threshold=0.9):
-    """Search UniProt by protein sequence as a fallback for BMRB->UniProt mapping.
-
-    Uses the UniProt REST API BLAST search.
-
-    Args:
-        sequence: Single-letter amino acid sequence
-        identity_threshold: Minimum identity to accept (default 0.9)
-
-    Returns:
-        UniProt accession string, or None if no good match
-    """
-    if not sequence or len(sequence) < 10:
-        return None
-
-    # Use UniProt's text search with sequence (BLAST endpoint)
-    url = f'{UNIPROT_SEARCH_URL}?query=sequence:{sequence[:50]}&format=json&size=1'
-
-    try:
-        req = urllib.request.Request(url)
-        req.add_header('Accept', 'application/json')
-        req.add_header('User-Agent', 'he_lab_pipeline/1.0')
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-
-        results = data.get('results', [])
-        if results:
-            return results[0].get('primaryAccession')
-    except Exception:
-        pass
 
     return None

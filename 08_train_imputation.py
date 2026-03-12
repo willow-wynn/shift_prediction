@@ -290,16 +290,15 @@ def main():
 
     # Load data file for stats computation
     print("\nLoading data for statistics...")
-    data_file = os.path.join(args.data_dir, 'structure_data.csv')
-    if not os.path.exists(data_file):
-        for c in ['small_structure_data.csv', 'sidechain_structure_data.csv']:
-            p = os.path.join(args.data_dir, c)
-            if os.path.exists(p):
-                data_file = p
-                break
-        else:
-            print(f"ERROR: No data file found in {args.data_dir}")
-            sys.exit(1)
+    data_file = None
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'small_structure_data.csv', 'sidechain_structure_data.csv']:
+        candidate = os.path.join(args.data_dir, name)
+        if os.path.exists(candidate):
+            data_file = candidate
+            break
+    if data_file is None:
+        print(f"ERROR: No data file found in {args.data_dir}")
+        sys.exit(1)
 
     df = pd.read_csv(data_file, dtype={'bmrb_id': str})
     shift_cols = parse_shift_columns(df.columns)
