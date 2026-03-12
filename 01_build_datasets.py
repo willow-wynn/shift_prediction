@@ -504,6 +504,7 @@ def get_alphafold_structures(bmrb_ids, shifts_df, alphafold_dir, online=False):
 
     if not online:
         # Offline: use cached BMRB->UniProt mapping + existing AlphaFold PDBs
+        from alphafold_utils import AF_MODEL_VERSION
         af_structures = {}
         if os.path.isdir(alphafold_dir) and os.path.exists(mapping_cache_path):
             with open(mapping_cache_path) as f:
@@ -512,7 +513,6 @@ def get_alphafold_structures(bmrb_ids, shifts_df, alphafold_dir, online=False):
                 uniprot_id = mapping.get(str(bmrb_id))
                 if uniprot_id is None:
                     continue
-                from alphafold_utils import AF_MODEL_VERSION
                 af_path = os.path.join(alphafold_dir, f'AF-{uniprot_id}-F1-{AF_MODEL_VERSION}.pdb')
                 if os.path.exists(af_path):
                     af_structures[bmrb_id] = (af_path, 'A')
