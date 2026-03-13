@@ -553,6 +553,7 @@ class QueryConditionedTransfer(nn.Module):
         dropout: float = 0.2,
         use_random_coil: bool = True,
         shift_cols: list = None,
+        stats: dict = None,
     ):
         super().__init__()
 
@@ -565,11 +566,20 @@ class QueryConditionedTransfer(nn.Module):
 
         # Build random coil lookup table as a buffer (not a parameter)
         # Shape: (n_residue_types, n_shifts) -- NaN where unavailable
+        # When stats are provided, normalize RC values to z-score space so they
+        # match the z-normalized shifts in the retrieval cache.
         if use_random_coil:
             if shift_cols is None:
-                # Default shift column names matching the 6 backbone shifts
                 shift_cols = ['ca_shift', 'cb_shift', 'c_shift', 'n_shift', 'h_shift', 'ha_shift']
             rc_np = build_rc_tensor(STANDARD_RESIDUES, shift_cols)  # (n_res, n_shifts)
+            # Convert RC table from raw ppm to z-score space
+            if stats is not None:
+                for si, col in enumerate(shift_cols):
+                    if col in stats and si < rc_np.shape[1]:
+                        mean = stats[col]['mean']
+                        std = stats[col]['std']
+                        valid = ~np.isnan(rc_np[:, si])
+                        rc_np[valid, si] = (rc_np[valid, si] - mean) / std
             # Pad with NaN row for UNK / out-of-range indices
             rc_padded = np.full((n_residue_types + 1, n_shifts), np.nan, dtype=np.float32)
             rc_padded[:rc_np.shape[0], :rc_np.shape[1]] = rc_np
@@ -915,6 +925,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
         use_query_conditioned_transfer: bool = True,
         use_random_coil: bool = True,
         shift_cols: list = None,
+        stats: dict = None,
     ):
         super().__init__()
 
@@ -1004,6 +1015,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
                     dropout=retrieval_dropout,
                     use_random_coil=use_random_coil,
                     shift_cols=shift_cols,
+                    stats=stats,
                 )
             else:
                 # Fall back to simple weighted average
@@ -1177,6 +1189,7 @@ def create_model(
     n_physics: int = 28,
     shift_cols: list = None,
     use_random_coil: bool = True,
+    stats: dict = None,
     **kwargs,
 ) -> ShiftPredictorWithRetrieval:
     """Create model with sensible defaults from config.
@@ -1187,6 +1200,7 @@ def create_model(
         n_physics: Number of physics feature dimensions
         shift_cols: List of shift column names (for RC correction lookup)
         use_random_coil: Whether to apply random coil correction in transfer
+        stats: Per-shift normalization stats (mean/std) for RC z-score conversion
         **kwargs: Override any ShiftPredictorWithRetrieval parameter
 
     Returns:
@@ -1198,5 +1212,6 @@ def create_model(
         n_physics=n_physics,
         shift_cols=shift_cols,
         use_random_coil=use_random_coil,
+        stats=stats,
         **kwargs,
     )

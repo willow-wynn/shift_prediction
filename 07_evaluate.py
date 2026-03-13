@@ -153,6 +153,7 @@ def load_model(checkpoint_path, device):
         use_query_conditioned_transfer=use_query_conditioned,
         use_random_coil=use_random_coil,
         shift_cols=shift_cols,
+        stats=stats,
     ).to(device)
 
     model.load_state_dict(clean_state_dict)

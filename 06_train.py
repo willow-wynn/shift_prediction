@@ -151,16 +151,27 @@ def mask_cs_outliers(df, stats, shift_cols):
 # Loss Functions
 # ============================================================================
 
-def huber_loss_masked(pred, target, mask, delta=0.5):
-    """Huber loss over masked positions.
+def build_shift_weights(shift_cols, device):
+    """Build per-shift loss weights. N gets 4x, other backbone 2x."""
+    from config import BACKBONE_LOSS_WEIGHT, N_SHIFT_LOSS_WEIGHT
+    weights = torch.ones(len(shift_cols), device=device)
+    for si, col in enumerate(shift_cols):
+        if col == 'n_shift':
+            weights[si] = N_SHIFT_LOSS_WEIGHT
+        else:
+            weights[si] = BACKBONE_LOSS_WEIGHT
+    return weights
 
-    Targets are z-normalized, so equal weighting across shift types is correct.
+
+def huber_loss_masked(pred, target, mask, delta=0.5, shift_weights=None):
+    """Huber loss over masked positions with optional per-shift weighting.
 
     Args:
         pred: (B, n_shifts) predictions
         target: (B, n_shifts) targets
         mask: (B, n_shifts) boolean mask
         delta: Huber delta parameter
+        shift_weights: (n_shifts,) optional per-shift loss weights
 
     Returns:
         Scalar loss
@@ -168,7 +179,13 @@ def huber_loss_masked(pred, target, mask, delta=0.5):
     if mask.sum() == 0:
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
-    loss = F.huber_loss(pred[mask], target[mask], reduction='mean', delta=delta)
+    if shift_weights is not None:
+        # Per-element Huber loss with shift-specific weighting
+        elem_loss = F.huber_loss(pred, target, reduction='none', delta=delta)
+        weighted = elem_loss * shift_weights.unsqueeze(0)  # (B, n_shifts)
+        loss = weighted[mask].mean()
+    else:
+        loss = F.huber_loss(pred[mask], target[mask], reduction='mean', delta=delta)
 
     if torch.isnan(loss) or torch.isinf(loss):
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
@@ -181,7 +198,7 @@ def huber_loss_masked(pred, target, mask, delta=0.5):
 # ============================================================================
 
 def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
-                clear_cache_every=50):
+                clear_cache_every=50, shift_weights=None):
     """Training epoch with Huber loss and outlier tracking.
 
     Returns:
@@ -212,7 +229,8 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
         ctx = autocast('cuda') if scaler else nullcontext()
         with ctx:
             pred = model(**batch)
-            loss = huber_loss_masked(pred, target, mask, delta=delta)
+            loss = huber_loss_masked(pred, target, mask, delta=delta,
+                                     shift_weights=shift_weights)
 
         if torch.isnan(loss) or torch.isinf(loss):
             nan_batches += 1
@@ -626,6 +644,7 @@ def main():
         n_physics=n_physics,
         shift_cols=shift_cols,
         use_random_coil=not args.no_random_coil,
+        stats=stats,
         n_dssp=len(dssp_cols),
         k_spatial=K_SPATIAL_NEIGHBORS,
         use_query_conditioned_transfer=not args.no_query_conditioned,
@@ -707,6 +726,9 @@ def main():
     print("Starting training...")
     print("=" * 80)
 
+    shift_weights = build_shift_weights(shift_cols, device)
+    print(f"  Shift loss weights: {dict(zip(shift_cols, shift_weights.tolist()))}")
+
     best_mae = float('inf')
     epoch_times = []
 
@@ -716,7 +738,7 @@ def main():
 
         train_loss = train_epoch(
             model, train_loader, optimizer, device, scaler,
-            delta=args.huber_delta,
+            delta=args.huber_delta, shift_weights=shift_weights,
         )
         scheduler.step()
 
