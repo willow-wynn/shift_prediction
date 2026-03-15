@@ -306,7 +306,7 @@ class SafeMultiHeadAttention(nn.Module):
         V = self.v_proj(value).view(B, Lk, H, HD).transpose(1, 2)
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
         if valid_mask is not None:
-            scores = scores.masked_fill(~valid_mask.unsqueeze(1).unsqueeze(2), -1e9)
+            scores = scores.masked_fill(~valid_mask.unsqueeze(1).unsqueeze(2), -1e4)
         weights = self.attn_drop(F.softmax(scores, dim=-1))
         out = torch.matmul(weights, V)
         out = out.transpose(1, 2).contiguous().view(B, Lq, D)
@@ -416,7 +416,7 @@ class ShiftSpecificCrossAttention(nn.Module):
         Vp = Vp.view(B, K, H, HD).transpose(1, 2)
         attn = torch.matmul(Q, Kp.transpose(-2, -1)) * self.scale
         attn = attn + ret_distances.unsqueeze(1).unsqueeze(2) * self.cos_scale
-        attn = attn.masked_fill(~ret_valid.unsqueeze(1).unsqueeze(2), -1e9)
+        attn = attn.masked_fill(~ret_valid.unsqueeze(1).unsqueeze(2), -1e4)
         attn = self.dropout(F.softmax(attn, dim=-1))
         out = torch.matmul(attn, Vp)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
@@ -441,7 +441,7 @@ class DirectTransferHead(nn.Module):
         B, K, S = ret_shifts.shape
         scores = self.scorer(neighbor_enc) * self.temperature
         valid_3d = ret_valid.unsqueeze(-1) & ret_masks
-        scores = scores.masked_fill(~valid_3d, -1e9)
+        scores = scores.masked_fill(~valid_3d, -1e4)
         weights = F.softmax(scores, dim=1) * valid_3d.float()
         transferred = (weights * ret_shifts).sum(dim=1)
         transferred = transferred * self.shift_scale + self.shift_bias
