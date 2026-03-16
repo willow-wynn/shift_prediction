@@ -344,12 +344,13 @@ class RetrievalNeighborEncoder(nn.Module):
     and mask coverage fraction.
     """
 
-    def __init__(self, n_residue_types, n_shifts, d_model, k=32, dropout=0.1):
+    def __init__(self, n_residue_types, n_shifts, n_struct, d_model, k=32, dropout=0.1):
         super().__init__()
         self.aa_embed = nn.Embedding(n_residue_types + 1, 48, padding_idx=n_residue_types)
         self.rank_embed = nn.Embedding(k, 24)
         # input: aa_emb(48) + rank(24) + cos_sim(1) + same_aa(1) + shifts(S) + deviation(S) + mask_frac(1)
-        input_dim = 48 + 24 + 1 + 1 + n_shifts + n_shifts + 1
+        #        + nbr_struct(n_struct) + struct_diff(n_struct) + struct_l2(1)
+        input_dim = 48 + 24 + 1 + 1 + n_shifts + n_shifts + 1 + n_struct + n_struct + 1
         self.net = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(), nn.Dropout(dropout),
@@ -360,7 +361,7 @@ class RetrievalNeighborEncoder(nn.Module):
         )
 
     def forward(self, ret_codes, ret_distances, ret_shifts, ret_masks,
-                ret_valid, query_aa, nbr_mean):
+                ret_valid, query_aa, nbr_mean, ret_nbr_struct, query_struct):
         B, K, S = ret_shifts.shape
         codes = ret_codes.clamp(0, self.aa_embed.num_embeddings - 2) * ret_valid.long()
         aa_emb = self.aa_embed(codes)
@@ -372,9 +373,13 @@ class RetrievalNeighborEncoder(nn.Module):
         masked_shifts = ret_shifts * mf
         deviation = ((ret_shifts - nbr_mean.unsqueeze(1)) * mf).clamp(-10, 10)
         mask_frac = mf.sum(dim=-1, keepdim=True) / max(S, 1)
+        query_struct_exp = query_struct.unsqueeze(1).expand(-1, K, -1)
+        struct_diff = (query_struct_exp - ret_nbr_struct).clamp(-10, 10)
+        struct_l2 = torch.norm(struct_diff, dim=-1, keepdim=True) / 10.0
         features = torch.cat([
             aa_emb, rank_emb, cos_sim, same_aa,
             masked_shifts, deviation, mask_frac,
+            ret_nbr_struct, struct_diff, struct_l2,
         ], dim=-1)
         enc = self.net(features)
         return enc * ret_valid.unsqueeze(-1).float()
@@ -562,6 +567,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
         n_self_attn: int = 2,
         n_cross_attn: int = 3,
         k_retrieved: int = 32,
+        n_struct: int = 49,
         # RC correction
         use_random_coil: bool = True,
         shift_cols: list = None,
@@ -647,7 +653,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
 
         # Neighbor encoder + self-attention
         self.neighbor_encoder = RetrievalNeighborEncoder(
-            n_residue_types, n_shifts, retrieval_hidden,
+            n_residue_types, n_shifts, n_struct, retrieval_hidden,
             k=k_retrieved, dropout=retrieval_dropout)
 
         self.self_attn_layers = nn.ModuleList([
@@ -729,6 +735,9 @@ class ShiftPredictorWithRetrieval(nn.Module):
         retrieved_residue_codes=None, retrieved_distances=None, retrieved_valid=None,
         # Physics features
         physics_features=None,
+        # Structural feature vectors for retrieval
+        query_struct=None,
+        neighbor_struct=None,
         # Extra fields for compatibility
         **kwargs,
     ):
@@ -809,12 +818,19 @@ class ShiftPredictorWithRetrieval(nn.Module):
         nbr_mean = self._compute_nbr_mean(
             retrieved_shifts, retrieved_shift_masks, retrieved_valid)
 
-        # Encode neighbors
+        # Encode neighbors (with structural context)
         K = retrieved_shifts.size(1)
+        if query_struct is None:
+            query_struct = torch.zeros(B, self.neighbor_encoder.net[0].in_features,
+                                       device=base_encoding.device)
+        if neighbor_struct is None:
+            neighbor_struct = torch.zeros(B, K, query_struct.size(-1),
+                                          device=base_encoding.device)
         nbr_enc = self.neighbor_encoder(
             retrieved_residue_codes, retrieved_distances,
             retrieved_shifts, retrieved_shift_masks,
-            retrieved_valid, query_residue_code, nbr_mean)
+            retrieved_valid, query_residue_code, nbr_mean,
+            neighbor_struct, query_struct)
 
         # Self-attention over neighbors
         for sa_layer in self.self_attn_layers:

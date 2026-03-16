@@ -61,6 +61,23 @@ BACKBONE_CORE_ATOMS = ['C', 'CA', 'N', 'O']
 BACKBONE_H_ATOMS = ['H', 'CB', 'HA']
 
 # ============================================================================
+# Compact Structural Feature Vector (49-dim per residue)
+# Used by retrieval neighbor encoder for structural comparison
+# ============================================================================
+STRUCT_DIST_COLS = [
+    'dist_C_CA', 'dist_C_CB', 'dist_C_H', 'dist_C_HA', 'dist_C_N', 'dist_C_O',
+    'dist_CA_CB', 'dist_CA_H', 'dist_CA_HA', 'dist_CA_N', 'dist_CA_O',
+    'dist_CB_H', 'dist_CB_HA', 'dist_CB_N', 'dist_CB_O',
+    'dist_H_HA', 'dist_H_N', 'dist_H_O', 'dist_HA_N', 'dist_HA_O', 'dist_N_O',
+]
+STRUCT_SC_COLS = [
+    'sc_n_resolved', 'sc_mean_dist_ca', 'sc_compactness', 'sc_max_extent',
+    'sc_centroid_dist',
+]
+# Total: 21 + 5 + 4(angles) + 9(DSSP) + 10(SS one-hot) = 49
+N_STRUCT_FEATURES = len(STRUCT_DIST_COLS) + len(STRUCT_SC_COLS) + 4 + len(DSSP_COLS) + len(SS_TYPES)
+
+# ============================================================================
 # Spatial Neighbor Parameters
 # ============================================================================
 K_SPATIAL_NEIGHBORS = 5
@@ -90,7 +107,6 @@ HUBER_DELTA = 0.5
 WEIGHT_DECAY = 0.05
 OUTLIER_STD_THRESHOLD = 4.0
 BACKBONE_LOSS_WEIGHT = 2.0
-N_SHIFT_LOSS_WEIGHT = 4.0
 
 # Model architecture
 DIST_ATTN_EMBED = 32
@@ -101,8 +117,8 @@ INPUT_DROPOUT = 0.10
 LAYER_DROPOUTS = [0.40, 0.40, 0.40, 0.40, 0.40]
 HEAD_DROPOUT = 0.45
 SPATIAL_ATTN_HIDDEN = 192
-RETRIEVAL_HIDDEN = 192
-RETRIEVAL_HEADS = 4
+RETRIEVAL_HIDDEN = 320
+RETRIEVAL_HEADS = 8
 RETRIEVAL_DROPOUT = 0.3
 MAX_VALID_DISTANCES = 400
 

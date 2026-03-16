@@ -62,6 +62,7 @@ from config import (
     CONTEXT_WINDOW,
     K_SPATIAL_NEIGHBORS,
     MAX_VALID_DISTANCES,
+    STRUCT_DIST_COLS, STRUCT_SC_COLS, N_STRUCT_FEATURES,
 )
 
 
@@ -117,6 +118,57 @@ def get_physics_columns(df_columns):
     return [c for c in PHYSICS_COLS if c in df_columns]
 
 
+def extract_struct_features(pdf, start_idx, n, flat_struct):
+    """Extract 49-dim structural feature vector for each residue.
+
+    Layout: [0:21] backbone distances, [21:26] SC geometry,
+            [26:30] sin/cos phi/psi, [30:39] DSSP, [39:49] SS one-hot
+    """
+    # [0:21] Backbone pairwise distances
+    for ci, col in enumerate(STRUCT_DIST_COLS):
+        if col in pdf.columns:
+            vals = pdf[col].values
+            valid = ~np.isnan(vals)
+            flat_struct[start_idx:start_idx + n, ci] = np.where(valid, vals, 0.0)
+
+    # [21:26] Sidechain geometry
+    off = len(STRUCT_DIST_COLS)
+    for ci, col in enumerate(STRUCT_SC_COLS):
+        if col in pdf.columns:
+            vals = pdf[col].values
+            valid = ~np.isnan(vals)
+            flat_struct[start_idx:start_idx + n, off + ci] = np.where(valid, vals, 0.0)
+
+    # [26:30] sin/cos phi/psi
+    off2 = off + len(STRUCT_SC_COLS)
+    for ai, angle_col in enumerate(['phi', 'psi']):
+        if angle_col in pdf.columns:
+            deg = pdf[angle_col].values.astype(np.float64)
+            nan_mask = np.isnan(deg)
+            rad = np.deg2rad(np.nan_to_num(deg, nan=0.0))
+            sin_vals = np.sin(rad).astype(np.float32)
+            cos_vals = np.cos(rad).astype(np.float32)
+            sin_vals[nan_mask] = 0.0
+            cos_vals[nan_mask] = 0.0
+            flat_struct[start_idx:start_idx + n, off2 + ai * 2] = sin_vals
+            flat_struct[start_idx:start_idx + n, off2 + ai * 2 + 1] = cos_vals
+
+    # [30:39] DSSP numeric
+    off3 = off2 + 4
+    for di, col in enumerate(DSSP_COLS):
+        if col in pdf.columns:
+            vals = pdf[col].values
+            valid = ~np.isnan(vals)
+            flat_struct[start_idx:start_idx + n, off3 + di] = np.where(valid, vals, 0.0)
+
+    # [39:49] Secondary structure one-hot
+    off4 = off3 + len(DSSP_COLS)
+    if 'secondary_structure' in pdf.columns:
+        for i, ss in enumerate(pdf['secondary_structure'].fillna('UNK').values):
+            idx = SS_TO_IDX.get(str(ss).strip(), SS_TO_IDX['UNK'])
+            flat_struct[start_idx + i, off4 + idx] = 1.0
+
+
 # ============================================================================
 # Cache Builder
 # ============================================================================
@@ -165,6 +217,7 @@ def build_cache_for_fold(
     max_valid_distances: int = MAX_VALID_DISTANCES,
     retrieval_batch_size: int = 5000,
     physics_cols: list = None,
+    struct_lookup: dict = None,
 ):
     """Build a complete training cache for one fold.
 
@@ -249,6 +302,9 @@ def build_cache_for_fold(
         np.zeros((total_residues, n_physics), dtype=np.float16)
         if n_physics > 0 else None
     )
+
+    # Compact structural feature vector (for retrieval neighbor encoder)
+    flat_query_struct = np.zeros((total_residues, N_STRUCT_FEATURES), dtype=np.float32)
 
     # Protein tracking
     protein_offsets = []
@@ -419,6 +475,9 @@ def build_cache_for_fold(
                     valid = ~np.isnan(vals)
                     flat_physics[start_idx:start_idx + n, pi] = np.where(valid, vals, 0.0)
 
+        # Compact structural feature vector
+        extract_struct_features(pdf, start_idx, n, flat_query_struct)
+
         # Build samples (only residues with at least one observed shift)
         for local_idx in range(n):
             global_idx = start_idx + local_idx
@@ -455,6 +514,7 @@ def build_cache_for_fold(
 
     if flat_physics is not None:
         np.save(sd / 'physics.npy', flat_physics)
+    np.save(sd / 'query_struct.npy', flat_query_struct)
 
     with open(sd / 'bmrb_mapping.json', 'w') as f:
         json.dump(idx_to_bmrb, f)
@@ -477,6 +537,7 @@ def build_cache_for_fold(
     del flat_window_idx, flat_res_id_lookup
     if flat_physics is not None:
         del flat_physics
+    # Keep flat_query_struct — needed for neighbor struct lookup during retrieval
     gc.collect()
 
     # ========== Build retrieval data (with checkpoint/resume) ==========
@@ -515,6 +576,13 @@ def build_cache_for_fold(
         rd / 'valid.npy', mode=mmap_mode, dtype=bool,
         shape=(total_residues, K),
     )
+    neighbor_struct = np.lib.format.open_memmap(
+        rd / 'neighbor_struct.npy', mode=mmap_mode, dtype=np.float16,
+        shape=(total_residues, K, N_STRUCT_FEATURES),
+    )
+
+    # Build a global_idx -> struct_features lookup for neighbor struct
+    # (flat_query_struct is still in memory from the structural pass)
 
     # Retrieval stats accumulators
     total_queries = 0
@@ -585,6 +653,21 @@ def build_cache_for_fold(
             retrieved_distances[global_indices_arr] = results['distances']
             retrieved_valid[global_indices_arr] = results['indices'] >= 0
 
+            # Look up structural features for retrieved neighbors
+            if struct_lookup is not None:
+                n_valid = len(valid_indices)
+                nbr_bmrb = results['bmrb_ids']      # (n_valid, K) object array
+                nbr_resid = results['residue_ids']   # (n_valid, K)
+                nbr_struct_batch = np.zeros((n_valid, K, N_STRUCT_FEATURES), dtype=np.float32)
+                for qi in range(n_valid):
+                    for ki in range(K):
+                        if results['indices'][qi, ki] >= 0:
+                            key = (str(nbr_bmrb[qi, ki]), int(nbr_resid[qi, ki]))
+                            feat = struct_lookup.get(key)
+                            if feat is not None:
+                                nbr_struct_batch[qi, ki] = feat
+                neighbor_struct[global_indices_arr] = nbr_struct_batch
+
             # Accumulate retrieval stats
             valid_mask = results['indices'] >= 0
             total_valid_retrieved += valid_mask.sum()
@@ -597,6 +680,7 @@ def build_cache_for_fold(
         retrieved_residue_codes.flush()
         retrieved_distances.flush()
         retrieved_valid.flush()
+        neighbor_struct.flush()
 
         checkpoint_file.write_text(str(batch_end))
 
@@ -609,6 +693,7 @@ def build_cache_for_fold(
     retrieved_residue_codes.flush()
     retrieved_distances.flush()
     retrieved_valid.flush()
+    neighbor_struct.flush()
 
     if checkpoint_file.exists():
         checkpoint_file.unlink()
@@ -619,7 +704,8 @@ def build_cache_for_fold(
     avg_coverage = total_valid_retrieved / max(total_valid_queries * K, 1)
 
     del retrieved_shifts, retrieved_shift_masks, retrieved_residue_codes
-    del retrieved_distances, retrieved_valid
+    del retrieved_distances, retrieved_valid, neighbor_struct
+    del flat_query_struct
     gc.collect()
 
     # ========== Save config ==========
@@ -635,6 +721,7 @@ def build_cache_for_fold(
         'n_atom_types': n_atom_types,
         'n_dssp': n_dssp,
         'n_physics': n_physics,
+        'n_struct_features': N_STRUCT_FEATURES,
         'n_shifts': n_shifts,
         'window_size': window_size,
         'k_spatial': k_spatial,
@@ -784,6 +871,51 @@ def main():
     print(f"\nLoading embedding lookup from {args.embeddings}...")
     embedding_lookup = EmbeddingLookup(args.embeddings)
 
+    # Build (bmrb_id, residue_id) -> struct_features lookup from the FULL CSV
+    # This is needed to look up structural features for retrieved neighbors
+    # (which may come from any protein, not just the current fold)
+    print(f"\nBuilding structural feature lookup for neighbor struct...")
+    t0 = time.time()
+    struct_lookup = {}
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="  Building lookup"):
+        key = (str(row['bmrb_id']), int(row['residue_id']))
+        feat = np.zeros(N_STRUCT_FEATURES, dtype=np.float32)
+        # [0:21] backbone distances
+        for ci, col in enumerate(STRUCT_DIST_COLS):
+            if col in df.columns:
+                v = row[col]
+                feat[ci] = 0.0 if (v != v) else float(v)  # NaN check
+        # [21:26] SC geometry
+        off = len(STRUCT_DIST_COLS)
+        for ci, col in enumerate(STRUCT_SC_COLS):
+            if col in df.columns:
+                v = row[col]
+                feat[off + ci] = 0.0 if (v != v) else float(v)
+        # [26:30] sin/cos phi/psi
+        off2 = off + len(STRUCT_SC_COLS)
+        for ai, angle_col in enumerate(['phi', 'psi']):
+            if angle_col in df.columns:
+                v = row[angle_col]
+                if v == v:  # not NaN
+                    rad = np.deg2rad(float(v))
+                    feat[off2 + ai * 2] = np.sin(rad)
+                    feat[off2 + ai * 2 + 1] = np.cos(rad)
+        # [30:39] DSSP numeric
+        off3 = off2 + 4
+        for di, col in enumerate(DSSP_COLS):
+            if col in df.columns:
+                v = row[col]
+                feat[off3 + di] = 0.0 if (v != v) else float(v)
+        # [39:49] SS one-hot
+        off4 = off3 + len(DSSP_COLS)
+        ss = str(row.get('secondary_structure', 'UNK')).strip()
+        if ss == 'nan':
+            ss = 'UNK'
+        ss_idx = SS_TO_IDX.get(ss, SS_TO_IDX['UNK'])
+        feat[off4 + ss_idx] = 1.0
+        struct_lookup[key] = feat
+    print(f"  Built lookup for {len(struct_lookup):,} residues in {time.time()-t0:.1f}s")
+
     all_provenance = {}
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -838,6 +970,7 @@ def main():
             k_retrieved=args.k,
             retrieval_batch_size=args.retrieval_batch_size,
             physics_cols=physics_cols,
+            struct_lookup=struct_lookup,
         )
 
         elapsed = time.time() - t0

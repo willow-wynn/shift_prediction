@@ -246,13 +246,21 @@ class CachedRetrievalDataset(Dataset):
         with open(sd / 'global_to_resid.json', 'r') as f:
             self.global_to_resid = json.load(f)
 
-        # Physics features (NEW)
+        # Physics features
         physics_path = sd / 'physics.npy'
         if physics_path.exists():
             self.flat_physics = torch.from_numpy(np.load(physics_path))
         else:
-            # Backward compatibility: no physics features available
             self.flat_physics = None
+
+        # Compact structural feature vector (for retrieval neighbor encoder)
+        query_struct_path = sd / 'query_struct.npy'
+        if query_struct_path.exists():
+            self.flat_query_struct = torch.from_numpy(np.load(query_struct_path))
+            self.n_struct_features = self.flat_query_struct.shape[1]
+        else:
+            self.flat_query_struct = None
+            self.n_struct_features = 0
 
     def _mmap_retrieval_data(self):
         """Memory-map retrieval data from disk."""
@@ -264,6 +272,13 @@ class CachedRetrievalDataset(Dataset):
         self.retrieved_residue_codes = np.load(rd / 'residue_codes.npy', mmap_mode='r')
         self.retrieved_distances = np.load(rd / 'distances.npy', mmap_mode='r')
         self.retrieved_valid = np.load(rd / 'valid.npy', mmap_mode='r')
+
+        # Neighbor structural features (may not exist in older caches)
+        nbr_struct_path = rd / 'neighbor_struct.npy'
+        if nbr_struct_path.exists():
+            self.retrieved_neighbor_struct = np.load(nbr_struct_path, mmap_mode='r')
+        else:
+            self.retrieved_neighbor_struct = None
 
     def __len__(self):
         return len(self.samples)
@@ -409,7 +424,7 @@ class CachedRetrievalDataset(Dataset):
                 retrieved_shifts
             )
 
-        # Physics features (NEW)
+        # Physics features
         if self.flat_physics is not None:
             physics_features = self.flat_physics[global_idx].float()
             physics_features = torch.where(
@@ -418,8 +433,30 @@ class CachedRetrievalDataset(Dataset):
                 physics_features
             )
         else:
-            # Backward compatibility: return zeros
-            physics_features = torch.zeros(self.n_physics, dtype=torch.float32)
+            physics_features = torch.zeros(max(self.n_physics, 1), dtype=torch.float32)
+
+        # Query structural features
+        if self.flat_query_struct is not None:
+            query_struct = self.flat_query_struct[global_idx].float()
+            query_struct = torch.where(
+                torch.isnan(query_struct),
+                torch.zeros_like(query_struct),
+                query_struct
+            )
+        else:
+            query_struct = torch.zeros(max(self.n_struct_features, 1), dtype=torch.float32)
+
+        # Neighbor structural features
+        if self.retrieved_neighbor_struct is not None:
+            neighbor_struct = torch.from_numpy(
+                self.retrieved_neighbor_struct[global_idx].astype(np.float32))
+            neighbor_struct = torch.where(
+                torch.isnan(neighbor_struct),
+                torch.zeros_like(neighbor_struct),
+                neighbor_struct
+            )
+        else:
+            neighbor_struct = torch.zeros(K, max(self.n_struct_features, 1), dtype=torch.float32)
 
         result = {
             # Structural features
@@ -455,8 +492,12 @@ class CachedRetrievalDataset(Dataset):
             'retrieved_distances': retrieved_distances,
             'retrieved_valid': retrieved_valid,
 
-            # Physics features (NEW)
+            # Physics features
             'physics_features': physics_features,
+
+            # Structural feature vectors (for retrieval neighbor encoder)
+            'query_struct': query_struct,
+            'neighbor_struct': neighbor_struct,
         }
 
         return result

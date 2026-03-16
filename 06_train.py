@@ -152,13 +152,12 @@ def mask_cs_outliers(df, stats, shift_cols):
 # ============================================================================
 
 def build_shift_weights(shift_cols, device):
-    """Build per-shift loss weights. N gets 4x, other backbone 2x."""
-    from config import BACKBONE_LOSS_WEIGHT, N_SHIFT_LOSS_WEIGHT
+    """Build per-shift loss weights. Backbone shifts 2x, sidechain 1x."""
+    from config import BACKBONE_LOSS_WEIGHT
+    BACKBONE_SHIFTS = {'ca_shift', 'cb_shift', 'c_shift', 'n_shift', 'h_shift', 'ha_shift'}
     weights = torch.ones(len(shift_cols), device=device)
     for si, col in enumerate(shift_cols):
-        if col == 'n_shift':
-            weights[si] = N_SHIFT_LOSS_WEIGHT
-        else:
+        if col in BACKBONE_SHIFTS:
             weights[si] = BACKBONE_LOSS_WEIGHT
     return weights
 
@@ -635,13 +634,15 @@ def main():
     # ========== Create model ==========
     print("\nCreating model via create_model() factory...")
 
-    # Detect physics feature dimension from dataset
+    # Detect feature dimensions from dataset
     n_physics = getattr(train_dataset, 'n_physics', 28)
+    n_struct = getattr(train_dataset, 'n_struct_features', 49)
 
     model = create_model(
         n_atom_types=len(atom_to_idx),
         n_shifts=len(shift_cols),
         n_physics=n_physics,
+        n_struct=n_struct,
         shift_cols=shift_cols,
         use_random_coil=not args.no_random_coil,
         stats=stats,
