@@ -19,8 +19,8 @@ BMRB_ENTRY_URL = 'https://api.bmrb.io/v2/entry/{bmrb_id}?format=json'
 # UniProt database name variants found in BMRB entries
 UNIPROT_DB_NAMES = {'UNIPROT', 'UNP', 'SP', 'SWISSPROT', 'SWISS-PROT', 'TREMBL'}
 
-# AlphaFold model version (v4 as of 2024)
-AF_MODEL_VERSION = 'model_v4'
+# AlphaFold model version (v6 as of 2025)
+AF_MODEL_VERSION = 'model_v6'
 
 
 def _fetch_json(url, retries=3, timeout=30):
