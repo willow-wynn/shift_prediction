@@ -6,7 +6,6 @@ Architecture:
   Base encoder:
     - DistanceAttentionPerPosition (atom-pair distances → 256-dim per position)
     - 5-layer residual CNN on 11-position window → 1280-dim center extraction
-    - PrevNextEncoder: explicit i-1/i+1 features from window
     - SpatialNeighborAttention: K=5 spatial neighbors → 192-dim
     - base_encoder_dim = 1280 + 128 + 192 = 1600
 
@@ -416,44 +415,6 @@ class DirectTransferHead(nn.Module):
 
 
 
-class PrevNextEncoder(nn.Module):
-    """Explicitly encode previous and next residue features from the window.
-
-    Key insight from SHIFTX2: psi(i-1) alone accounts for 18.7% of 15N
-    prediction power. Instead of relying on the CNN to discover this,
-    we extract i-1 and i+1 features directly.
-    """
-
-    def __init__(self, cnn_input_dim, d_out=128, dropout=0.2):
-        super().__init__()
-        self.prev_net = nn.Sequential(
-            nn.Linear(cnn_input_dim, d_out), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_out, d_out), nn.LayerNorm(d_out))
-        self.next_net = nn.Sequential(
-            nn.Linear(cnn_input_dim, d_out), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_out, d_out), nn.LayerNorm(d_out))
-        self.combine = nn.Sequential(
-            nn.Linear(d_out * 2, d_out), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_out, d_out), nn.LayerNorm(d_out))
-        self.out_dim = d_out
-
-    def forward(self, window_features, is_valid):
-        """
-        Args:
-            window_features: (B, W, cnn_input_dim) per-position features before CNN
-            is_valid: (B, W) validity mask
-        """
-        center = window_features.size(1) // 2
-        prev_pos = center - 1
-        next_pos = center + 1
-
-        prev_feat = self.prev_net(window_features[:, prev_pos])
-        prev_feat = prev_feat * is_valid[:, prev_pos].unsqueeze(-1).float()
-
-        next_feat = self.next_net(window_features[:, next_pos])
-        next_feat = next_feat * is_valid[:, next_pos].unsqueeze(-1).float()
-
-        return self.combine(torch.cat([prev_feat, next_feat], dim=-1))
 
 
 # ============================================================================
@@ -464,7 +425,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
     """Chemical shift prediction with V9-style retrieval augmentation.
 
     Architecture:
-      Base encoder: Distance attention + CNN + PrevNext + Spatial
+      Base encoder: Distance attention + CNN + Spatial
       Retrieval: Neighbor encoder + self-attn + shift-specific cross-attn
                  + direct transfer + dual gating
       Prediction: struct_pred, retrieval_pred blended by learned gates
@@ -540,13 +501,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
         self.cnn = nn.Sequential(*cnn_layers)
         cnn_out_dim = cnn_channels[-1]
 
-        # PrevNextEncoder: explicit i-1/i+1 features
-        self.prevnext_encoder = PrevNextEncoder(
-            cnn_input_dim=cnn_input_dim,
-            d_out=128,
-            dropout=0.2,
-        )
-        prevnext_dim = self.prevnext_encoder.out_dim
 
         self.spatial_attention = SpatialNeighborAttention(
             n_residue_types=n_residue_types,
@@ -558,7 +512,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
             dist_attn_hidden=dist_attn_hidden,
         )
 
-        base_encoder_dim = cnn_out_dim + prevnext_dim + spatial_hidden
+        base_encoder_dim = cnn_out_dim + spatial_hidden
 
         # ========== Retrieval pathway (V9-style) ==========
         # Note: RC correction removed — retrieval uses only same-AA-type neighbors
@@ -671,9 +625,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
 
         x = self.input_dropout_layer(self.input_norm(window_feat))
 
-        # PrevNext encoding (from pre-CNN features at positions i-1, i+1)
-        x_prevnext = self.prevnext_encoder(x, is_valid)  # (B, 128)
-
         # CNN over window
         x = x.transpose(1, 2)
         x = self.cnn(x)
@@ -701,7 +652,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
             neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
 
-        base_encoding = torch.cat([x_center, x_prevnext, x_spatial], dim=-1)
+        base_encoding = torch.cat([x_center, x_spatial], dim=-1)
 
         # ========== Structure-only prediction ==========
         struct_pred = self.struct_head(base_encoding)  # (B, n_shifts)
