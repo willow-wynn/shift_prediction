@@ -6,10 +6,8 @@ Architecture:
   Base encoder:
     - DistanceAttentionPerPosition (atom-pair distances → 256-dim per position)
     - 5-layer residual CNN on 11-position window → 1280-dim center extraction
-    - PrevNextEncoder: explicit i-1/i+1 features from window
     - SpatialNeighborAttention: K=5 spatial neighbors → 192-dim
-    - PhysicsFeatureEncoder: H-bonds, HSE, etc. → 64-dim
-    - base_encoder_dim = 1280 + 128 + 192 + 64 = 1664
+    - base_encoder_dim = 1280 + 128 + 192 = 1600
 
   Retrieval pathway (adapted from V9 reranker):
     - RetrievalNeighborEncoder: per-neighbor features → (B, K, retrieval_hidden)
@@ -47,7 +45,6 @@ from config import (
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
 )
-from random_coil import RC_SHIFTS, build_rc_tensor
 
 
 # ============================================================================
@@ -242,43 +239,6 @@ class ResidualBlock1D(nn.Module):
 
 
 # ============================================================================
-# NEW: Physics Feature Encoder
-# ============================================================================
-
-class PhysicsFeatureEncoder(nn.Module):
-    """
-    Encode physics-based features into a fixed-dim representation.
-
-    Input features are derived from DSSP H-bond geometry. The exact
-    dimensionality is determined at runtime (n_physics parameter).
-
-    Output: 64-dim vector concatenated with the base encoder.
-    """
-
-    def __init__(self, n_physics: int, hidden_dim: int = 64, dropout: float = 0.2):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(n_physics, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.out_dim = hidden_dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, n_physics) physics feature vector
-
-        Returns:
-            (B, hidden_dim) encoded features
-        """
-        # Replace NaN with 0 for safety
-        x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
-        return self.mlp(x)
-
-
-# ============================================================================
 # V9 Retrieval Components: Neighbor Encoder + Self-Attention + Cross-Attention
 # ============================================================================
 
@@ -453,90 +413,19 @@ class DirectTransferHead(nn.Module):
         return transferred * valid_3d.any(dim=1).float()
 
 
-class RandomCoilCorrector(nn.Module):
-    """Apply random coil correction to retrieved shifts.
-
-    corrected[b,k,s] = RC[query_aa, s] + (shift[b,k,s] - RC[retrieved_aa, s])
-    RC values are in z-score space (normalized using dataset stats).
-    """
-
-    def __init__(self, n_residue_types, n_shifts, shift_cols=None, stats=None):
-        super().__init__()
-        if shift_cols is None:
-            shift_cols = ['ca_shift', 'cb_shift', 'c_shift', 'n_shift', 'h_shift', 'ha_shift']
-        rc_np = build_rc_tensor(STANDARD_RESIDUES, shift_cols)
-        if stats is not None:
-            for si, col in enumerate(shift_cols):
-                if col in stats and si < rc_np.shape[1]:
-                    mean, std = stats[col]['mean'], stats[col]['std']
-                    valid = ~np.isnan(rc_np[:, si])
-                    rc_np[valid, si] = (rc_np[valid, si] - mean) / std
-        rc_padded = np.full((n_residue_types + 1, n_shifts), np.nan, dtype=np.float32)
-        rc_padded[:rc_np.shape[0], :rc_np.shape[1]] = rc_np
-        self.register_buffer('rc_table', torch.from_numpy(rc_padded))
-
-    def forward(self, retrieved_shifts, query_residue_code, retrieved_residue_codes,
-                retrieved_shift_masks):
-        query_idx = query_residue_code.clamp(0, self.rc_table.size(0) - 1)
-        retrieved_idx = retrieved_residue_codes.clamp(0, self.rc_table.size(0) - 1)
-        rc_query = self.rc_table[query_idx].unsqueeze(1)
-        rc_retrieved = self.rc_table[retrieved_idx]
-        corrected = rc_query + (retrieved_shifts - rc_retrieved)
-        rc_valid = ~torch.isnan(rc_query) & ~torch.isnan(rc_retrieved)
-        corrected = torch.where(rc_valid, corrected, retrieved_shifts)
-        corrected = torch.where(retrieved_shift_masks, corrected, retrieved_shifts)
-        return corrected
 
 
-class PrevNextEncoder(nn.Module):
-    """Explicitly encode previous and next residue features from the window.
-
-    Key insight from SHIFTX2: psi(i-1) alone accounts for 18.7% of 15N
-    prediction power. Instead of relying on the CNN to discover this,
-    we extract i-1 and i+1 features directly.
-    """
-
-    def __init__(self, cnn_input_dim, d_out=128, dropout=0.2):
-        super().__init__()
-        self.prev_net = nn.Sequential(
-            nn.Linear(cnn_input_dim, d_out), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_out, d_out), nn.LayerNorm(d_out))
-        self.next_net = nn.Sequential(
-            nn.Linear(cnn_input_dim, d_out), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_out, d_out), nn.LayerNorm(d_out))
-        self.combine = nn.Sequential(
-            nn.Linear(d_out * 2, d_out), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_out, d_out), nn.LayerNorm(d_out))
-        self.out_dim = d_out
-
-    def forward(self, window_features, is_valid):
-        """
-        Args:
-            window_features: (B, W, cnn_input_dim) per-position features before CNN
-            is_valid: (B, W) validity mask
-        """
-        center = window_features.size(1) // 2
-        prev_pos = center - 1
-        next_pos = center + 1
-
-        prev_feat = self.prev_net(window_features[:, prev_pos])
-        prev_feat = prev_feat * is_valid[:, prev_pos].unsqueeze(-1).float()
-
-        next_feat = self.next_net(window_features[:, next_pos])
-        next_feat = next_feat * is_valid[:, next_pos].unsqueeze(-1).float()
-
-        return self.combine(torch.cat([prev_feat, next_feat], dim=-1))
 
 
 # ============================================================================
-# Full Model with Retrieval + Physics Features
+# Full Model with Retrieval
 # ============================================================================
 
 class ShiftPredictorWithRetrieval(nn.Module):
     """Chemical shift prediction with V9-style retrieval augmentation.
 
     Architecture:
-      Base encoder: Distance attention + CNN + PrevNext + Spatial + Physics
+      Base encoder: Distance attention + CNN + Spatial
       Retrieval: Neighbor encoder + self-attn + shift-specific cross-attn
                  + direct transfer + dual gating
       Prediction: struct_pred, retrieval_pred blended by learned gates
@@ -550,7 +439,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
         n_mismatch_types: int = N_MISMATCH_TYPES,
         n_dssp: int = len(DSSP_COLS),
         n_shifts: int = 6,
-        n_physics: int = 28,
         dist_attn_embed: int = DIST_ATTN_EMBED,
         dist_attn_hidden: int = DIST_ATTN_HIDDEN,
         cnn_channels: list = None,
@@ -568,13 +456,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
         n_cross_attn: int = 3,
         k_retrieved: int = 32,
         n_struct: int = 49,
-        # RC correction
-        use_random_coil: bool = True,
-        shift_cols: list = None,
-        stats: dict = None,
-        # Legacy params (accepted but ignored for backward compat)
-        use_direct_transfer: bool = True,
-        use_query_conditioned_transfer: bool = True,
     ):
         super().__init__()
 
@@ -619,13 +500,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
         self.cnn = nn.Sequential(*cnn_layers)
         cnn_out_dim = cnn_channels[-1]
 
-        # PrevNextEncoder: explicit i-1/i+1 features
-        self.prevnext_encoder = PrevNextEncoder(
-            cnn_input_dim=cnn_input_dim,
-            d_out=128,
-            dropout=0.2,
-        )
-        prevnext_dim = self.prevnext_encoder.out_dim
 
         self.spatial_attention = SpatialNeighborAttention(
             n_residue_types=n_residue_types,
@@ -637,19 +511,10 @@ class ShiftPredictorWithRetrieval(nn.Module):
             dist_attn_hidden=dist_attn_hidden,
         )
 
-        self.physics_encoder = PhysicsFeatureEncoder(
-            n_physics=n_physics, hidden_dim=64, dropout=0.2)
-        physics_dim = self.physics_encoder.out_dim
-
-        base_encoder_dim = cnn_out_dim + prevnext_dim + spatial_hidden + physics_dim
+        base_encoder_dim = cnn_out_dim + spatial_hidden
 
         # ========== Retrieval pathway (V9-style) ==========
-
-        # RC correction (applied to retrieved shifts before transfer)
-        self.rc_corrector = None
-        if use_random_coil:
-            self.rc_corrector = RandomCoilCorrector(
-                n_residue_types, n_shifts, shift_cols, stats)
+        # Note: RC correction removed — retrieval uses only same-AA-type neighbors
 
         # Neighbor encoder + self-attention
         self.neighbor_encoder = RetrievalNeighborEncoder(
@@ -733,7 +598,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
         query_residue_code=None,
         retrieved_shifts=None, retrieved_shift_masks=None,
         retrieved_residue_codes=None, retrieved_distances=None, retrieved_valid=None,
-        # Physics features
+        # Deprecated: accepted but ignored (for old dataset compatibility)
         physics_features=None,
         # Structural feature vectors for retrieval
         query_struct=None,
@@ -758,9 +623,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
             window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb], dim=-1)
 
         x = self.input_dropout_layer(self.input_norm(window_feat))
-
-        # PrevNext encoding (from pre-CNN features at positions i-1, i+1)
-        x_prevnext = self.prevnext_encoder(x, is_valid)  # (B, 128)
 
         # CNN over window
         x = x.transpose(1, 2)
@@ -789,30 +651,21 @@ class ShiftPredictorWithRetrieval(nn.Module):
             neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
 
-        # Physics encoding
-        if physics_features is None:
-            physics_features = torch.zeros(
-                B, self.physics_encoder.mlp[0].in_features,
-                device=x_center.device, dtype=x_center.dtype)
-        x_physics = self.physics_encoder(physics_features)
-
-        base_encoding = torch.cat([x_center, x_prevnext, x_spatial, x_physics], dim=-1)
+        base_encoding = torch.cat([x_center, x_spatial], dim=-1)
 
         # ========== Structure-only prediction ==========
         struct_pred = self.struct_head(base_encoding)  # (B, n_shifts)
 
         # ========== Retrieval pathway ==========
+        # Only use neighbors of the same amino acid type as the query
+        same_aa_mask = (retrieved_residue_codes == query_residue_code.unsqueeze(1))
+        retrieved_valid = retrieved_valid & same_aa_mask
+
         # Apply retrieval dropout (drop ALL retrieval for some training samples)
         if self.training and self.retrieval_dropout_rate > 0:
             drop_mask = torch.rand(B, device=base_encoding.device) < self.retrieval_dropout_rate
             retrieved_valid = retrieved_valid.clone()
             retrieved_valid[drop_mask] = False
-
-        # Apply random coil correction
-        if self.rc_corrector is not None:
-            retrieved_shifts = self.rc_corrector(
-                retrieved_shifts, query_residue_code,
-                retrieved_residue_codes, retrieved_shift_masks)
 
         # Neighbor consensus
         nbr_mean = self._compute_nbr_mean(
@@ -882,32 +735,11 @@ class ShiftPredictorWithRetrieval(nn.Module):
 def create_model(
     n_atom_types: int,
     n_shifts: int = 6,
-    n_physics: int = 28,
-    shift_cols: list = None,
-    use_random_coil: bool = True,
-    stats: dict = None,
     **kwargs,
 ) -> ShiftPredictorWithRetrieval:
-    """Create model with sensible defaults from config.
-
-    Args:
-        n_atom_types: Number of unique atom types in distance columns
-        n_shifts: Number of chemical shift types to predict
-        n_physics: Number of physics feature dimensions
-        shift_cols: List of shift column names (for RC correction lookup)
-        use_random_coil: Whether to apply random coil correction in transfer
-        stats: Per-shift normalization stats (mean/std) for RC z-score conversion
-        **kwargs: Override any ShiftPredictorWithRetrieval parameter
-
-    Returns:
-        Configured ShiftPredictorWithRetrieval instance
-    """
+    """Create model with sensible defaults from config."""
     return ShiftPredictorWithRetrieval(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        n_physics=n_physics,
-        shift_cols=shift_cols,
-        use_random_coil=use_random_coil,
-        stats=stats,
         **kwargs,
     )

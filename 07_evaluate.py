@@ -97,13 +97,8 @@ def load_model(checkpoint_path, device):
     stats = checkpoint.get('stats', None)
     shift_cols = checkpoint.get('shift_cols', None)
     k_retrieved = checkpoint.get('k_retrieved', K_RETRIEVED)
-    n_physics = checkpoint.get('n_physics', 28)
 
     # Detect query-conditioned transfer
-    use_query_conditioned = 'shift_transfer.query_proj.0.weight' in clean_state_dict
-
-    # Detect random coil correction
-    use_random_coil = 'shift_transfer.rc_table' in clean_state_dict
 
     # Get DSSP dimension
     n_dssp = clean_state_dict['dssp_proj.weight'].shape[1] if 'dssp_proj.weight' in clean_state_dict else 0
@@ -123,20 +118,13 @@ def load_model(checkpoint_path, device):
     retrieval_hidden = (clean_state_dict['retrieval_cross_attn.fallback'].shape[0]
                         if 'retrieval_cross_attn.fallback' in clean_state_dict else 192)
 
-    # Infer physics dimension
-    if 'physics_encoder.mlp.0.weight' in clean_state_dict:
-        n_physics = clean_state_dict['physics_encoder.mlp.0.weight'].shape[1]
-
     print(f"  Auto-detected architecture:")
     print(f"    n_atom_types:            {n_atom_types}")
     print(f"    n_shifts:                {n_shifts}")
     print(f"    n_dssp:                  {n_dssp}")
-    print(f"    n_physics:               {n_physics}")
     print(f"    cnn_channels:            {cnn_channels}")
     print(f"    spatial_hidden:          {spatial_hidden}")
     print(f"    retrieval_hidden:        {retrieval_hidden}")
-    print(f"    use_query_conditioned:   {use_query_conditioned}")
-    print(f"    use_random_coil:         {use_random_coil}")
     print(f"    k_retrieved:             {k_retrieved}")
 
     model = ShiftPredictorWithRetrieval(
@@ -146,17 +134,15 @@ def load_model(checkpoint_path, device):
         n_mismatch_types=N_MISMATCH_TYPES,
         n_dssp=n_dssp,
         n_shifts=n_shifts,
-        n_physics=n_physics,
         cnn_channels=cnn_channels,
         spatial_hidden=spatial_hidden,
         retrieval_hidden=retrieval_hidden,
-        use_query_conditioned_transfer=use_query_conditioned,
-        use_random_coil=use_random_coil,
-        shift_cols=shift_cols,
-        stats=stats,
     ).to(device)
 
-    model.load_state_dict(clean_state_dict)
+    # Filter out deprecated physics_encoder keys from old checkpoints
+    filtered_sd = {k: v for k, v in clean_state_dict.items()
+                   if not k.startswith('physics_encoder.')}
+    model.load_state_dict(filtered_sd, strict=False)
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -166,7 +152,6 @@ def load_model(checkpoint_path, device):
         'stats': stats,
         'shift_cols': shift_cols,
         'k_retrieved': k_retrieved,
-        'n_physics': n_physics,
         'checkpoint_path': checkpoint_path,
         'epoch': checkpoint.get('epoch', 'unknown'),
     }

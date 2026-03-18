@@ -237,7 +237,6 @@ def main():
     parser.add_argument('--k_retrieved', type=int, default=K_RETRIEVED)
     parser.add_argument('--save_every', type=int, default=25)
     parser.add_argument('--no_wandb', action='store_true')
-    parser.add_argument('--no_random_coil', action='store_true')
     parser.add_argument('--build_cache_only', action='store_true',
                         help='Build imputation cache and exit')
     parser.add_argument('--rebuild_cache', action='store_true')
@@ -291,7 +290,7 @@ def main():
     # Load data file for stats computation
     print("\nLoading data for statistics...")
     data_file = None
-    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'small_structure_data.csv', 'sidechain_structure_data.csv']:
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv']:
         candidate = os.path.join(args.data_dir, name)
         if os.path.exists(candidate):
             data_file = candidate
@@ -300,9 +299,24 @@ def main():
         print(f"ERROR: No data file found in {args.data_dir}")
         sys.exit(1)
 
-    df = pd.read_csv(data_file, dtype={'bmrb_id': str})
-    shift_cols = parse_shift_columns(df.columns)
-    dssp_cols = get_dssp_columns(df.columns)
+    # Only load columns needed for stats (avoid OOM on large CSVs with 1500+ cols)
+    all_columns = pd.read_csv(data_file, nrows=0).columns.tolist()
+    shift_cols = parse_shift_columns(all_columns)
+    dssp_cols = get_dssp_columns(all_columns)
+    light_cols = ['bmrb_id', 'split'] + shift_cols + dssp_cols
+    light_cols = [c for c in light_cols if c in all_columns]
+
+    fold_files = [os.path.join(args.data_dir, f'structure_data_hybrid_fold_{f}.csv')
+                  for f in range(1, 6)]
+    if all(os.path.exists(f) for f in fold_files):
+        parts = []
+        for ff in fold_files:
+            avail = [c for c in light_cols if c in pd.read_csv(ff, nrows=0).columns]
+            parts.append(pd.read_csv(ff, usecols=avail, dtype={'bmrb_id': str}, low_memory=False))
+        df = pd.concat(parts, ignore_index=True)
+        del parts
+    else:
+        df = pd.read_csv(data_file, usecols=light_cols, dtype={'bmrb_id': str}, low_memory=False)
     n_shifts = len(shift_cols)
 
     train_df = df[df['split'] != args.fold]
@@ -397,14 +411,10 @@ def main():
 
     # Get n_atom_types from base dataset config
     n_atom_types = train_base.n_atom_types
-    n_physics = getattr(train_base, 'n_physics', 28)
 
     model = create_imputation_model(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        n_physics=n_physics,
-        shift_cols=shift_cols,
-        use_random_coil=not args.no_random_coil,
         n_dssp=len(dssp_cols),
         k_spatial=K_SPATIAL_NEIGHBORS,
     ).to(device)
@@ -418,7 +428,10 @@ def main():
     if args.checkpoint:
         print(f"\nResuming from: {args.checkpoint}")
         resume_checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(resume_checkpoint['model_state_dict'])
+        # Filter out deprecated physics_encoder keys from old checkpoints
+        sd = {k: v for k, v in resume_checkpoint['model_state_dict'].items()
+              if not k.startswith('physics_encoder.')}
+        model.load_state_dict(sd, strict=False)
         start_epoch = resume_checkpoint.get('epoch', 0) + 1
         print(f"  Resuming from epoch {start_epoch}")
 
@@ -515,7 +528,6 @@ def main():
                 'shift_cols': shift_cols,
                 'dssp_cols': dssp_cols,
                 'n_atom_types': n_atom_types,
-                'n_physics': n_physics,
                 'k_retrieved': args.k_retrieved,
             }, ckpt_path)
             print(f"  Checkpoint saved: {ckpt_path}")
@@ -552,7 +564,6 @@ def main():
                     'shift_cols': shift_cols,
                     'dssp_cols': dssp_cols,
                     'n_atom_types': n_atom_types,
-                    'n_physics': n_physics,
                     'k_retrieved': args.k_retrieved,
                 }, best_path)
                 print(f"  *** New best model saved (MAE: {best_mae:.4f} ppm) ***")

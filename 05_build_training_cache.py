@@ -24,7 +24,7 @@ Cache layout (per fold):
     <output_dir>/fold_{k}/
         config.json
         samples.npy
-        structural/  (residue_idx.npy, ss_idx.npy, ... , physics.npy)
+        structural/  (residue_idx.npy, ss_idx.npy, ...)
         retrieval/   (shifts.npy, shift_masks.npy, residue_codes.npy, ...)
 
 Usage:
@@ -101,21 +101,6 @@ def parse_shift_columns(columns):
 def get_dssp_columns(df_columns):
     """Get available DSSP columns."""
     return [c for c in DSSP_COLS if c in df_columns]
-
-
-# Physics feature columns (from dataset.py)
-PHYSICS_COLS = [
-    'ring_current_h', 'ring_current_ha',
-    'hse_up', 'hse_down', 'hse_ratio',
-    'hbond_dist_1', 'hbond_energy_1',
-    'hbond_dist_2', 'hbond_energy_2',
-    'order_parameter',
-]
-
-
-def get_physics_columns(df_columns):
-    """Get available physics feature columns."""
-    return [c for c in PHYSICS_COLS if c in df_columns]
 
 
 def extract_struct_features(pdf, start_idx, n, flat_struct):
@@ -216,7 +201,6 @@ def build_cache_for_fold(
     k_retrieved: int = K_RETRIEVED,
     max_valid_distances: int = MAX_VALID_DISTANCES,
     retrieval_batch_size: int = 5000,
-    physics_cols: list = None,
     struct_lookup: dict = None,
 ):
     """Build a complete training cache for one fold.
@@ -225,11 +209,6 @@ def build_cache_for_fold(
     standalone function with full provenance logging and checkpoint/resume.
     """
     cache_path = Path(cache_dir)
-
-    # Auto-detect physics columns if not provided
-    if physics_cols is None:
-        physics_cols = get_physics_columns(df.columns)
-    n_physics = len(physics_cols)
 
     # Check for resume
     checkpoint_file = cache_path / 'retrieval' / '_checkpoint.txt'
@@ -270,7 +249,6 @@ def build_cache_for_fold(
     print(f"      Shift columns: {n_shifts}")
     print(f"      Distance columns: {len(dist_col_info)}")
     print(f"      DSSP columns: {n_dssp}")
-    print(f"      Physics columns: {n_physics}")
     print(f"      Context window: {window_size}")
     print(f"      K spatial: {k_spatial}")
     print(f"      K retrieved: {K}")
@@ -296,12 +274,6 @@ def build_cache_for_fold(
     flat_spatial_seq_sep = np.zeros((total_residues, k_spatial), dtype=np.int16)
 
     flat_window_idx = np.full((total_residues, window_size), -1, dtype=np.int32)
-
-    # Physics features
-    flat_physics = (
-        np.zeros((total_residues, n_physics), dtype=np.float16)
-        if n_physics > 0 else None
-    )
 
     # Compact structural feature vector (for retrieval neighbor encoder)
     flat_query_struct = np.zeros((total_residues, N_STRUCT_FEATURES), dtype=np.float32)
@@ -467,14 +439,6 @@ def build_cache_for_fold(
                     if neighbor_global >= 0:
                         flat_window_idx[global_idx, w] = neighbor_global
 
-        # Physics features
-        if flat_physics is not None and n_physics > 0:
-            for pi, col in enumerate(physics_cols):
-                if col in pdf.columns:
-                    vals = pdf[col].values
-                    valid = ~np.isnan(vals)
-                    flat_physics[start_idx:start_idx + n, pi] = np.where(valid, vals, 0.0)
-
         # Compact structural feature vector
         extract_struct_features(pdf, start_idx, n, flat_query_struct)
 
@@ -512,8 +476,6 @@ def build_cache_for_fold(
     np.save(sd / 'protein_min_res.npy', np.array(protein_min_res, dtype=np.int32))
     np.save(sd / 'protein_max_res.npy', np.array(protein_max_res, dtype=np.int32))
 
-    if flat_physics is not None:
-        np.save(sd / 'physics.npy', flat_physics)
     np.save(sd / 'query_struct.npy', flat_query_struct)
 
     with open(sd / 'bmrb_mapping.json', 'w') as f:
@@ -535,8 +497,6 @@ def build_cache_for_fold(
     del flat_dssp, flat_shifts, flat_shift_mask, flat_angles
     del flat_spatial_ids, flat_spatial_dist, flat_spatial_seq_sep
     del flat_window_idx, flat_res_id_lookup
-    if flat_physics is not None:
-        del flat_physics
     # Keep flat_query_struct — needed for neighbor struct lookup during retrieval
     gc.collect()
 
@@ -720,7 +680,6 @@ def build_cache_for_fold(
     config = {
         'n_atom_types': n_atom_types,
         'n_dssp': n_dssp,
-        'n_physics': n_physics,
         'n_struct_features': N_STRUCT_FEATURES,
         'n_shifts': n_shifts,
         'window_size': window_size,
@@ -732,7 +691,6 @@ def build_cache_for_fold(
         'n_samples': n_samples,
         'shift_cols': shift_cols,
         'stats': stats_for_json,
-        'physics_cols': physics_cols,
     }
 
     with open(cache_path / 'config.json', 'w') as f:
@@ -818,9 +776,8 @@ def main():
     print()
 
     # Locate compiled CSV
-    # Try common dataset names in order of preference
     csv_path = None
-    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'compiled_dataset.csv', 'sidechain_structure_data.csv', 'small_structure_data.csv']:
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'compiled_dataset.csv']:
         candidate = os.path.join(args.data_dir, name)
         if os.path.exists(candidate):
             csv_path = candidate
@@ -832,117 +789,132 @@ def main():
             f"Available CSVs: {candidates}"
         )
 
-    print(f"Loading data from {csv_path}...")
-    df = pd.read_csv(csv_path, dtype={'bmrb_id': str})
-    n_residues = len(df)
-    n_proteins = df['bmrb_id'].nunique()
-    print(f"  Loaded {n_residues:,} residues from {n_proteins:,} proteins")
+    # ======================================================================
+    # PASS 1: Read header only → discover columns, build atom vocabulary
+    # ======================================================================
+    print(f"Reading column headers from {csv_path}...")
+    all_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    print(f"  {len(all_columns)} columns total")
 
-    # Determine fold column
-    if 'split' in df.columns:
-        fold_col = 'split'
-    elif 'fold' in df.columns:
-        fold_col = 'fold'
-    else:
+    shift_cols = parse_shift_columns(all_columns)
+    dist_col_info = parse_distance_columns(all_columns)
+    dssp_cols = get_dssp_columns(all_columns)
+    _, atom_to_idx = build_atom_vocabulary(dist_col_info)
+
+    fold_col = 'split' if 'split' in all_columns else 'fold'
+    if fold_col not in all_columns:
         raise ValueError("CSV must contain a 'split' or 'fold' column")
 
-    fold_counts = df.groupby(fold_col)['bmrb_id'].nunique()
-    print(f"  Fold distribution (proteins):")
+    print(f"  Shift columns:    {len(shift_cols)}")
+    print(f"  Distance columns: {len(dist_col_info)}")
+    print(f"  DSSP columns:     {len(dssp_cols)}")
+    print(f"  Atom types:       {len(atom_to_idx)}")
+
+    # ======================================================================
+    # PASS 2: Read LIGHT columns (~100 cols) for stats + struct_lookup
+    # This avoids loading all 1500+ distance columns into memory at once.
+    # ======================================================================
+    light_cols = set(['bmrb_id', 'residue_id', 'residue_code',
+                      'secondary_structure', 'phi', 'psi', fold_col])
+    light_cols.update(shift_cols)
+    light_cols.update(dssp_cols)
+    light_cols.update(STRUCT_DIST_COLS)
+    light_cols.update(STRUCT_SC_COLS)
+    for k in range(K_SPATIAL_NEIGHBORS):
+        for suffix in ['_id', '_dist', '_seq_sep']:
+            light_cols.add(f'spatial_neighbor_{k}{suffix}')
+    light_cols = sorted(c for c in light_cols if c in all_columns)
+
+    # Load light columns — try per-fold files to avoid pandas memory explosion
+    print(f"\nLoading {len(light_cols)} light columns for stats + struct lookup...")
+    fold_files = [os.path.join(args.data_dir, f'structure_data_hybrid_fold_{f}.csv')
+                  for f in range(1, 6)]
+    if all(os.path.exists(f) for f in fold_files):
+        print("  Using per-fold CSV files...")
+        light_parts = []
+        for ff in fold_files:
+            usecols_avail = [c for c in light_cols if c in pd.read_csv(ff, nrows=0).columns]
+            part = pd.read_csv(ff, usecols=usecols_avail, dtype={'bmrb_id': str}, low_memory=False)
+            light_parts.append(part)
+            print(f"    {os.path.basename(ff)}: {len(part):,} rows")
+        light_df = pd.concat(light_parts, ignore_index=True)
+        del light_parts
+        gc.collect()
+    else:
+        light_df = pd.read_csv(csv_path, usecols=light_cols, dtype={'bmrb_id': str},
+                               low_memory=False)
+    n_residues = len(light_df)
+    n_proteins = light_df['bmrb_id'].nunique()
+    print(f"  {n_residues:,} residues from {n_proteins:,} proteins")
+
+    fold_counts = light_df.groupby(fold_col)['bmrb_id'].nunique()
+    print(f"  Fold distribution:")
     for f_val, cnt in fold_counts.items():
         print(f"    Fold {f_val}: {cnt} proteins")
 
-    # Parse columns
-    shift_cols = parse_shift_columns(df.columns.tolist())
-    dist_col_info = parse_distance_columns(df.columns.tolist())
-    dssp_cols = get_dssp_columns(df.columns.tolist())
-    physics_cols = get_physics_columns(df.columns.tolist())
-    _, atom_to_idx = build_atom_vocabulary(dist_col_info)
+    # Build struct_lookup (vectorized)
+    print(f"\nBuilding structural feature lookup...")
+    t0 = time.time()
+    N = len(light_df)
+    all_struct = np.zeros((N, N_STRUCT_FEATURES), dtype=np.float32)
+    extract_struct_features(light_df, 0, N, all_struct)
 
-    print(f"\n  Shift columns:    {len(shift_cols)}")
-    print(f"  Distance columns: {len(dist_col_info)}")
-    print(f"  DSSP columns:     {len(dssp_cols)}")
-    print(f"  Physics columns:  {len(physics_cols)}")
-    print(f"  Atom types:       {len(atom_to_idx)}")
+    bmrb_ids_arr = light_df['bmrb_id'].values.astype(str)
+    residue_ids_arr = light_df['residue_id'].values.astype(int)
+    struct_lookup = {}
+    for i in range(N):
+        struct_lookup[(bmrb_ids_arr[i], residue_ids_arr[i])] = all_struct[i]
+    del all_struct, bmrb_ids_arr, residue_ids_arr
+    gc.collect()
+    print(f"  Built lookup for {len(struct_lookup):,} residues in {time.time()-t0:.1f}s")
 
-    # Import retrieval module (lazy to avoid import errors if faiss not installed)
+    # Import retrieval module
     from retrieval import Retriever, EmbeddingLookup
 
     # Load embedding lookup once
     print(f"\nLoading embedding lookup from {args.embeddings}...")
     embedding_lookup = EmbeddingLookup(args.embeddings)
 
-    # Build (bmrb_id, residue_id) -> struct_features lookup from the FULL CSV
-    # This is needed to look up structural features for retrieved neighbors
-    # (which may come from any protein, not just the current fold)
-    print(f"\nBuilding structural feature lookup for neighbor struct...")
-    t0 = time.time()
-    struct_lookup = {}
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="  Building lookup"):
-        key = (str(row['bmrb_id']), int(row['residue_id']))
-        feat = np.zeros(N_STRUCT_FEATURES, dtype=np.float32)
-        # [0:21] backbone distances
-        for ci, col in enumerate(STRUCT_DIST_COLS):
-            if col in df.columns:
-                v = row[col]
-                feat[ci] = 0.0 if (v != v) else float(v)  # NaN check
-        # [21:26] SC geometry
-        off = len(STRUCT_DIST_COLS)
-        for ci, col in enumerate(STRUCT_SC_COLS):
-            if col in df.columns:
-                v = row[col]
-                feat[off + ci] = 0.0 if (v != v) else float(v)
-        # [26:30] sin/cos phi/psi
-        off2 = off + len(STRUCT_SC_COLS)
-        for ai, angle_col in enumerate(['phi', 'psi']):
-            if angle_col in df.columns:
-                v = row[angle_col]
-                if v == v:  # not NaN
-                    rad = np.deg2rad(float(v))
-                    feat[off2 + ai * 2] = np.sin(rad)
-                    feat[off2 + ai * 2 + 1] = np.cos(rad)
-        # [30:39] DSSP numeric
-        off3 = off2 + 4
-        for di, col in enumerate(DSSP_COLS):
-            if col in df.columns:
-                v = row[col]
-                feat[off3 + di] = 0.0 if (v != v) else float(v)
-        # [39:49] SS one-hot
-        off4 = off3 + len(DSSP_COLS)
-        ss = str(row.get('secondary_structure', 'UNK')).strip()
-        if ss == 'nan':
-            ss = 'UNK'
-        ss_idx = SS_TO_IDX.get(ss, SS_TO_IDX['UNK'])
-        feat[off4 + ss_idx] = 1.0
-        struct_lookup[key] = feat
-    print(f"  Built lookup for {len(struct_lookup):,} residues in {time.time()-t0:.1f}s")
-
     all_provenance = {}
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # ======================================================================
+    # PASS 3: Per-fold — chunked read of full CSV, build cache
+    # ======================================================================
     for fold in args.folds:
         print(f"\n{'=' * 50}")
         print(f"  FOLD {fold}")
         print(f"{'=' * 50}")
 
-        # Filter to proteins in this fold
-        fold_df = df[df[fold_col] == fold].copy()
-        n_fold_proteins = fold_df['bmrb_id'].nunique()
-        n_fold_residues = len(fold_df)
+        # Compute normalization stats from training data using light_df
+        train_mask = light_df[fold_col] != fold
+        stats = compute_normalization_stats(
+            light_df[train_mask], shift_cols, dssp_cols)
+        n_train = train_mask.sum()
+        print(f"    Stats from {light_df.loc[train_mask, 'bmrb_id'].nunique()} "
+              f"training proteins ({n_train:,} residues)")
 
-        print(f"    Proteins in fold {fold}: {n_fold_proteins}")
-        print(f"    Residues in fold {fold}: {n_fold_residues:,}")
+        # Load fold data — try per-fold CSV first (memory-efficient), fall back to filtering
+        fold_csv = os.path.join(args.data_dir, f'structure_data_hybrid_fold_{fold}.csv')
+        t0 = time.time()
+        if os.path.exists(fold_csv):
+            print(f"    Loading per-fold file: {fold_csv}")
+            fold_df = pd.read_csv(fold_csv, dtype={'bmrb_id': str}, low_memory=False)
+        else:
+            print(f"    Loading fold {fold} from full CSV (chunked)...")
+            fold_chunks = []
+            for chunk in pd.read_csv(csv_path, chunksize=50000,
+                                      dtype={'bmrb_id': str}, low_memory=False):
+                fold_chunk = chunk[chunk[fold_col] == fold]
+                if len(fold_chunk) > 0:
+                    fold_chunks.append(fold_chunk)
+            fold_df = pd.concat(fold_chunks, ignore_index=True)
+            del fold_chunks
+            gc.collect()
+        print(f"    Loaded {fold_df['bmrb_id'].nunique()} proteins, "
+              f"{len(fold_df):,} residues in {time.time()-t0:.1f}s")
 
-        if n_fold_proteins == 0:
-            print(f"    WARNING: No proteins in fold {fold}, skipping")
-            continue
-
-        # Compute normalization stats from training data (all folds EXCEPT this one)
-        train_df = df[df[fold_col] != fold]
-        stats = compute_normalization_stats(train_df, shift_cols, dssp_cols)
-        print(f"    Normalization stats computed from {train_df['bmrb_id'].nunique()} "
-              f"training proteins ({len(train_df):,} residues)")
-
-        # Load retriever for this fold
+        # Load retriever
         print(f"    Loading FAISS index (excluding fold {fold})...")
         retriever = Retriever(
             index_dir=args.index_dir,
@@ -969,19 +941,20 @@ def main():
             cache_dir=cache_dir,
             k_retrieved=args.k,
             retrieval_batch_size=args.retrieval_batch_size,
-            physics_cols=physics_cols,
             struct_lookup=struct_lookup,
         )
 
         elapsed = time.time() - t0
         provenance['build_time_seconds'] = elapsed
         all_provenance[fold] = provenance
-
         print(f"    Cache built in {elapsed:.1f}s")
 
-        # Free retriever memory
-        del retriever
+        # Free fold data and retriever
+        del fold_df, retriever
         gc.collect()
+
+    # Cleanup
+    del light_df, struct_lookup
 
     # Close embedding lookup
     embedding_lookup.close()

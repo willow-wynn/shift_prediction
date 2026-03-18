@@ -3,7 +3,7 @@
 Chemical Shift Imputation Model with Structure + Observed Shifts + Retrieval.
 
 Combines three information sources:
-1. Structural encoding (distances, spatial neighbors, DSSP, physics)
+1. Structural encoding (distances, spatial neighbors, DSSP)
 2. Observed shift context (neighboring residues' measured chemical shifts)
 3. Retrieval transfer (FAISS-retrieved similar residues, shift-aware weighting)
 
@@ -19,7 +19,6 @@ Reuses from model.py:
 - DistanceAttentionPerPosition
 - ResidualBlock1D
 - SpatialNeighborAttention
-- PhysicsFeatureEncoder
 """
 
 import os
@@ -42,12 +41,10 @@ from config import (
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
 )
-from random_coil import build_rc_tensor
 from model import (
     DistanceAttentionPerPosition,
     ResidualBlock1D,
     SpatialNeighborAttention,
-    PhysicsFeatureEncoder,
 )
 
 
@@ -160,8 +157,6 @@ class UnifiedRetrievalTransfer(nn.Module):
         hidden_dim: int = 192,
         n_heads: int = 4,
         dropout: float = 0.25,
-        use_random_coil: bool = True,
-        shift_cols: list = None,
     ):
         super().__init__()
 
@@ -171,19 +166,6 @@ class UnifiedRetrievalTransfer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = hidden_dim // n_heads
         self.scale = self.head_dim ** -0.5
-        self.use_random_coil = use_random_coil
-
-        # Random coil lookup table
-        if use_random_coil:
-            if shift_cols is None:
-                shift_cols = ['ca_shift', 'cb_shift', 'c_shift',
-                              'n_shift', 'h_shift', 'ha_shift']
-            rc_np = build_rc_tensor(STANDARD_RESIDUES, shift_cols)
-            rc_padded = np.full((n_residue_types + 1, n_shifts), np.nan, dtype=np.float32)
-            rc_padded[:rc_np.shape[0], :rc_np.shape[1]] = rc_np
-            self.register_buffer('rc_table', torch.from_numpy(rc_padded))
-        else:
-            self.rc_table = None
 
         # Query projection: takes structural encoding + shift context + observed shifts
         self.query_proj = nn.Sequential(
@@ -264,25 +246,6 @@ class UnifiedRetrievalTransfer(nn.Module):
 
         self.out_dim = hidden_dim
 
-    def _apply_random_coil_correction(self, retrieved_shifts, query_residue_code,
-                                       retrieved_residue_codes, retrieved_shift_masks):
-        """Apply RC correction: corrected = RC[query] + (shift - RC[retrieved])."""
-        if self.rc_table is None:
-            return retrieved_shifts
-
-        query_idx = query_residue_code.clamp(0, self.rc_table.size(0) - 1)
-        retrieved_idx = retrieved_residue_codes.clamp(0, self.rc_table.size(0) - 1)
-
-        rc_query = self.rc_table[query_idx].unsqueeze(1)        # (B, 1, S)
-        rc_retrieved = self.rc_table[retrieved_idx]              # (B, K, S)
-
-        corrected = rc_query + (retrieved_shifts - rc_retrieved)
-
-        rc_valid = ~torch.isnan(rc_query) & ~torch.isnan(rc_retrieved)
-        corrected = torch.where(rc_valid, corrected, retrieved_shifts)
-        corrected = torch.where(retrieved_shift_masks, corrected, retrieved_shifts)
-        return corrected
-
     def forward(
         self,
         query_encoding: torch.Tensor,          # (B, query_dim)
@@ -302,13 +265,6 @@ class UnifiedRetrievalTransfer(nn.Module):
             trust_scores: (B, n_shifts)
         """
         B, K, S = retrieved_shifts.shape
-
-        # RC correction
-        if self.use_random_coil:
-            retrieved_shifts = self._apply_random_coil_correction(
-                retrieved_shifts, query_residue_code,
-                retrieved_residue_codes, retrieved_shift_masks,
-            )
 
         any_valid = retrieved_valid.any(dim=1)  # (B,)
         same_type = (retrieved_residue_codes == query_residue_code.unsqueeze(1)).float()
@@ -440,7 +396,7 @@ class ShiftImputationModel(nn.Module):
     """Chemical shift imputation using structure + observed shifts + retrieval.
 
     Architecture:
-    1. Structural Encoder: DistanceAttention -> CNN -> center -> SpatialAttention -> Physics
+    1. Structural Encoder: DistanceAttention -> CNN -> center -> SpatialAttention
     2. Shift Context Encoder: 1D CNN over observed shifts in local window
     3. Unified Retrieval Transfer: cross-attention with shift-aware re-ranking
     4. Fusion -> shift-type-conditioned prediction head -> scalar output
@@ -450,7 +406,6 @@ class ShiftImputationModel(nn.Module):
         self,
         n_atom_types: int,
         n_shifts: int = 6,
-        n_physics: int = 28,
         n_residue_types: int = N_RESIDUE_TYPES,
         n_ss_types: int = N_SS_TYPES,
         n_mismatch_types: int = N_MISMATCH_TYPES,
@@ -472,8 +427,6 @@ class ShiftImputationModel(nn.Module):
         retrieval_hidden: int = RETRIEVAL_HIDDEN,
         retrieval_heads: int = RETRIEVAL_HEADS,
         retrieval_dropout: float = RETRIEVAL_DROPOUT,
-        use_random_coil: bool = True,
-        shift_cols: list = None,
     ):
         super().__init__()
 
@@ -527,12 +480,7 @@ class ShiftImputationModel(nn.Module):
             dropout=0.30,
         )
 
-        self.physics_encoder = PhysicsFeatureEncoder(
-            n_physics=n_physics, hidden_dim=64, dropout=0.2,
-        )
-        physics_dim = self.physics_encoder.out_dim
-
-        base_encoder_dim = struct_cnn_out + spatial_hidden + physics_dim
+        base_encoder_dim = struct_cnn_out + spatial_hidden
 
         # ========== Shift Context Encoder ==========
         self.shift_context_encoder = ShiftContextEncoder(
@@ -555,8 +503,6 @@ class ShiftImputationModel(nn.Module):
             hidden_dim=retrieval_hidden,
             n_heads=retrieval_heads,
             dropout=retrieval_dropout,
-            use_random_coil=use_random_coil,
-            shift_cols=shift_cols,
         )
 
         # ========== Fusion + Prediction ==========
@@ -599,9 +545,7 @@ class ShiftImputationModel(nn.Module):
         query_residue_code,
         retrieved_shifts, retrieved_shift_masks,
         retrieved_residue_codes, retrieved_distances, retrieved_valid,
-        # Physics features
-        physics_features,
-        # Shift context inputs (NEW)
+        # Shift context inputs
         context_residue_idx,       # (B, W) residue types in context window
         context_observed_shifts,   # (B, W, n_shifts) z-normalized shifts
         context_shift_masks,       # (B, W, n_shifts) availability masks
@@ -611,6 +555,8 @@ class ShiftImputationModel(nn.Module):
         # Observed shifts at center (for retrieval conditioning)
         center_observed_shifts,    # (B, n_shifts) shifts at center residue
         center_shift_masks,        # (B, n_shifts) availability at center
+        # Deprecated: accepted but ignored (for old dataset compatibility)
+        physics_features=None,
         **kwargs,
     ):
         """Forward pass. Returns (B, 1) scalar prediction."""
@@ -643,14 +589,7 @@ class ShiftImputationModel(nn.Module):
             neighbor_valid,
         )
 
-        if physics_features is None:
-            physics_features = torch.zeros(
-                B, self.physics_encoder.mlp[0].in_features,
-                device=x_center.device, dtype=x_center.dtype,
-            )
-        x_physics = self.physics_encoder(physics_features)
-
-        base_encoding = torch.cat([x_center, x_spatial, x_physics], dim=-1)
+        base_encoding = torch.cat([x_center, x_spatial], dim=-1)
 
         # ========== 2. Shift Context Encoder ==========
         shift_context = self.shift_context_encoder(
@@ -712,17 +651,13 @@ class ShiftImputationModel(nn.Module):
 def create_imputation_model(
     n_atom_types: int,
     n_shifts: int = 6,
-    n_physics: int = 28,
     shift_cols: list = None,
-    use_random_coil: bool = True,
     **kwargs,
 ) -> ShiftImputationModel:
     """Create imputation model with sensible defaults."""
     return ShiftImputationModel(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        n_physics=n_physics,
         shift_cols=shift_cols,
-        use_random_coil=use_random_coil,
         **kwargs,
     )

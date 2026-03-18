@@ -4,23 +4,13 @@ Retrieval Module for Chemical Shift Prediction (Better Data Pipeline)
 
 Adapted from homologies/retrieval_module.py with the following modifications:
 
-1. Adds random coil correction to retrieval results:
-   - Imports correct_transfer from random_coil
-   - New apply_random_coil_correction() function applies:
-       corrected = RC[query_aa] + (shift - RC[retrieved_aa])
-     on raw (unnormalized) shifts before they are stored in the dataset cache
-   - Returns modified results dict
+1. Imports FAISS_NPROBE and K_RETRIEVED from config instead of hardcoding
 
-2. Imports FAISS_NPROBE and K_RETRIEVED from config instead of hardcoding
-
-3. Keeps Retriever and EmbeddingLookup classes identical to original
+2. Keeps Retriever and EmbeddingLookup classes identical to original
 
 Usage:
     retriever = Retriever(index_dir='/path/to/indices', exclude_fold=1)
     results = retriever.retrieve(query_embeddings, query_bmrb_ids)
-
-    # Apply random coil correction
-    corrected = apply_random_coil_correction(results, query_residue_codes, shift_cols)
 """
 
 import json
@@ -37,78 +27,6 @@ import h5py
 import numpy as np
 
 from config import FAISS_NPROBE, K_RETRIEVED, STANDARD_RESIDUES, AA_3_TO_1, RESIDUE_TO_IDX
-from random_coil import RC_SHIFTS, correct_transfer, build_rc_tensor
-
-
-# ============================================================================
-# Random Coil Correction for Retrieval Results
-# ============================================================================
-
-def apply_random_coil_correction(
-    results: dict,
-    query_residue_codes: np.ndarray,
-    shift_cols: list,
-) -> dict:
-    """
-    Apply random coil correction to retrieved shifts.
-
-    For each retrieved shift, computes:
-        corrected = RC[query_aa] + (shift - RC[retrieved_aa])
-
-    This corrects for intrinsic chemical shift differences between amino acid
-    types, preserving the secondary (structural) shift contribution. The
-    correction is applied on RAW (unnormalized) shifts so it is physically
-    meaningful.
-
-    Args:
-        results: Dict from Retriever.retrieve() containing:
-            - 'shifts': (n_queries, k, n_shifts) raw chemical shifts
-            - 'shift_masks': (n_queries, k, n_shifts) validity masks
-            - 'residue_codes': (n_queries, k) residue type indices of retrieved
-        query_residue_codes: (n_queries,) residue type indices of queries
-            (indices into STANDARD_RESIDUES, i.e. the same encoding as config.RESIDUE_TO_IDX)
-        shift_cols: List of shift column names (e.g. ['ca_shift', 'cb_shift', ...])
-            Used to determine the atom type for each shift column.
-
-    Returns:
-        Modified results dict with corrected 'shifts' array.
-        The original dict is NOT modified; a shallow copy with a new 'shifts' is returned.
-    """
-    # Build RC lookup table: (n_residue_types, n_shifts)
-    rc_table = build_rc_tensor(STANDARD_RESIDUES, shift_cols)  # NaN where unavailable
-
-    n_queries, k, n_shifts = results['shifts'].shape
-    corrected_shifts = results['shifts'].copy()
-
-    # Vectorized correction
-    # rc_query: (n_queries, n_shifts)
-    query_codes_clamped = np.clip(query_residue_codes, 0, rc_table.shape[0] - 1)
-    rc_query = rc_table[query_codes_clamped]  # (n_queries, n_shifts)
-
-    # rc_retrieved: (n_queries, k, n_shifts)
-    retrieved_codes_clamped = np.clip(results['residue_codes'], 0, rc_table.shape[0] - 1)
-    rc_retrieved = rc_table[retrieved_codes_clamped]  # (n_queries, k, n_shifts)
-
-    # Expand query RC for broadcasting: (n_queries, 1, n_shifts)
-    rc_query_expanded = rc_query[:, np.newaxis, :]
-
-    # Compute correction
-    correction = rc_query_expanded + (results['shifts'] - rc_retrieved)
-
-    # Only apply where both RC values are available (not NaN)
-    rc_valid = ~np.isnan(rc_query_expanded) & ~np.isnan(rc_retrieved)
-    shift_valid = results['shift_masks']
-
-    apply_mask = rc_valid & shift_valid
-    corrected_shifts = np.where(apply_mask, correction, corrected_shifts)
-
-    # Handle any NaN introduced by the arithmetic
-    corrected_shifts = np.where(np.isnan(corrected_shifts), results['shifts'], corrected_shifts)
-
-    # Return modified copy
-    out = dict(results)
-    out['shifts'] = corrected_shifts
-    return out
 
 
 # ============================================================================

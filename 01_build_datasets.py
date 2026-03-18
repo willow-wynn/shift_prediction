@@ -46,7 +46,6 @@ from pdb_utils import (
 from alignment import align_sequences, to_single_letter
 from distance_features import compute_all_distance_features, get_sidechain_summary_names
 from spatial_neighbors import find_neighbors
-from physics_features import compute_all_physics_features, get_physics_feature_names
 from structure_selection import select_best_chain, kabsch_superimpose
 from alphafold_utils import get_uniprot_for_bmrb, download_alphafold_structure
 
@@ -503,23 +502,34 @@ def get_alphafold_structures(bmrb_ids, shifts_df, alphafold_dir, online=False):
     mapping_cache_path = os.path.join(alphafold_dir, 'bmrb_uniprot_mapping.json')
 
     if not online:
-        # Offline: use cached BMRB->UniProt mapping + existing AlphaFold PDBs
+        # Offline: use cached BMRB->UniProt mappings + existing AlphaFold PDBs
         from alphafold_utils import AF_MODEL_VERSION
         af_structures = {}
-        if os.path.isdir(alphafold_dir) and os.path.exists(mapping_cache_path):
+        mapping = {}
+        # Load primary mapping
+        if os.path.exists(mapping_cache_path):
             with open(mapping_cache_path) as f:
                 mapping = json.load(f)
-            for bmrb_id in bmrb_ids:
-                uniprot_id = mapping.get(str(bmrb_id))
-                if uniprot_id is None:
-                    continue
-                af_path = os.path.join(alphafold_dir, f'AF-{uniprot_id}-F1-{AF_MODEL_VERSION}.pdb')
-                if os.path.exists(af_path):
-                    af_structures[bmrb_id] = (af_path, 'A')
-            if af_structures:
-                print(f"  Offline: found {len(af_structures)} cached AlphaFold structures")
-        else:
+        # Merge supplementary mappings (from find_missing_uniprots.py)
+        new_mapping_path = os.path.join(alphafold_dir, 'new_uniprot_mappings.json')
+        if os.path.exists(new_mapping_path):
+            with open(new_mapping_path) as f:
+                new_mapping = json.load(f)
+            mapping.update(new_mapping)
+            print(f"  Merged {len(new_mapping)} supplementary UniProt mappings")
+
+        if not mapping:
             print("  Offline mode: no AlphaFold mapping cache found. Run with --online first.")
+            return af_structures
+
+        for bmrb_id in bmrb_ids:
+            uniprot_id = mapping.get(str(bmrb_id))
+            if uniprot_id is None:
+                continue
+            af_path = os.path.join(alphafold_dir, f'AF-{uniprot_id}-F1-{AF_MODEL_VERSION}.pdb')
+            if os.path.exists(af_path):
+                af_structures[bmrb_id] = (af_path, 'A')
+        print(f"  Offline: found {len(af_structures)} AlphaFold structures")
         return af_structures
 
     os.makedirs(alphafold_dir, exist_ok=True)
@@ -704,15 +714,7 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
     shift_cols = sorted([c for c in shifts_df.columns if c.endswith('_shift')])
     ambig_cols = sorted([c for c in shifts_df.columns if c.endswith('_ambiguity_code')])
 
-    # Pre-compute chain-wide coords for physics features
     sorted_rids = sorted(struct_data.keys())
-    rid_to_idx = {}
-    all_residue_coords = {}  # rid -> atom coords dict for h-bond distance calc
-    for idx, rid in enumerate(sorted_rids):
-        rdata = struct_data[rid]
-        atoms = rdata.get('atoms', {})
-        rid_to_idx[rid] = idx
-        all_residue_coords[idx] = atoms
 
     # Build rows
     for m in mapping:
@@ -787,15 +789,6 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
                 val = dssp_entry.get(col)
                 if val is not None:
                     row[col] = val
-
-            # Physics features (h-bond geometry only)
-            dssp_for_phys = dict(dssp_entry)
-            dssp_for_phys['residue_idx'] = rid_to_idx.get(struct_rid, 0)
-            phys_feats = compute_all_physics_features(
-                dssp_data=dssp_for_phys,
-                all_coords=all_residue_coords,
-            )
-            row.update(phys_feats)
 
         # Spatial neighbors
         if has_struct and struct_rid in neighbors:
@@ -1068,31 +1061,51 @@ def main():
     for dataset_name, selections in dataset_configs.items():
         print(f"\n  Compiling {dataset_name} dataset...")
 
-        all_rows = []
         failed = 0
         succeeded = 0
+        total_residues = 0
 
-        for bmrb_id in tqdm(sorted(selections.keys()),
-                            desc=f"  {dataset_name}", unit="protein"):
-            pdb_path, chain_id = selections[bmrb_id]
-            prot_shifts = shifts_by_protein.get(bmrb_id)
-            if prot_shifts is None:
-                continue
+        # Process in batches to limit peak memory
+        BATCH_SIZE = 2000  # proteins per batch
+        sorted_ids = sorted(selections.keys())
+        all_batch_dfs = []
 
-            try:
-                rows = process_protein(bmrb_id, prot_shifts, pdb_path, chain_id)
-                if rows:
-                    all_rows.extend(rows)
-                    succeeded += 1
-                    log_rows.append({
-                        'dataset': dataset_name,
-                        'bmrb_id': bmrb_id,
-                        'pdb_path': pdb_path,
-                        'chain_id': chain_id,
-                        'n_residues': len(rows),
-                        'status': 'success',
-                    })
-                else:
+        for batch_start in range(0, len(sorted_ids), BATCH_SIZE):
+            batch_ids = sorted_ids[batch_start:batch_start + BATCH_SIZE]
+            batch_rows = []
+
+            for bmrb_id in tqdm(batch_ids,
+                                desc=f"  {dataset_name} [{batch_start}:{batch_start+len(batch_ids)}]",
+                                unit="protein"):
+                pdb_path, chain_id = selections[bmrb_id]
+                prot_shifts = shifts_by_protein.get(bmrb_id)
+                if prot_shifts is None:
+                    continue
+
+                try:
+                    rows = process_protein(bmrb_id, prot_shifts, pdb_path, chain_id)
+                    if rows:
+                        batch_rows.extend(rows)
+                        succeeded += 1
+                        log_rows.append({
+                            'dataset': dataset_name,
+                            'bmrb_id': bmrb_id,
+                            'pdb_path': pdb_path,
+                            'chain_id': chain_id,
+                            'n_residues': len(rows),
+                            'status': 'success',
+                        })
+                    else:
+                        failed += 1
+                        log_rows.append({
+                            'dataset': dataset_name,
+                            'bmrb_id': bmrb_id,
+                            'pdb_path': pdb_path,
+                            'chain_id': chain_id,
+                            'n_residues': 0,
+                            'status': 'empty',
+                        })
+                except Exception as e:
                     failed += 1
                     log_rows.append({
                         'dataset': dataset_name,
@@ -1100,50 +1113,48 @@ def main():
                         'pdb_path': pdb_path,
                         'chain_id': chain_id,
                         'n_residues': 0,
-                        'status': 'empty',
+                        'status': f'error: {e}',
                     })
-            except Exception as e:
-                failed += 1
-                log_rows.append({
-                    'dataset': dataset_name,
-                    'bmrb_id': bmrb_id,
-                    'pdb_path': pdb_path,
-                    'chain_id': chain_id,
-                    'n_residues': 0,
-                    'status': f'error: {e}',
-                })
-                if failed <= 3:
-                    print(f"\n    WARNING: {bmrb_id}: {e}")
-                    traceback.print_exc()
+                    if failed <= 3:
+                        print(f"\n    WARNING: {bmrb_id}: {e}")
+                        traceback.print_exc()
 
-        if not all_rows:
+            if batch_rows:
+                batch_df = pd.DataFrame(batch_rows)
+                batch_df['split'] = batch_df['bmrb_id'].apply(
+                    lambda bid: assign_fold(bid, n_folds=args.n_folds))
+                all_batch_dfs.append(batch_df)
+                del batch_rows
+                print(f"    Batch done: {len(batch_df):,} residues, "
+                      f"cumulative: {sum(len(d) for d in all_batch_dfs):,}")
+
+        if not all_batch_dfs:
             print(f"    No residues compiled for {dataset_name}")
             continue
 
-        df = pd.DataFrame(all_rows)
-        print(f"    Raw: {df['bmrb_id'].nunique()} proteins, {len(df):,} residues "
-              f"({succeeded} ok, {failed} failed)")
-
-        # Assign folds
-        df['split'] = df['bmrb_id'].apply(lambda bid: assign_fold(bid, n_folds=args.n_folds))
-
-        # ------------------------------------------------------------------
-        # Step 5: Quality filtering
-        # ------------------------------------------------------------------
-        print(f"    Quality filtering...")
-
-        # 5a: Remove proteins with nonstandard residues (should already be filtered, but double-check)
-        df = filter_nonstandard_proteins(df)
-
-        # 5b: Outlier detection per (atom_type, secondary_structure)
-        df = filter_outliers_by_group(df)
-
-        # Save
+        # Collect all columns across batches, then write with uniform schema
         output_path = os.path.join(output_dir, f'structure_data_{dataset_name}.csv')
-        df.to_csv(output_path, index=False)
+        all_cols = set()
+        for batch_df in all_batch_dfs:
+            all_cols.update(batch_df.columns)
+        all_cols = sorted(all_cols)
+        print(f"    Writing {len(all_batch_dfs)} batches ({len(all_cols)} columns) to {output_path}...")
+        total_rows = 0
+        for bi, batch_df in enumerate(all_batch_dfs):
+            # Reindex to uniform columns (missing cols become NaN)
+            batch_df = batch_df.reindex(columns=all_cols)
+            batch_df.to_csv(output_path, mode='a' if bi > 0 else 'w',
+                            index=False, header=(bi == 0))
+            total_rows += len(batch_df)
+        del all_batch_dfs
+        import gc; gc.collect()
+
         print(f"    Saved: {output_path}")
-        print(f"    Final: {df['bmrb_id'].nunique()} proteins, {len(df):,} residues, "
-              f"{len(df.columns)} columns")
+        print(f"    Total: {succeeded} proteins, {total_rows:,} residues, "
+              f"({succeeded} ok, {failed} failed)")
+        print(f"    Note: Run analyze_data_quality.py for quality filtering")
+
+        gc.collect()
 
     # Save build log
     log_path = os.path.join(output_dir, 'build_log.csv')
