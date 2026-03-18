@@ -397,12 +397,10 @@ def main():
 
     # Get n_atom_types from base dataset config
     n_atom_types = train_base.n_atom_types
-    n_physics = getattr(train_base, 'n_physics', 28)
 
     model = create_imputation_model(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        n_physics=n_physics,
         shift_cols=shift_cols,
         use_random_coil=not args.no_random_coil,
         n_dssp=len(dssp_cols),
@@ -418,7 +416,10 @@ def main():
     if args.checkpoint:
         print(f"\nResuming from: {args.checkpoint}")
         resume_checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(resume_checkpoint['model_state_dict'])
+        # Filter out deprecated physics_encoder keys from old checkpoints
+        sd = {k: v for k, v in resume_checkpoint['model_state_dict'].items()
+              if not k.startswith('physics_encoder.')}
+        model.load_state_dict(sd, strict=False)
         start_epoch = resume_checkpoint.get('epoch', 0) + 1
         print(f"  Resuming from epoch {start_epoch}")
 
@@ -515,7 +516,6 @@ def main():
                 'shift_cols': shift_cols,
                 'dssp_cols': dssp_cols,
                 'n_atom_types': n_atom_types,
-                'n_physics': n_physics,
                 'k_retrieved': args.k_retrieved,
             }, ckpt_path)
             print(f"  Checkpoint saved: {ckpt_path}")
@@ -552,7 +552,6 @@ def main():
                     'shift_cols': shift_cols,
                     'dssp_cols': dssp_cols,
                     'n_atom_types': n_atom_types,
-                    'n_physics': n_physics,
                     'k_retrieved': args.k_retrieved,
                 }, best_path)
                 print(f"  *** New best model saved (MAE: {best_mae:.4f} ppm) ***")

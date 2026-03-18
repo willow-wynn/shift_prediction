@@ -5,7 +5,6 @@ Training Script for Retrieval-Augmented Chemical Shift Prediction
 
 Adapted from homologies/train_retrieval.py with improvements:
 - Imports hyperparameters from config.py (central configuration)
-- Physics features passed through to model forward()
 - Model creation via create_model() factory from model.py
 - Outlier masking: mask predictions where |residual| > 4*std during loss
 - AdamW optimizer with CosineAnnealingWarmRestarts scheduler
@@ -635,13 +634,11 @@ def main():
     print("\nCreating model via create_model() factory...")
 
     # Detect feature dimensions from dataset
-    n_physics = getattr(train_dataset, 'n_physics', 28)
     n_struct = getattr(train_dataset, 'n_struct_features', 49)
 
     model = create_model(
         n_atom_types=len(atom_to_idx),
         n_shifts=len(shift_cols),
-        n_physics=n_physics,
         n_struct=n_struct,
         shift_cols=shift_cols,
         use_random_coil=not args.no_random_coil,
@@ -661,7 +658,10 @@ def main():
     if args.checkpoint:
         print(f"\nResuming from checkpoint: {args.checkpoint}")
         resume_checkpoint = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(resume_checkpoint['model_state_dict'])
+        # Filter out deprecated physics_encoder keys from old checkpoints
+        sd = {k: v for k, v in resume_checkpoint['model_state_dict'].items()
+              if not k.startswith('physics_encoder.')}
+        model.load_state_dict(sd, strict=False)
         start_epoch = resume_checkpoint.get('epoch', 0) + 1
         print(f"  Resuming from epoch {start_epoch}")
         provenance.log_data_summary('resumed_from', args.checkpoint)
@@ -771,7 +771,6 @@ def main():
                 'dssp_cols': dssp_cols,
                 'atom_to_idx': atom_to_idx,
                 'k_retrieved': args.k_retrieved,
-                'n_physics': n_physics,
             }, ckpt_path)
             print(f"  Checkpoint saved at epoch {epoch}: {ckpt_path}")
 
@@ -809,7 +808,6 @@ def main():
                     'dssp_cols': dssp_cols,
                     'atom_to_idx': atom_to_idx,
                     'k_retrieved': args.k_retrieved,
-                    'n_physics': n_physics,
                 }, best_path)
                 print(f"  *** New best model saved (MAE: {best_mae:.4f} ppm) ***")
 

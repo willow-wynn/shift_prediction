@@ -11,15 +11,8 @@ Adapted from homologies/dataset_cached.py with the following modifications:
    - MISMATCH_TYPES, MISMATCH_TO_IDX, N_MISMATCH_TYPES
    - DSSP_COLS
 
-2. Adds physics features to structural data:
-   - _load_structural_data() also loads physics.npy if present
-   - __getitem__() includes 'physics_features' in the output dict
-   - create() saves physics feature array alongside other structural data
-
-3. Backward compatibility: returns zeros if physics features don't exist
-
-4. Keeps the same memory-mapped retrieval architecture (shifts.npy, shift_masks.npy, etc.)
-5. Keeps the same create() and load() classmethods with checkpoint/resume support
+2. Keeps the same memory-mapped retrieval architecture (shifts.npy, shift_masks.npy, etc.)
+3. Keeps the same create() and load() classmethods with checkpoint/resume support
 
 Usage:
     # First run: builds and saves dataset
@@ -96,26 +89,6 @@ def get_dssp_columns(df_columns):
 
 
 # ============================================================================
-# Physics Feature Columns
-# ============================================================================
-
-# Default physics feature columns expected in the dataset.
-# The exact list may vary; the dataset handles missing columns gracefully.
-PHYSICS_COLS = [
-    'ring_current_h', 'ring_current_ha',
-    'hse_up', 'hse_down', 'hse_ratio',
-    'hbond_dist_1', 'hbond_energy_1',
-    'hbond_dist_2', 'hbond_energy_2',
-    'order_parameter',
-]
-
-
-def get_physics_columns(df_columns):
-    """Get available physics feature columns from the dataframe."""
-    return [c for c in PHYSICS_COLS if c in df_columns]
-
-
-# ============================================================================
 # Memory-Efficient Cached Dataset
 # ============================================================================
 
@@ -125,7 +98,6 @@ class CachedRetrievalDataset(Dataset):
 
     Storage strategy:
     - Structural features: stored in memory (compact)
-    - Physics features: stored in memory (compact, ~28 floats per residue)
     - Retrieved shifts: stored as memory-mapped numpy array on disk
     - Sample indices: stored in memory (small)
     """
@@ -155,7 +127,6 @@ class CachedRetrievalDataset(Dataset):
 
         self.n_atom_types = config['n_atom_types']
         self.n_dssp = config['n_dssp']
-        self.n_physics = config.get('n_physics', 0)
         self.window_size = config['window_size']
         self.k_spatial = config['k_spatial']
         self.max_valid_distances = config['max_valid_distances']
@@ -245,13 +216,6 @@ class CachedRetrievalDataset(Dataset):
         # Global index to residue ID mapping (load once, not per-item)
         with open(sd / 'global_to_resid.json', 'r') as f:
             self.global_to_resid = json.load(f)
-
-        # Physics features
-        physics_path = sd / 'physics.npy'
-        if physics_path.exists():
-            self.flat_physics = torch.from_numpy(np.load(physics_path))
-        else:
-            self.flat_physics = None
 
         # Compact structural feature vector (for retrieval neighbor encoder)
         query_struct_path = sd / 'query_struct.npy'
@@ -424,17 +388,6 @@ class CachedRetrievalDataset(Dataset):
                 retrieved_shifts
             )
 
-        # Physics features
-        if self.flat_physics is not None:
-            physics_features = self.flat_physics[global_idx].float()
-            physics_features = torch.where(
-                torch.isnan(physics_features),
-                torch.zeros_like(physics_features),
-                physics_features
-            )
-        else:
-            physics_features = torch.zeros(max(self.n_physics, 1), dtype=torch.float32)
-
         # Query structural features
         if self.flat_query_struct is not None:
             query_struct = self.flat_query_struct[global_idx].float()
@@ -492,9 +445,6 @@ class CachedRetrievalDataset(Dataset):
             'retrieved_distances': retrieved_distances,
             'retrieved_valid': retrieved_valid,
 
-            # Physics features
-            'physics_features': physics_features,
-
             # Structural feature vectors (for retrieval neighbor encoder)
             'query_struct': query_struct,
             'neighbor_struct': neighbor_struct,
@@ -543,24 +493,14 @@ class CachedRetrievalDataset(Dataset):
         k_retrieved: int = 32,
         max_valid_distances: int = 275,
         retrieval_batch_size: int = 5000,
-        physics_cols: list = None,
     ):
         """
         Create a new cached dataset.
 
         This builds all the data and saves to disk, then returns a loaded dataset.
         Supports checkpoint/resume - if it crashes, run again and it picks up where it left off.
-
-        MODIFIED from original:
-        - Accepts physics_cols parameter for physics feature columns
-        - Saves physics.npy alongside other structural data
         """
         cache_path = Path(cache_dir)
-
-        # Auto-detect physics columns if not provided
-        if physics_cols is None:
-            physics_cols = get_physics_columns(df.columns)
-        n_physics = len(physics_cols)
 
         # Check if we're resuming from a crash
         checkpoint_file = cache_path / 'retrieval' / '_checkpoint.txt'
@@ -599,7 +539,6 @@ class CachedRetrievalDataset(Dataset):
 
         print("  Building cached dataset...")
         print(f"    Total residues: {total_residues:,}, proteins: {n_proteins}")
-        print(f"    Physics features: {n_physics} columns")
 
         # ========== Allocate structural arrays ==========
         # Note: structural data rebuilds on resume (fast), only retrieval checkpoints
@@ -622,9 +561,6 @@ class CachedRetrievalDataset(Dataset):
         flat_spatial_seq_sep = np.zeros((total_residues, k_spatial), dtype=np.int16)
 
         flat_window_idx = np.full((total_residues, window_size), -1, dtype=np.int32)
-
-        # NEW: Physics features array
-        flat_physics = np.zeros((total_residues, n_physics), dtype=np.float16) if n_physics > 0 else None
 
         # Protein tracking
         protein_offsets = []
@@ -780,15 +716,6 @@ class CachedRetrievalDataset(Dataset):
                         if neighbor_global >= 0:
                             flat_window_idx[global_idx, w] = neighbor_global
 
-            # Physics features (NEW)
-            if flat_physics is not None and n_physics > 0:
-                for pi, col in enumerate(physics_cols):
-                    if col in pdf.columns:
-                        vals = pdf[col].values
-                        valid = ~np.isnan(vals)
-                        # Store raw values (normalization can be done at model level or here)
-                        flat_physics[start_idx:start_idx + n, pi] = np.where(valid, vals, 0.0)
-
             # Build samples
             for local_idx in range(n):
                 global_idx = start_idx + local_idx
@@ -823,10 +750,6 @@ class CachedRetrievalDataset(Dataset):
         np.save(sd / 'protein_min_res.npy', np.array(protein_min_res, dtype=np.int32))
         np.save(sd / 'protein_max_res.npy', np.array(protein_max_res, dtype=np.int32))
 
-        # Save physics features (NEW)
-        if flat_physics is not None:
-            np.save(sd / 'physics.npy', flat_physics)
-
         with open(sd / 'bmrb_mapping.json', 'w') as f:
             json.dump(idx_to_bmrb, f)
         with open(sd / 'global_to_resid.json', 'w') as f:
@@ -841,8 +764,6 @@ class CachedRetrievalDataset(Dataset):
         del flat_dssp, flat_shifts, flat_shift_mask, flat_angles
         del flat_spatial_ids, flat_spatial_dist, flat_spatial_seq_sep
         del flat_window_idx, flat_res_id_lookup
-        if flat_physics is not None:
-            del flat_physics
 
         import gc
         gc.collect()
@@ -978,7 +899,6 @@ class CachedRetrievalDataset(Dataset):
         config = {
             'n_atom_types': n_atom_types,
             'n_dssp': n_dssp,
-            'n_physics': n_physics,
             'n_shifts': n_shifts,
             'window_size': window_size,
             'k_spatial': k_spatial,
@@ -989,7 +909,6 @@ class CachedRetrievalDataset(Dataset):
             'n_samples': len(samples_list),
             'shift_cols': shift_cols,        # Save for retrieval normalization
             'stats': stats_for_json,         # Save for retrieval normalization
-            'physics_cols': physics_cols,     # Save physics col names
         }
 
         with open(cache_path / 'config.json', 'w') as f:

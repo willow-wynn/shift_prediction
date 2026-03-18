@@ -24,7 +24,7 @@ Cache layout (per fold):
     <output_dir>/fold_{k}/
         config.json
         samples.npy
-        structural/  (residue_idx.npy, ss_idx.npy, ... , physics.npy)
+        structural/  (residue_idx.npy, ss_idx.npy, ...)
         retrieval/   (shifts.npy, shift_masks.npy, residue_codes.npy, ...)
 
 Usage:
@@ -101,21 +101,6 @@ def parse_shift_columns(columns):
 def get_dssp_columns(df_columns):
     """Get available DSSP columns."""
     return [c for c in DSSP_COLS if c in df_columns]
-
-
-# Physics feature columns (from dataset.py)
-PHYSICS_COLS = [
-    'ring_current_h', 'ring_current_ha',
-    'hse_up', 'hse_down', 'hse_ratio',
-    'hbond_dist_1', 'hbond_energy_1',
-    'hbond_dist_2', 'hbond_energy_2',
-    'order_parameter',
-]
-
-
-def get_physics_columns(df_columns):
-    """Get available physics feature columns."""
-    return [c for c in PHYSICS_COLS if c in df_columns]
 
 
 def extract_struct_features(pdf, start_idx, n, flat_struct):
@@ -216,7 +201,6 @@ def build_cache_for_fold(
     k_retrieved: int = K_RETRIEVED,
     max_valid_distances: int = MAX_VALID_DISTANCES,
     retrieval_batch_size: int = 5000,
-    physics_cols: list = None,
     struct_lookup: dict = None,
 ):
     """Build a complete training cache for one fold.
@@ -225,11 +209,6 @@ def build_cache_for_fold(
     standalone function with full provenance logging and checkpoint/resume.
     """
     cache_path = Path(cache_dir)
-
-    # Auto-detect physics columns if not provided
-    if physics_cols is None:
-        physics_cols = get_physics_columns(df.columns)
-    n_physics = len(physics_cols)
 
     # Check for resume
     checkpoint_file = cache_path / 'retrieval' / '_checkpoint.txt'
@@ -270,7 +249,6 @@ def build_cache_for_fold(
     print(f"      Shift columns: {n_shifts}")
     print(f"      Distance columns: {len(dist_col_info)}")
     print(f"      DSSP columns: {n_dssp}")
-    print(f"      Physics columns: {n_physics}")
     print(f"      Context window: {window_size}")
     print(f"      K spatial: {k_spatial}")
     print(f"      K retrieved: {K}")
@@ -296,12 +274,6 @@ def build_cache_for_fold(
     flat_spatial_seq_sep = np.zeros((total_residues, k_spatial), dtype=np.int16)
 
     flat_window_idx = np.full((total_residues, window_size), -1, dtype=np.int32)
-
-    # Physics features
-    flat_physics = (
-        np.zeros((total_residues, n_physics), dtype=np.float16)
-        if n_physics > 0 else None
-    )
 
     # Compact structural feature vector (for retrieval neighbor encoder)
     flat_query_struct = np.zeros((total_residues, N_STRUCT_FEATURES), dtype=np.float32)
@@ -467,14 +439,6 @@ def build_cache_for_fold(
                     if neighbor_global >= 0:
                         flat_window_idx[global_idx, w] = neighbor_global
 
-        # Physics features
-        if flat_physics is not None and n_physics > 0:
-            for pi, col in enumerate(physics_cols):
-                if col in pdf.columns:
-                    vals = pdf[col].values
-                    valid = ~np.isnan(vals)
-                    flat_physics[start_idx:start_idx + n, pi] = np.where(valid, vals, 0.0)
-
         # Compact structural feature vector
         extract_struct_features(pdf, start_idx, n, flat_query_struct)
 
@@ -512,8 +476,6 @@ def build_cache_for_fold(
     np.save(sd / 'protein_min_res.npy', np.array(protein_min_res, dtype=np.int32))
     np.save(sd / 'protein_max_res.npy', np.array(protein_max_res, dtype=np.int32))
 
-    if flat_physics is not None:
-        np.save(sd / 'physics.npy', flat_physics)
     np.save(sd / 'query_struct.npy', flat_query_struct)
 
     with open(sd / 'bmrb_mapping.json', 'w') as f:
@@ -535,8 +497,6 @@ def build_cache_for_fold(
     del flat_dssp, flat_shifts, flat_shift_mask, flat_angles
     del flat_spatial_ids, flat_spatial_dist, flat_spatial_seq_sep
     del flat_window_idx, flat_res_id_lookup
-    if flat_physics is not None:
-        del flat_physics
     # Keep flat_query_struct — needed for neighbor struct lookup during retrieval
     gc.collect()
 
@@ -720,7 +680,6 @@ def build_cache_for_fold(
     config = {
         'n_atom_types': n_atom_types,
         'n_dssp': n_dssp,
-        'n_physics': n_physics,
         'n_struct_features': N_STRUCT_FEATURES,
         'n_shifts': n_shifts,
         'window_size': window_size,
@@ -732,7 +691,6 @@ def build_cache_for_fold(
         'n_samples': n_samples,
         'shift_cols': shift_cols,
         'stats': stats_for_json,
-        'physics_cols': physics_cols,
     }
 
     with open(cache_path / 'config.json', 'w') as f:
@@ -855,13 +813,11 @@ def main():
     shift_cols = parse_shift_columns(df.columns.tolist())
     dist_col_info = parse_distance_columns(df.columns.tolist())
     dssp_cols = get_dssp_columns(df.columns.tolist())
-    physics_cols = get_physics_columns(df.columns.tolist())
     _, atom_to_idx = build_atom_vocabulary(dist_col_info)
 
     print(f"\n  Shift columns:    {len(shift_cols)}")
     print(f"  Distance columns: {len(dist_col_info)}")
     print(f"  DSSP columns:     {len(dssp_cols)}")
-    print(f"  Physics columns:  {len(physics_cols)}")
     print(f"  Atom types:       {len(atom_to_idx)}")
 
     # Import retrieval module (lazy to avoid import errors if faiss not installed)
@@ -969,7 +925,6 @@ def main():
             cache_dir=cache_dir,
             k_retrieved=args.k,
             retrieval_batch_size=args.retrieval_batch_size,
-            physics_cols=physics_cols,
             struct_lookup=struct_lookup,
         )
 

@@ -3,7 +3,7 @@
 Chemical Shift Imputation Model with Structure + Observed Shifts + Retrieval.
 
 Combines three information sources:
-1. Structural encoding (distances, spatial neighbors, DSSP, physics)
+1. Structural encoding (distances, spatial neighbors, DSSP)
 2. Observed shift context (neighboring residues' measured chemical shifts)
 3. Retrieval transfer (FAISS-retrieved similar residues, shift-aware weighting)
 
@@ -19,7 +19,6 @@ Reuses from model.py:
 - DistanceAttentionPerPosition
 - ResidualBlock1D
 - SpatialNeighborAttention
-- PhysicsFeatureEncoder
 """
 
 import os
@@ -47,7 +46,6 @@ from model import (
     DistanceAttentionPerPosition,
     ResidualBlock1D,
     SpatialNeighborAttention,
-    PhysicsFeatureEncoder,
 )
 
 
@@ -440,7 +438,7 @@ class ShiftImputationModel(nn.Module):
     """Chemical shift imputation using structure + observed shifts + retrieval.
 
     Architecture:
-    1. Structural Encoder: DistanceAttention -> CNN -> center -> SpatialAttention -> Physics
+    1. Structural Encoder: DistanceAttention -> CNN -> center -> SpatialAttention
     2. Shift Context Encoder: 1D CNN over observed shifts in local window
     3. Unified Retrieval Transfer: cross-attention with shift-aware re-ranking
     4. Fusion -> shift-type-conditioned prediction head -> scalar output
@@ -450,7 +448,7 @@ class ShiftImputationModel(nn.Module):
         self,
         n_atom_types: int,
         n_shifts: int = 6,
-        n_physics: int = 28,
+        n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
         n_residue_types: int = N_RESIDUE_TYPES,
         n_ss_types: int = N_SS_TYPES,
         n_mismatch_types: int = N_MISMATCH_TYPES,
@@ -527,12 +525,7 @@ class ShiftImputationModel(nn.Module):
             dropout=0.30,
         )
 
-        self.physics_encoder = PhysicsFeatureEncoder(
-            n_physics=n_physics, hidden_dim=64, dropout=0.2,
-        )
-        physics_dim = self.physics_encoder.out_dim
-
-        base_encoder_dim = struct_cnn_out + spatial_hidden + physics_dim
+        base_encoder_dim = struct_cnn_out + spatial_hidden
 
         # ========== Shift Context Encoder ==========
         self.shift_context_encoder = ShiftContextEncoder(
@@ -599,9 +592,7 @@ class ShiftImputationModel(nn.Module):
         query_residue_code,
         retrieved_shifts, retrieved_shift_masks,
         retrieved_residue_codes, retrieved_distances, retrieved_valid,
-        # Physics features
-        physics_features,
-        # Shift context inputs (NEW)
+        # Shift context inputs
         context_residue_idx,       # (B, W) residue types in context window
         context_observed_shifts,   # (B, W, n_shifts) z-normalized shifts
         context_shift_masks,       # (B, W, n_shifts) availability masks
@@ -611,6 +602,8 @@ class ShiftImputationModel(nn.Module):
         # Observed shifts at center (for retrieval conditioning)
         center_observed_shifts,    # (B, n_shifts) shifts at center residue
         center_shift_masks,        # (B, n_shifts) availability at center
+        # Deprecated: accepted but ignored (for old dataset compatibility)
+        physics_features=None,
         **kwargs,
     ):
         """Forward pass. Returns (B, 1) scalar prediction."""
@@ -643,14 +636,7 @@ class ShiftImputationModel(nn.Module):
             neighbor_valid,
         )
 
-        if physics_features is None:
-            physics_features = torch.zeros(
-                B, self.physics_encoder.mlp[0].in_features,
-                device=x_center.device, dtype=x_center.dtype,
-            )
-        x_physics = self.physics_encoder(physics_features)
-
-        base_encoding = torch.cat([x_center, x_spatial, x_physics], dim=-1)
+        base_encoding = torch.cat([x_center, x_spatial], dim=-1)
 
         # ========== 2. Shift Context Encoder ==========
         shift_context = self.shift_context_encoder(
@@ -712,16 +698,17 @@ class ShiftImputationModel(nn.Module):
 def create_imputation_model(
     n_atom_types: int,
     n_shifts: int = 6,
-    n_physics: int = 28,
     shift_cols: list = None,
     use_random_coil: bool = True,
+    n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
     **kwargs,
 ) -> ShiftImputationModel:
     """Create imputation model with sensible defaults."""
+    # Remove n_physics from kwargs if caller passed it, to avoid double-passing
+    kwargs.pop('n_physics', None)
     return ShiftImputationModel(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        n_physics=n_physics,
         shift_cols=shift_cols,
         use_random_coil=use_random_coil,
         **kwargs,

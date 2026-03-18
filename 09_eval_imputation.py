@@ -76,7 +76,6 @@ def load_imputation_model(checkpoint_path, device):
     stats = checkpoint.get('stats', None)
     shift_cols = checkpoint.get('shift_cols', None)
     k_retrieved = checkpoint.get('k_retrieved', K_RETRIEVED)
-    n_physics = checkpoint.get('n_physics', 28)
     n_atom_types = checkpoint.get('n_atom_types', None)
     dssp_cols = checkpoint.get('dssp_cols', [])
 
@@ -86,9 +85,6 @@ def load_imputation_model(checkpoint_path, device):
 
     n_shifts = clean_sd['shift_type_proj.0.weight'].shape[1]
     n_dssp = clean_sd['dssp_proj.weight'].shape[1] if 'dssp_proj.weight' in clean_sd else 0
-
-    if 'physics_encoder.mlp.0.weight' in clean_sd:
-        n_physics = clean_sd['physics_encoder.mlp.0.weight'].shape[1]
 
     # Detect CNN channels
     struct_cnn_channels = []
@@ -112,14 +108,13 @@ def load_imputation_model(checkpoint_path, device):
     use_random_coil = 'retrieval.rc_table' in clean_sd
 
     print(f"  Auto-detected: n_atoms={n_atom_types}, n_shifts={n_shifts}, "
-          f"n_dssp={n_dssp}, n_physics={n_physics}")
+          f"n_dssp={n_dssp}")
     print(f"  struct_cnn={struct_cnn_channels}, shift_ctx={shift_context_channels}")
     print(f"  spatial={spatial_hidden}, retrieval={retrieval_hidden}, RC={use_random_coil}")
 
     model = ShiftImputationModel(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        n_physics=n_physics,
         n_dssp=n_dssp,
         struct_cnn_channels=struct_cnn_channels or None,
         shift_context_channels=shift_context_channels or None,
@@ -129,7 +124,10 @@ def load_imputation_model(checkpoint_path, device):
         shift_cols=shift_cols,
     ).to(device)
 
-    model.load_state_dict(clean_sd)
+    # Filter out deprecated physics_encoder keys from old checkpoints
+    filtered_sd = {k: v for k, v in clean_sd.items()
+                   if not k.startswith('physics_encoder.')}
+    model.load_state_dict(filtered_sd, strict=False)
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -139,7 +137,6 @@ def load_imputation_model(checkpoint_path, device):
         'stats': stats,
         'shift_cols': shift_cols,
         'k_retrieved': k_retrieved,
-        'n_physics': n_physics,
         'epoch': checkpoint.get('epoch', 'unknown'),
         'dssp_cols': dssp_cols,
     }

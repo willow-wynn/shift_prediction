@@ -255,15 +255,6 @@ class ImputationDataset(Dataset):
                 torch.isnan(retrieved_shifts), torch.zeros_like(retrieved_shifts),
                 retrieved_shifts)
 
-        # Physics features
-        if base.flat_physics is not None:
-            physics_features = base.flat_physics[global_idx].float()
-            physics_features = torch.where(
-                torch.isnan(physics_features), torch.zeros_like(physics_features),
-                physics_features)
-        else:
-            physics_features = torch.zeros(base.n_physics, dtype=torch.float32)
-
         return {
             'atom1_idx': atom1_idx,
             'atom2_idx': atom2_idx,
@@ -286,7 +277,6 @@ class ImputationDataset(Dataset):
             'retrieved_residue_codes': retrieved_residue_codes,
             'retrieved_distances': retrieved_distances,
             'retrieved_valid': retrieved_valid,
-            'physics_features': physics_features,
         }
 
 
