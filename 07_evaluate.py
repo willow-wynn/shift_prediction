@@ -99,7 +99,6 @@ def load_model(checkpoint_path, device):
     k_retrieved = checkpoint.get('k_retrieved', K_RETRIEVED)
 
     # Detect query-conditioned transfer
-    use_query_conditioned = 'shift_transfer.query_proj.0.weight' in clean_state_dict
 
     # Get DSSP dimension
     n_dssp = clean_state_dict['dssp_proj.weight'].shape[1] if 'dssp_proj.weight' in clean_state_dict else 0
@@ -126,7 +125,6 @@ def load_model(checkpoint_path, device):
     print(f"    cnn_channels:            {cnn_channels}")
     print(f"    spatial_hidden:          {spatial_hidden}")
     print(f"    retrieval_hidden:        {retrieval_hidden}")
-    print(f"    use_query_conditioned:   {use_query_conditioned}")
     print(f"    k_retrieved:             {k_retrieved}")
 
     model = ShiftPredictorWithRetrieval(
@@ -139,9 +137,6 @@ def load_model(checkpoint_path, device):
         cnn_channels=cnn_channels,
         spatial_hidden=spatial_hidden,
         retrieval_hidden=retrieval_hidden,
-        use_query_conditioned_transfer=use_query_conditioned,
-        shift_cols=shift_cols,
-        stats=stats,
     ).to(device)
 
     # Filter out deprecated physics_encoder keys from old checkpoints

@@ -415,7 +415,6 @@ def main():
     model = create_imputation_model(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        shift_cols=shift_cols,
         n_dssp=len(dssp_cols),
         k_spatial=K_SPATIAL_NEIGHBORS,
     ).to(device)

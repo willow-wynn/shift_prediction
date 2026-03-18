@@ -118,7 +118,6 @@ def load_imputation_model(checkpoint_path, device):
         shift_context_channels=shift_context_channels or None,
         spatial_hidden=spatial_hidden,
         retrieval_hidden=retrieval_hidden,
-        shift_cols=shift_cols,
     ).to(device)
 
     # Filter out deprecated physics_encoder keys from old checkpoints

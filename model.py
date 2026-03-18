@@ -439,7 +439,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
         n_mismatch_types: int = N_MISMATCH_TYPES,
         n_dssp: int = len(DSSP_COLS),
         n_shifts: int = 6,
-        n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
         dist_attn_embed: int = DIST_ATTN_EMBED,
         dist_attn_hidden: int = DIST_ATTN_HIDDEN,
         cnn_channels: list = None,

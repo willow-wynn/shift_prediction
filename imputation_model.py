@@ -157,7 +157,6 @@ class UnifiedRetrievalTransfer(nn.Module):
         hidden_dim: int = 192,
         n_heads: int = 4,
         dropout: float = 0.25,
-        shift_cols: list = None,
     ):
         super().__init__()
 
@@ -407,7 +406,6 @@ class ShiftImputationModel(nn.Module):
         self,
         n_atom_types: int,
         n_shifts: int = 6,
-        n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
         n_residue_types: int = N_RESIDUE_TYPES,
         n_ss_types: int = N_SS_TYPES,
         n_mismatch_types: int = N_MISMATCH_TYPES,
@@ -429,7 +427,6 @@ class ShiftImputationModel(nn.Module):
         retrieval_hidden: int = RETRIEVAL_HIDDEN,
         retrieval_heads: int = RETRIEVAL_HEADS,
         retrieval_dropout: float = RETRIEVAL_DROPOUT,
-        shift_cols: list = None,
     ):
         super().__init__()
 
@@ -506,7 +503,6 @@ class ShiftImputationModel(nn.Module):
             hidden_dim=retrieval_hidden,
             n_heads=retrieval_heads,
             dropout=retrieval_dropout,
-            shift_cols=shift_cols,
         )
 
         # ========== Fusion + Prediction ==========
@@ -656,12 +652,9 @@ def create_imputation_model(
     n_atom_types: int,
     n_shifts: int = 6,
     shift_cols: list = None,
-    n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
     **kwargs,
 ) -> ShiftImputationModel:
     """Create imputation model with sensible defaults."""
-    # Remove n_physics from kwargs if caller passed it, to avoid double-passing
-    kwargs.pop('n_physics', None)
     return ShiftImputationModel(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
