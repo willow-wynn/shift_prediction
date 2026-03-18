@@ -357,7 +357,6 @@ def main():
     parser.add_argument('--save_every', type=int, default=25)
     parser.add_argument('--no_wandb', action='store_true')
     parser.add_argument('--no_query_conditioned', action='store_true')
-    parser.add_argument('--no_random_coil', action='store_true')
 
     parser.add_argument('--rebuild_cache', action='store_true')
     args = parser.parse_args()
@@ -398,7 +397,6 @@ def main():
     print(f"K retrieved: {args.k_retrieved}")
     print(f"Grad clip: {GRAD_CLIP}")
     print(f"Query-conditioned transfer: {not args.no_query_conditioned}")
-    print(f"Random coil correction: {not args.no_random_coil}")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -641,7 +639,6 @@ def main():
         n_shifts=len(shift_cols),
         n_struct=n_struct,
         shift_cols=shift_cols,
-        use_random_coil=not args.no_random_coil,
         stats=stats,
         n_dssp=len(dssp_cols),
         k_spatial=K_SPATIAL_NEIGHBORS,

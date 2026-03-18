@@ -105,12 +105,10 @@ def load_imputation_model(checkpoint_path, device):
     retrieval_hidden = clean_sd.get(
         'retrieval.fallback_context', torch.zeros(192)).shape[0]
 
-    use_random_coil = 'retrieval.rc_table' in clean_sd
-
     print(f"  Auto-detected: n_atoms={n_atom_types}, n_shifts={n_shifts}, "
           f"n_dssp={n_dssp}")
     print(f"  struct_cnn={struct_cnn_channels}, shift_ctx={shift_context_channels}")
-    print(f"  spatial={spatial_hidden}, retrieval={retrieval_hidden}, RC={use_random_coil}")
+    print(f"  spatial={spatial_hidden}, retrieval={retrieval_hidden}")
 
     model = ShiftImputationModel(
         n_atom_types=n_atom_types,
@@ -120,7 +118,6 @@ def load_imputation_model(checkpoint_path, device):
         shift_context_channels=shift_context_channels or None,
         spatial_hidden=spatial_hidden,
         retrieval_hidden=retrieval_hidden,
-        use_random_coil=use_random_coil,
         shift_cols=shift_cols,
     ).to(device)
 

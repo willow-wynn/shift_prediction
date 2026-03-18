@@ -237,7 +237,6 @@ def main():
     parser.add_argument('--k_retrieved', type=int, default=K_RETRIEVED)
     parser.add_argument('--save_every', type=int, default=25)
     parser.add_argument('--no_wandb', action='store_true')
-    parser.add_argument('--no_random_coil', action='store_true')
     parser.add_argument('--build_cache_only', action='store_true',
                         help='Build imputation cache and exit')
     parser.add_argument('--rebuild_cache', action='store_true')
@@ -402,7 +401,6 @@ def main():
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
         shift_cols=shift_cols,
-        use_random_coil=not args.no_random_coil,
         n_dssp=len(dssp_cols),
         k_spatial=K_SPATIAL_NEIGHBORS,
     ).to(device)

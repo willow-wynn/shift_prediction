@@ -46,7 +46,6 @@ from config import (
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
 )
-from random_coil import RC_SHIFTS, build_rc_tensor
 
 
 # ============================================================================
@@ -415,39 +414,6 @@ class DirectTransferHead(nn.Module):
         return transferred * valid_3d.any(dim=1).float()
 
 
-class RandomCoilCorrector(nn.Module):
-    """Apply random coil correction to retrieved shifts.
-
-    corrected[b,k,s] = RC[query_aa, s] + (shift[b,k,s] - RC[retrieved_aa, s])
-    RC values are in z-score space (normalized using dataset stats).
-    """
-
-    def __init__(self, n_residue_types, n_shifts, shift_cols=None, stats=None):
-        super().__init__()
-        if shift_cols is None:
-            shift_cols = ['ca_shift', 'cb_shift', 'c_shift', 'n_shift', 'h_shift', 'ha_shift']
-        rc_np = build_rc_tensor(STANDARD_RESIDUES, shift_cols)
-        if stats is not None:
-            for si, col in enumerate(shift_cols):
-                if col in stats and si < rc_np.shape[1]:
-                    mean, std = stats[col]['mean'], stats[col]['std']
-                    valid = ~np.isnan(rc_np[:, si])
-                    rc_np[valid, si] = (rc_np[valid, si] - mean) / std
-        rc_padded = np.full((n_residue_types + 1, n_shifts), np.nan, dtype=np.float32)
-        rc_padded[:rc_np.shape[0], :rc_np.shape[1]] = rc_np
-        self.register_buffer('rc_table', torch.from_numpy(rc_padded))
-
-    def forward(self, retrieved_shifts, query_residue_code, retrieved_residue_codes,
-                retrieved_shift_masks):
-        query_idx = query_residue_code.clamp(0, self.rc_table.size(0) - 1)
-        retrieved_idx = retrieved_residue_codes.clamp(0, self.rc_table.size(0) - 1)
-        rc_query = self.rc_table[query_idx].unsqueeze(1)
-        rc_retrieved = self.rc_table[retrieved_idx]
-        corrected = rc_query + (retrieved_shifts - rc_retrieved)
-        rc_valid = ~torch.isnan(rc_query) & ~torch.isnan(rc_retrieved)
-        corrected = torch.where(rc_valid, corrected, retrieved_shifts)
-        corrected = torch.where(retrieved_shift_masks, corrected, retrieved_shifts)
-        return corrected
 
 
 class PrevNextEncoder(nn.Module):
@@ -530,13 +496,6 @@ class ShiftPredictorWithRetrieval(nn.Module):
         n_cross_attn: int = 3,
         k_retrieved: int = 32,
         n_struct: int = 49,
-        # RC correction
-        use_random_coil: bool = True,
-        shift_cols: list = None,
-        stats: dict = None,
-        # Legacy params (accepted but ignored for backward compat)
-        use_direct_transfer: bool = True,
-        use_query_conditioned_transfer: bool = True,
     ):
         super().__init__()
 
@@ -602,12 +561,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
         base_encoder_dim = cnn_out_dim + prevnext_dim + spatial_hidden
 
         # ========== Retrieval pathway (V9-style) ==========
-
-        # RC correction (applied to retrieved shifts before transfer)
-        self.rc_corrector = None
-        if use_random_coil:
-            self.rc_corrector = RandomCoilCorrector(
-                n_residue_types, n_shifts, shift_cols, stats)
+        # Note: RC correction removed — retrieval uses only same-AA-type neighbors
 
         # Neighbor encoder + self-attention
         self.neighbor_encoder = RetrievalNeighborEncoder(
@@ -753,17 +707,15 @@ class ShiftPredictorWithRetrieval(nn.Module):
         struct_pred = self.struct_head(base_encoding)  # (B, n_shifts)
 
         # ========== Retrieval pathway ==========
+        # Only use neighbors of the same amino acid type as the query
+        same_aa_mask = (retrieved_residue_codes == query_residue_code.unsqueeze(1))
+        retrieved_valid = retrieved_valid & same_aa_mask
+
         # Apply retrieval dropout (drop ALL retrieval for some training samples)
         if self.training and self.retrieval_dropout_rate > 0:
             drop_mask = torch.rand(B, device=base_encoding.device) < self.retrieval_dropout_rate
             retrieved_valid = retrieved_valid.clone()
             retrieved_valid[drop_mask] = False
-
-        # Apply random coil correction
-        if self.rc_corrector is not None:
-            retrieved_shifts = self.rc_corrector(
-                retrieved_shifts, query_residue_code,
-                retrieved_residue_codes, retrieved_shift_masks)
 
         # Neighbor consensus
         nbr_mean = self._compute_nbr_mean(
@@ -833,33 +785,11 @@ class ShiftPredictorWithRetrieval(nn.Module):
 def create_model(
     n_atom_types: int,
     n_shifts: int = 6,
-    shift_cols: list = None,
-    use_random_coil: bool = True,
-    stats: dict = None,
-    n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
     **kwargs,
 ) -> ShiftPredictorWithRetrieval:
-    """Create model with sensible defaults from config.
-
-    Args:
-        n_atom_types: Number of unique atom types in distance columns
-        n_shifts: Number of chemical shift types to predict
-        shift_cols: List of shift column names (for RC correction lookup)
-        use_random_coil: Whether to apply random coil correction in transfer
-        stats: Per-shift normalization stats (mean/std) for RC z-score conversion
-        n_physics: Deprecated, ignored. Accepted for backward compatibility.
-        **kwargs: Override any ShiftPredictorWithRetrieval parameter
-
-    Returns:
-        Configured ShiftPredictorWithRetrieval instance
-    """
-    # Remove n_physics from kwargs if caller passed it, to avoid double-passing
-    kwargs.pop('n_physics', None)
+    """Create model with sensible defaults from config."""
     return ShiftPredictorWithRetrieval(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        shift_cols=shift_cols,
-        use_random_coil=use_random_coil,
-        stats=stats,
         **kwargs,
     )

@@ -41,7 +41,6 @@ from config import (
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
 )
-from random_coil import build_rc_tensor
 from model import (
     DistanceAttentionPerPosition,
     ResidualBlock1D,
@@ -158,7 +157,6 @@ class UnifiedRetrievalTransfer(nn.Module):
         hidden_dim: int = 192,
         n_heads: int = 4,
         dropout: float = 0.25,
-        use_random_coil: bool = True,
         shift_cols: list = None,
     ):
         super().__init__()
@@ -169,19 +167,6 @@ class UnifiedRetrievalTransfer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = hidden_dim // n_heads
         self.scale = self.head_dim ** -0.5
-        self.use_random_coil = use_random_coil
-
-        # Random coil lookup table
-        if use_random_coil:
-            if shift_cols is None:
-                shift_cols = ['ca_shift', 'cb_shift', 'c_shift',
-                              'n_shift', 'h_shift', 'ha_shift']
-            rc_np = build_rc_tensor(STANDARD_RESIDUES, shift_cols)
-            rc_padded = np.full((n_residue_types + 1, n_shifts), np.nan, dtype=np.float32)
-            rc_padded[:rc_np.shape[0], :rc_np.shape[1]] = rc_np
-            self.register_buffer('rc_table', torch.from_numpy(rc_padded))
-        else:
-            self.rc_table = None
 
         # Query projection: takes structural encoding + shift context + observed shifts
         self.query_proj = nn.Sequential(
@@ -262,25 +247,6 @@ class UnifiedRetrievalTransfer(nn.Module):
 
         self.out_dim = hidden_dim
 
-    def _apply_random_coil_correction(self, retrieved_shifts, query_residue_code,
-                                       retrieved_residue_codes, retrieved_shift_masks):
-        """Apply RC correction: corrected = RC[query] + (shift - RC[retrieved])."""
-        if self.rc_table is None:
-            return retrieved_shifts
-
-        query_idx = query_residue_code.clamp(0, self.rc_table.size(0) - 1)
-        retrieved_idx = retrieved_residue_codes.clamp(0, self.rc_table.size(0) - 1)
-
-        rc_query = self.rc_table[query_idx].unsqueeze(1)        # (B, 1, S)
-        rc_retrieved = self.rc_table[retrieved_idx]              # (B, K, S)
-
-        corrected = rc_query + (retrieved_shifts - rc_retrieved)
-
-        rc_valid = ~torch.isnan(rc_query) & ~torch.isnan(rc_retrieved)
-        corrected = torch.where(rc_valid, corrected, retrieved_shifts)
-        corrected = torch.where(retrieved_shift_masks, corrected, retrieved_shifts)
-        return corrected
-
     def forward(
         self,
         query_encoding: torch.Tensor,          # (B, query_dim)
@@ -300,13 +266,6 @@ class UnifiedRetrievalTransfer(nn.Module):
             trust_scores: (B, n_shifts)
         """
         B, K, S = retrieved_shifts.shape
-
-        # RC correction
-        if self.use_random_coil:
-            retrieved_shifts = self._apply_random_coil_correction(
-                retrieved_shifts, query_residue_code,
-                retrieved_residue_codes, retrieved_shift_masks,
-            )
 
         any_valid = retrieved_valid.any(dim=1)  # (B,)
         same_type = (retrieved_residue_codes == query_residue_code.unsqueeze(1)).float()
@@ -470,7 +429,6 @@ class ShiftImputationModel(nn.Module):
         retrieval_hidden: int = RETRIEVAL_HIDDEN,
         retrieval_heads: int = RETRIEVAL_HEADS,
         retrieval_dropout: float = RETRIEVAL_DROPOUT,
-        use_random_coil: bool = True,
         shift_cols: list = None,
     ):
         super().__init__()
@@ -548,7 +506,6 @@ class ShiftImputationModel(nn.Module):
             hidden_dim=retrieval_hidden,
             n_heads=retrieval_heads,
             dropout=retrieval_dropout,
-            use_random_coil=use_random_coil,
             shift_cols=shift_cols,
         )
 
@@ -699,7 +656,6 @@ def create_imputation_model(
     n_atom_types: int,
     n_shifts: int = 6,
     shift_cols: list = None,
-    use_random_coil: bool = True,
     n_physics: int = 0,  # Deprecated, accepted for backward compat but ignored
     **kwargs,
 ) -> ShiftImputationModel:
@@ -710,6 +666,5 @@ def create_imputation_model(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
         shift_cols=shift_cols,
-        use_random_coil=use_random_coil,
         **kwargs,
     )
