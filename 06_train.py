@@ -356,7 +356,6 @@ def main():
     parser.add_argument('--k_retrieved', type=int, default=K_RETRIEVED)
     parser.add_argument('--save_every', type=int, default=25)
     parser.add_argument('--no_wandb', action='store_true')
-    parser.add_argument('--no_query_conditioned', action='store_true')
 
     parser.add_argument('--rebuild_cache', action='store_true')
     args = parser.parse_args()
@@ -396,7 +395,6 @@ def main():
     print(f"Huber delta: {args.huber_delta}")
     print(f"K retrieved: {args.k_retrieved}")
     print(f"Grad clip: {GRAD_CLIP}")
-    print(f"Query-conditioned transfer: {not args.no_query_conditioned}")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -526,105 +524,44 @@ def main():
     provenance.log_data_summary('train_outliers_masked', train_outliers)
     provenance.log_data_summary('test_outliers_masked', test_outliers)
 
-    # ========== Create/Load cached datasets ==========
-    train_cache = os.path.join(args.cache_dir, f'fold{args.fold}_train')
-    test_cache = os.path.join(args.cache_dir, f'fold{args.fold}_test')
+    # ========== Load cached datasets ==========
+    # The cache is built by 05_build_training_cache.py which creates fold_1..fold_5.
+    # fold_N contains data FOR fold N. To train on fold 1:
+    #   test = fold_1, train = fold_2 + fold_3 + fold_4 + fold_5
+    test_cache = os.path.join(args.cache_dir, f'fold_{args.fold}')
 
-    need_train_build = not CachedRetrievalDataset.exists(train_cache) or args.rebuild_cache
-    need_test_build = not CachedRetrievalDataset.exists(test_cache) or args.rebuild_cache
+    if not CachedRetrievalDataset.exists(test_cache):
+        print(f"ERROR: Test cache not found at {test_cache}")
+        print("  Run 05_build_training_cache.py first.")
+        sys.exit(1)
 
-    embedding_lookup = None
-    retriever = None
+    # Load test dataset
+    print(f"\nLoading test dataset from {test_cache}...")
+    test_dataset = CachedRetrievalDataset.load(
+        test_cache, len(shift_cols), args.k_retrieved,
+        stats=stats, shift_cols=shift_cols,
+    )
 
-    if need_train_build or need_test_build:
-        print("\nInitializing ESM embedding lookup (needed for cache build)...")
-        from retrieval import EmbeddingLookup, Retriever
-
-        emb_file = os.path.join(args.data_dir, 'esm_embeddings.h5')
-        if not os.path.exists(emb_file):
-            print(f"ERROR: ESM embeddings not found at {emb_file}")
-            print("  Run the ESM extraction step first.")
+    # Load training datasets (all other folds) and concatenate
+    train_datasets = []
+    for f in range(1, 6):
+        if f == args.fold:
+            continue
+        fold_cache = os.path.join(args.cache_dir, f'fold_{f}')
+        if not CachedRetrievalDataset.exists(fold_cache):
+            print(f"ERROR: Training fold cache not found at {fold_cache}")
+            print("  Run 05_build_training_cache.py first.")
             sys.exit(1)
-
-        embedding_lookup = EmbeddingLookup(emb_file, cache_size=50)
-
-        index_dir = os.path.join(args.data_dir, 'retrieval_indices')
-        if not os.path.exists(index_dir):
-            print(f"ERROR: FAISS indices not found at {index_dir}")
-            print("  Run the FAISS index building step first.")
-            sys.exit(1)
-
-        print("Initializing retriever...")
-        retriever = Retriever(
-            index_dir=index_dir,
-            exclude_fold=args.fold,
-            k=args.k_retrieved,
-            nprobe=64,
-            device='cuda' if device == 'cuda' else 'cpu',
-        )
-
-    # Training dataset
-    if not need_train_build:
-        print(f"\nLoading cached training dataset from {train_cache}...")
-        train_dataset = CachedRetrievalDataset.load(
-            train_cache, len(shift_cols), args.k_retrieved,
+        print(f"  Loading fold_{f}...")
+        ds = CachedRetrievalDataset.load(
+            fold_cache, len(shift_cols), args.k_retrieved,
             stats=stats, shift_cols=shift_cols,
         )
-    else:
-        print(f"\nBuilding training dataset (will be cached to {train_cache})...")
-        train_dataset = CachedRetrievalDataset.create(
-            df=train_df,
-            shift_cols=shift_cols,
-            dist_col_info=dist_col_info,
-            dssp_cols=dssp_cols,
-            atom_to_idx=atom_to_idx,
-            stats=stats,
-            embedding_lookup=embedding_lookup,
-            retriever=retriever,
-            cache_dir=train_cache,
-            context_window=CONTEXT_WINDOW,
-            k_spatial=K_SPATIAL_NEIGHBORS,
-            k_retrieved=args.k_retrieved,
-            max_valid_distances=MAX_VALID_DISTANCES,
-        )
+        train_datasets.append(ds)
 
-    del train_df
-    gc.collect()
+    train_dataset = torch.utils.data.ConcatDataset(train_datasets)
 
-    # Test dataset
-    if not need_test_build:
-        print(f"\nLoading cached test dataset from {test_cache}...")
-        test_dataset = CachedRetrievalDataset.load(
-            test_cache, len(shift_cols), args.k_retrieved,
-            stats=stats, shift_cols=shift_cols,
-        )
-    else:
-        print(f"\nBuilding test dataset (will be cached to {test_cache})...")
-        test_dataset = CachedRetrievalDataset.create(
-            df=test_df,
-            shift_cols=shift_cols,
-            dist_col_info=dist_col_info,
-            dssp_cols=dssp_cols,
-            atom_to_idx=atom_to_idx,
-            stats=stats,
-            embedding_lookup=embedding_lookup,
-            retriever=retriever,
-            cache_dir=test_cache,
-            context_window=CONTEXT_WINDOW,
-            k_spatial=K_SPATIAL_NEIGHBORS,
-            k_retrieved=args.k_retrieved,
-            max_valid_distances=MAX_VALID_DISTANCES,
-        )
-
-    del test_df
-    gc.collect()
-
-    # Clean up
-    if embedding_lookup is not None:
-        embedding_lookup.close()
-        del embedding_lookup
-    if retriever is not None:
-        del retriever
+    del train_df, test_df
     gc.collect()
 
     provenance.log_data_summary('train_samples', len(train_dataset))
@@ -650,18 +587,16 @@ def main():
     # ========== Create model ==========
     print("\nCreating model via create_model() factory...")
 
-    # Detect feature dimensions from dataset
-    n_struct = getattr(train_dataset, 'n_struct_features', 49)
+    # Detect feature dimensions from first training fold's dataset
+    first_train_ds = train_datasets[0]
+    n_struct = getattr(first_train_ds, 'n_struct_features', 49)
 
     model = create_model(
         n_atom_types=len(atom_to_idx),
         n_shifts=len(shift_cols),
         n_struct=n_struct,
-        shift_cols=shift_cols,
-        stats=stats,
         n_dssp=len(dssp_cols),
         k_spatial=K_SPATIAL_NEIGHBORS,
-        use_query_conditioned_transfer=not args.no_query_conditioned,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
