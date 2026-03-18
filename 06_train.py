@@ -407,28 +407,47 @@ def main():
     # ========== Load data ==========
     print("\nLoading data...")
     data_file = None
-    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'small_structure_data.csv', 'sidechain_structure_data.csv']:
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv']:
         candidate = os.path.join(args.data_dir, name)
         if os.path.exists(candidate):
             data_file = candidate
             break
     if data_file is None:
         print(f"ERROR: No data file found in {args.data_dir}")
-        print(f"  Tried: structure_data_hybrid.csv, structure_data.csv, small_structure_data.csv, sidechain_structure_data.csv")
         sys.exit(1)
 
-    df = pd.read_csv(data_file, dtype={'bmrb_id': str})
+    # Read header for column names, then load only light columns
+    # (the full CSV can be 6GB+ with 1500 distance columns — too large for pandas)
+    all_columns = pd.read_csv(data_file, nrows=0).columns.tolist()
+    dist_col_info = parse_distance_columns(all_columns)
+    atom_list, atom_to_idx = build_atom_vocabulary(dist_col_info)
+    shift_cols = parse_shift_columns(all_columns)
+    dssp_cols = get_dssp_columns(all_columns)
+
+    # Load only columns needed for stats + fold splitting
+    light_cols = ['bmrb_id', 'residue_id', 'residue_code', 'split']
+    light_cols += shift_cols + dssp_cols
+    light_cols = [c for c in light_cols if c in all_columns]
+
+    # Try per-fold files first (avoids pandas memory explosion on huge CSVs)
+    fold_files = [os.path.join(args.data_dir, f'structure_data_hybrid_fold_{f}.csv')
+                  for f in range(1, 6)]
+    if all(os.path.exists(f) for f in fold_files):
+        print(f"  Loading from per-fold CSV files...")
+        parts = []
+        for ff in fold_files:
+            avail = [c for c in light_cols if c in pd.read_csv(ff, nrows=0).columns]
+            parts.append(pd.read_csv(ff, usecols=avail, dtype={'bmrb_id': str}, low_memory=False))
+        df = pd.concat(parts, ignore_index=True)
+        del parts
+    else:
+        df = pd.read_csv(data_file, usecols=light_cols, dtype={'bmrb_id': str}, low_memory=False)
+
     print(f"  Loaded {len(df):,} residues from {df['bmrb_id'].nunique():,} proteins")
     print(f"  Data file: {data_file}")
     provenance.log_data_summary('data_file', data_file)
     provenance.log_data_summary('total_residues_loaded', len(df))
     provenance.log_data_summary('total_proteins_loaded', int(df['bmrb_id'].nunique()))
-
-    # Parse columns
-    dist_col_info = parse_distance_columns(df.columns)
-    atom_list, atom_to_idx = build_atom_vocabulary(dist_col_info)
-    shift_cols = parse_shift_columns(df.columns)
-    dssp_cols = get_dssp_columns(df.columns)
 
     print(f"  Distance columns: {len(dist_col_info)}")
     print(f"  Atom types: {len(atom_list)}")
