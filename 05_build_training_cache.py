@@ -82,15 +82,14 @@ def parse_distance_columns(columns):
     return dist_cols
 
 
-def build_atom_vocabulary(dist_col_info):
-    """Build vocabulary of unique atom types from distance columns."""
-    atoms = set()
-    for _, atom1, atom2 in dist_col_info:
-        atoms.add(atom1)
-        atoms.add(atom2)
-    atom_list = sorted(atoms)
-    atom_to_idx = {a: i for i, a in enumerate(atom_list)}
-    return atom_list, atom_to_idx
+def build_atom_vocabulary(dist_col_info=None):
+    """Return canonical atom vocabulary from config.
+
+    Always returns the same vocabulary regardless of which distance columns
+    are present, ensuring caches and models are interchangeable across datasets.
+    """
+    from config import ATOM_TYPES, ATOM_TO_IDX
+    return list(ATOM_TYPES), dict(ATOM_TO_IDX)
 
 
 def parse_shift_columns(columns):
@@ -161,7 +160,9 @@ def extract_struct_features(pdf, start_idx, n, flat_struct):
 def compute_normalization_stats(df, shift_cols, dssp_cols):
     """Compute mean/std for shift and DSSP columns from the training data.
 
-    Only non-NaN values are considered.
+    Computes both global and per-(amino_acid, shift) statistics.
+    Per-AA stats enable better normalization for shifts whose distribution
+    varies dramatically across amino acid types (e.g., CD1: LEU=24, TYR=132).
     """
     stats = {}
     for col in shift_cols:
@@ -181,6 +182,24 @@ def compute_normalization_stats(df, shift_cols, dssp_cols):
             else:
                 dssp_stats[col] = {'mean': 0.0, 'std': 1.0}
     stats['dssp'] = dssp_stats
+
+    # Per-(amino_acid, shift) stats
+    if 'residue_code' in df.columns:
+        per_aa = {}
+        for aa in df['residue_code'].dropna().unique():
+            aa_str = str(aa).strip()
+            if not aa_str:
+                continue
+            aa_df = df[df['residue_code'] == aa]
+            aa_stats = {}
+            for col in shift_cols:
+                if col in aa_df.columns:
+                    vals = aa_df[col].dropna()
+                    if len(vals) >= 10:
+                        aa_stats[col] = {'mean': float(vals.mean()), 'std': max(float(vals.std()), 0.1)}
+            if aa_stats:
+                per_aa[aa_str] = aa_stats
+        stats['per_aa'] = per_aa
 
     return stats
 

@@ -55,6 +55,34 @@ DSSP_COLS = [
 ]
 
 # ============================================================================
+# Canonical Atom Vocabulary (union of all datasets: hybrid, alphafold, experimental)
+# Every cache and model uses this vocabulary so they are interchangeable.
+# ============================================================================
+ATOM_TYPES = [
+    'C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1', 'CE2', 'CE3',
+    'CG', 'CG1', 'CG2', 'CH2', 'CZ', 'CZ2', 'CZ3', 'DD1',
+    'H', 'H1', 'H2', 'H3', 'HA', 'HA2', 'HA3',
+    'HB', 'HB1', 'HB2', 'HB3', 'HC',
+    'HD1', 'HD11', 'HD12', 'HD13', 'HD2', 'HD21', 'HD22', 'HD23', 'HD3',
+    'HE', 'HE1', 'HE2', 'HE21', 'HE22', 'HE3',
+    'HG', 'HG1', 'HG11', 'HG12', 'HG13', 'HG2', 'HG21', 'HG22', 'HG23', 'HG3',
+    'HH', 'HH11', 'HH12', 'HH2', 'HH21', 'HH22',
+    'HN1', 'HN2', 'HXT', 'HZ', 'HZ1', 'HZ2', 'HZ3',
+    'N', 'ND1', 'ND2', 'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ',
+    'O', 'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'OXT',
+    'SD', 'SG',
+]
+ATOM_TO_IDX = {a: i for i, a in enumerate(ATOM_TYPES)}
+N_ATOM_TYPES = len(ATOM_TYPES)
+
+# Dataset paths: --data flag maps to these directories
+DATASET_DIRS = {
+    'hybrid': 'data',
+    'alphafold': 'data_alphafold',
+    'experimental': 'data_experimental',
+}
+
+# ============================================================================
 # Dense Distance Columns
 # ============================================================================
 BACKBONE_CORE_ATOMS = ['C', 'CA', 'N', 'O']

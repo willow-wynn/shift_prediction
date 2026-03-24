@@ -1,181 +1,153 @@
 # Chemical Shift Prediction Pipeline
 
-Retrieval-augmented deep learning pipeline for predicting backbone chemical shifts (CA, CB, C, N, H, HA) from protein 3D structure.
+Retrieval-augmented deep learning pipeline for predicting NMR chemical shifts (49 shift types including backbone and sidechain) from protein 3D structure.
 
 ## Overview
 
-This pipeline predicts NMR backbone chemical shifts from protein structures using a retrieval-augmented architecture. Given a protein's PDB structure and sequence, it:
+Given a protein's PDB structure, the model:
 
-1. Extracts structural features (intramolecular distances, backbone angles, DSSP secondary structure, spatial neighbors)
-2. Computes physics-based features (ring currents, half-sphere exposure, hydrogen bond geometry)
-3. Uses ESM-2 embeddings to retrieve similar residues from a training database via FAISS
-4. Combines structural encoding with retrieved neighbor shifts through cross-attention and query-conditioned transfer
-5. Predicts per-residue backbone chemical shifts with calibrated confidence estimates
+1. Extracts structural features (intramolecular atom-pair distances, backbone angles, DSSP secondary structure, spatial neighbors)
+2. Uses ESM-2 embeddings to retrieve similar residues from a training database via FAISS
+3. Combines structural encoding with retrieved neighbor shifts through shift-specific cross-attention and direct transfer
+4. Blends retrieval-augmented and structure-only predictions via learned dual gating
+5. Predicts per-residue chemical shifts for 49 atom types (6 backbone + 43 sidechain)
+
+## Quick Start
+
+```bash
+# Train on experimental structures (builds cache automatically if needed)
+python main.py --data experimental --fold 1 --epochs 150
+
+# Train on hybrid (experimental + AlphaFold where no experimental exists)
+python main.py --data hybrid --fold 1 --epochs 150 --skip_cache
+
+# Train on AlphaFold structures only
+python main.py --data alphafold --fold 1 --epochs 150
+
+# Predict shifts for a PDB file
+python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb
+python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb --chain A --backbone_only
+python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb -o predictions.csv
+
+# Evaluate a trained model
+python 07_evaluate.py --data_dir data --model data/checkpoints/best_fold1.pt --fold 1 --plots
+```
+
+## Datasets
+
+Three structure datasets are supported via `--data`:
+
+| Dataset | Flag | Description |
+|---------|------|-------------|
+| Hybrid | `--data hybrid` | Experimental structures where available, AlphaFold otherwise. Primary training set. |
+| Experimental | `--data experimental` | Experimental PDB structures only |
+| AlphaFold | `--data alphafold` | AlphaFold predicted structures only |
+
+All datasets share the same canonical atom vocabulary (88 atom types), ESM embeddings, and FAISS retrieval indices. Models trained on one dataset can be evaluated on data cached from any other.
+
+Each dataset is stored in its own directory (`data/`, `data_alphafold/`, `data_experimental/`) with per-fold caches under `cache/` and model checkpoints under `checkpoints/`.
 
 ## Pipeline Steps
+
+### Data Preparation (run once)
 
 | Step | Script | Description |
 |------|--------|-------------|
 | 00 | `00_fetch_bmrb_shifts.py` | Download and pivot chemical shift data from BMRB |
-| 01 | `01_build_datasets.py` | Find PDB/AlphaFold structures, align sequences, compute all features, produce 3 output datasets |
+| 01 | `01_build_datasets.py` | Find PDB/AlphaFold structures, align sequences, compute features, produce 3 CSV datasets |
 | 02 | `cluster_sequences.py` | Cluster sequences at 90% identity using MMseqs2 for retrieval exclusion |
 | 03 | `03_extract_esm_embeddings.py` | Extract ESM-2 embeddings (esm2_t36_3B_UR50D, layer 36, 2560-dim) |
 | 04 | `04_build_retrieval_index.py` | Build fold-aware FAISS IVF indices with sequence identity exclusion |
-| 05 | `05_build_training_cache.py` | Pre-compute retrieval results and save memory-mapped cache for fast training I/O |
-| 06 | `06_train.py` | Train the retrieval-augmented model with 5-fold cross-validation |
-| 07 | `07_evaluate.py` | Comprehensive evaluation: per-shift metrics, baselines, retrieval analysis, plots |
-| 08 | `08_train_imputation.py` | Train shift imputation model (structure + observed shifts + retrieval) |
-| 09 | `09_eval_imputation.py` | Evaluate imputation model against structure-only, mean, and random coil baselines |
 
-### Quick Start
+### Training and Evaluation
 
-```bash
-# Step 0: Fetch BMRB chemical shift data
-python 00_fetch_bmrb_shifts.py --download --output-dir data
+| Script | Description |
+|--------|-------------|
+| `main.py` | Unified pipeline: builds cache if needed, then trains. Use `--data` to select dataset. |
+| `05_build_training_cache.py` | Pre-compute retrieval results and save memory-mapped cache (called by `main.py`) |
+| `06_train.py` | Training script (reads CSV for stats — use `main.py` instead for cache-only training) |
+| `07_evaluate.py` | Evaluation: per-shift MAE/RMSE/R², baselines, retrieval analysis, plots |
+| `08_train_imputation.py` | Train shift imputation model (structure + observed shifts + retrieval) |
+| `09_eval_imputation.py` | Evaluate imputation model |
+| `inference.py` | Predict shifts from a single PDB file |
 
-# Step 1: Build datasets (online mode fetches PDB/AlphaFold structures)
-python 01_build_datasets.py --online --output-dir data --pdb-dir data/pdbs
+## Model Architecture
 
-# Step 2: Cluster sequences for retrieval exclusion (requires MMseqs2)
-python cluster_sequences.py --data_dir data
+### Base Structural Encoder
+- **Distance attention** (`DistanceAttentionPerPosition`): Attention over all intramolecular atom-pair distances per residue position (88 atom types, learned embeddings)
+- **1D residual CNN**: Processes a context window of ±5 residues (11 positions) through 5 residual blocks → 1280-dim
+- **Spatial neighbor attention** (`SpatialNeighborAttention`): Attends to K=5 nearest spatial neighbors (min 4 residues sequence separation). Each neighbor contributes residue type, secondary structure, backbone angles, CA distance, and its own distance attention embedding.
 
-# Step 3: Extract ESM-2 embeddings (GPU recommended)
-python 03_extract_esm_embeddings.py --data_dir data
+### Retrieval Pathway
+- **ESM-2 embeddings** (2560-dim per residue) are used as query vectors for FAISS nearest-neighbor retrieval (K=32 neighbors)
+- **RetrievalNeighborEncoder**: Encodes each retrieved neighbor using amino acid type, rank, cosine similarity, same-AA indicator, shift values, deviation from consensus, structural features
+- **Self-attention** (2 layers): Neighbors attend to each other
+- **Shift-specific cross-attention** (3 layers): Per-shift-type query embeddings attend to neighbor encodings, allowing different shifts to focus on different neighbors
+- **Direct transfer head**: Learned per-neighbor per-shift scoring for direct shift copying
+- **Dual gating**: `direct_gate` blends direct transfer vs attention prediction; `retrieval_gate` blends retrieval vs structure-only. Both are learned functions that adapt per-sample.
 
-# Step 4: Build FAISS retrieval indices
-python 04_build_retrieval_index.py --data_dir data
+### Prediction Flow
+```
+struct_pred = structure_head(base_encoding)
+attn_pred = attention_head(shift_context, base_encoding)
+direct_pred = direct_transfer(neighbor_encodings, retrieved_shifts)
 
-# Step 5: Build training cache (memory-mapped)
-python 05_build_training_cache.py --data_dir data
-
-# Step 6: Train model
-python 06_train.py --data_dir data --fold 1 --epochs 200
-
-# Step 7: Evaluate model
-python 07_evaluate.py --data_dir data --model checkpoints/best_retrieval_fold1.pt --fold 1 --plots
-
-# Step 8: Train imputation model
-python 08_train_imputation.py --data_dir data --fold 1 --epochs 350
-
-# Step 9: Evaluate imputation model
-python 09_eval_imputation.py --model checkpoints/best_imputation_fold1.pt --data_dir data --fold 1
+retrieval_pred = direct_gate * direct_pred + (1 - direct_gate) * attn_pred
+final_pred = retrieval_gate * retrieval_pred + (1 - retrieval_gate) * struct_pred
 ```
 
-### Inference
+When no retrieval neighbors are available (e.g., during single-PDB inference), the model gracefully falls back to structure-only prediction via the gating mechanism.
 
-```bash
-# CLI prediction on a PDB file
-python predict.py --checkpoint checkpoints/best_retrieval_fold1.pt --pdb my_protein.pdb --chain A
-
-# Web UI (requires gradio)
-python app.py --checkpoint checkpoints/best_retrieval_fold1.pt
-```
+### Shift Imputation Model
+A second-stage model (`imputation_model.py`) leverages partially observed chemical shifts to predict missing ones, combining structural encoding, observed shift context, and shift-aware retrieval.
 
 ## Dataset Construction (Step 01)
-
-`01_build_datasets.py` is the main data pipeline. It replaces the earlier separate structure selection and compilation scripts.
 
 ### Structure Sources
 
 For each BMRB protein entry the pipeline finds structures from two sources:
 
-- **Experimental PDB**: Looks up PDB IDs via `pairs.csv` and the BMRB API (in `--online` mode). For each candidate PDB, selects the chain with the highest sequence identity to the BMRB sequence.
-- **AlphaFold**: Maps BMRB -> UniProt -> AlphaFold DB to retrieve predicted structures.
+- **Experimental PDB**: Looks up PDB IDs via `pairs.csv` and the BMRB API. Selects the chain with highest sequence identity.
+- **AlphaFold**: Maps BMRB → UniProt → AlphaFold DB for predicted structures.
 
-Proteins with no PDB mapping go straight to AlphaFold-only (there is no BLAST fallback).
+### Sequence Alignment
 
-### Sequence Alignment and Identity
-
-Each PDB chain is aligned to the BMRB sequence using Biopython pairwise alignment. A minimum **80% sequence identity** cutoff (`MIN_SEQUENCE_IDENTITY` in `config.py`) is enforced — proteins below this threshold are rejected.
-
-The alignment produces a residue mapping that classifies each position:
-
-| Mismatch Type | Meaning |
-|---------------|---------|
-| `match` | Identical residue in both structure and shift data |
-| `mismatch` | Aligned but different residue types |
-| `protein_edge` | Within 2 residues of chain termini |
-| `gap_in_cs` | Structure residue has no chemical shift counterpart (gap in shift sequence) |
-| `gap_in_structure` | Chemical shift residue has no structure counterpart (gap in structure) |
+Each PDB chain is aligned to the BMRB sequence using Biopython pairwise alignment. A minimum **80% sequence identity** cutoff is enforced. The alignment classifies each position as `match`, `mismatch`, `protein_edge`, `gap_in_cs`, or `gap_in_structure`.
 
 ### NMR Model Selection
 
-For multi-model NMR PDB files, the pipeline selects a single representative model:
+For multi-model NMR PDB files: superimpose all models onto Model 1 (Kabsch, CA atoms), compute median coordinates, select the model with lowest RMSD from the median.
 
-1. Parse all models from the PDB file
-2. Superimpose all models onto Model 1 using Kabsch superposition (CA atoms)
-3. Compute median CA coordinates across all models
-4. Select the model with the lowest RMSD from the median coordinates
+## Configuration
 
-### Three Output Datasets
+All hyperparameters, paths, and constants are in `config.py`:
 
-| Dataset | File | Description |
-|---------|------|-------------|
-| Hybrid | `structure_data_hybrid.csv` | Experimental structures where available, AlphaFold otherwise. Primary training set. |
-| Experimental | `structure_data_experimental.csv` | Experimental PDB structures only |
-| AlphaFold | `structure_data_alphafold.csv` | All AlphaFold structures |
-
-### Quality Filtering
-
-- Physical range filters remove impossible shift values (e.g., CA: 40-70 ppm)
-- Statistical outlier detection grouped by **(residue_code, shift_column)**, removing values beyond 3 IQRs
-- Non-standard residues and nucleotide entries are discarded
-- All filtering decisions are logged to `build_log.csv` with full provenance
-
-## Sequence Clustering for Retrieval Exclusion
-
-`cluster_sequences.py` uses MMseqs2 to cluster all protein sequences at 90% identity. The output (`identity_clusters_90.json`) maps each BMRB ID to the list of other BMRB IDs with >90% sequence identity. This exclusion map is used during FAISS retrieval to prevent data leakage from homologous proteins.
-
-**Requires**: [MMseqs2](https://github.com/soedinglab/MMseqs2) installed and on `$PATH`.
-
-## Model Architecture
-
-### Structural Encoding
-- **Distance attention** (`DistanceAttentionPerPosition`): Learns over 7 backbone atom pair distances per residue via attention
-- **1D CNN encoder**: Processes the context window (i +/- 5 residues) of structural features
-- **Spatial neighbor attention** (`SpatialNeighborAttention`): Attends to the k-nearest spatial neighbors. Each spatial neighbor contributes residue type, secondary structure, backbone angles, CA distance, and its own intramolecular distance embeddings (computed by the shared distance attention module)
-
-### Physics Features
-- Ring current effects on H and HA from nearby aromatics
-- Half-sphere exposure (upper/lower CA neighbor counts)
-- Hydrogen bond geometry from DSSP
-- Encoded by a 2-layer MLP (`PhysicsFeatureEncoder`)
-
-### Retrieval-Augmented Prediction
-- **ESM-2 embeddings**: Used as query vectors for FAISS nearest-neighbor retrieval
-- **Cross-attention**: Attends to retrieved neighbor embeddings
-- **Query-conditioned transfer**: Applies random coil correction when transferring shifts from retrieved neighbors:
-  ```
-  corrected = RC[query_aa] + (retrieved_shift - RC[retrieved_aa])
-  ```
-- **>90% identity exclusion**: During retrieval, residues from proteins with >90% sequence identity to the query are excluded (in addition to same-protein exclusion)
-
-### Shift Imputation Model
-A second-stage model (`imputation_model.py`) leverages partially observed chemical shifts to predict missing ones, combining structural encoding, observed shift context, and shift-aware retrieval.
+- **Canonical atom vocabulary**: 88 atom types shared across all datasets (`ATOM_TYPES`, `ATOM_TO_IDX`)
+- **Dataset directories**: `DATASET_DIRS` maps `hybrid`/`alphafold`/`experimental` to directory paths
+- **Training**: learning rate (2e-4), batch size (1024), Huber delta (0.5), weight decay (0.05), cosine annealing with warm restarts (T_0=50, T_mult=2)
+- **Model**: CNN channels [256, 512, 768, 1024, 1280], K=5 spatial neighbors, K=32 retrieved, 8-head retrieval attention
+- **ESM-2**: esm2_t36_3B_UR50D, layer 36, 2560-dim embeddings
 
 ## Utility Modules
 
 | Module | Description |
 |--------|-------------|
-| `config.py` | Central configuration: paths, amino acid mappings, shift ranges, hyperparameters |
-| `model.py` | Neural network: distance attention, CNN encoder, spatial attention, physics encoder, retrieval cross-attention, query-conditioned transfer |
-| `dataset.py` | Memory-efficient cached dataset with disk-mapped retrieval data, spatial neighbor distances, and physics features |
-| `data_quality.py` | `FilterLog` class and filtering functions (outliers, duplicates, non-standard residues) with full provenance |
-| `random_coil.py` | Random coil shift tables (Schwarzinger 2001, Wishart 1995) and correction functions |
-| `physics_features.py` | Ring current estimation, HSE computation, H-bond features |
-| `distance_features.py` | Dense backbone distance computation from PDB coordinates |
+| `config.py` | Central configuration: atom vocabulary, dataset paths, hyperparameters, model architecture |
+| `model.py` | Neural network: distance attention, CNN, spatial attention, retrieval cross-attention, dual gating |
+| `dataset.py` | Memory-efficient cached dataset with disk-mapped retrieval data |
+| `data_quality.py` | `FilterLog` class for provenance-tracked data filtering |
+| `analyze_data_quality.py` | Comprehensive data cleaning: outlier detection, physical range checks, shift referencing errors |
+| `random_coil.py` | Random coil shift tables (Schwarzinger 2001, Wishart 1995) |
+| `distance_features.py` | Intra-residue atom-pair distance computation from PDB coordinates |
 | `spatial_neighbors.py` | K-nearest spatial neighbor finder with minimum sequence separation |
 | `alignment.py` | Biopython-based sequence alignment for BMRB-to-PDB residue mapping |
-| `pdb_utils.py` | PDB file parsing (single and multi-model), chain extraction, coordinate retrieval |
+| `pdb_utils.py` | PDB file parsing, DSSP wrapper, coordinate extraction |
 | `structure_selection.py` | Best-chain selection by alignment identity; Kabsch superposition |
-| `rcsb_search.py` | RCSB PDB API search for structure discovery |
+| `rcsb_search.py` | RCSB PDB API search |
 | `alphafold_utils.py` | AlphaFold DB structure download via UniProt mapping |
-| `cluster_sequences.py` | MMseqs2-based sequence clustering for retrieval exclusion |
-| `retrieval.py` | FAISS-based retrieval with identity exclusion and random coil correction |
-| `predict.py` | Inference engine: load a trained model and predict shifts from a PDB file |
-| `app.py` | Gradio web UI for interactive prediction |
-| `imputation_model.py` | Shift imputation network: structural encoding + observed shift context + shift-aware retrieval |
-| `imputation_dataset.py` | Extends cached dataset with observed shift context; per-(residue, shift_type) sampling |
+| `retrieval.py` | FAISS-based retrieval with identity exclusion |
+| `imputation_model.py` | Shift imputation network |
+| `imputation_dataset.py` | Extends cached dataset with observed shift context |
 
 ## Requirements
 
@@ -184,76 +156,68 @@ See `requirements.txt`. Core dependencies:
 - Python >= 3.9
 - PyTorch >= 2.0
 - NumPy, Pandas, SciPy
-- Biopython >= 1.80 (sequence alignment, PDB parsing)
+- Biopython >= 1.80
 - fair-esm (ESM-2 protein language model)
-- faiss-cpu or faiss-gpu (approximate nearest neighbor search)
+- faiss-cpu or faiss-gpu
 - h5py (ESM embedding storage)
-- scikit-learn (metrics)
 - matplotlib (evaluation plots)
 - wandb (optional training logging)
-- tqdm (progress bars)
+- tqdm
 
-External tools (not pip-installable):
-- [MMseqs2](https://github.com/soedinglab/MMseqs2) — required for sequence clustering (Step 02)
-- [DSSP](https://github.com/PDB-REDO/dssp) — required for secondary structure assignment (used in Step 01)
-
-Optional:
-- gradio — for the web UI (`app.py`)
+External tools:
+- [MMseqs2](https://github.com/soedinglab/MMseqs2) — sequence clustering (Step 02)
+- [DSSP](https://github.com/PDB-REDO/dssp) — secondary structure assignment (Step 01)
 
 ## Directory Structure
 
 ```
-homologies_better_data/
-├── 00_fetch_bmrb_shifts.py        # Step 0: BMRB data download
-├── 01_build_datasets.py           # Step 1: Structure selection + dataset compilation
-├── cluster_sequences.py           # Step 2: Sequence clustering (MMseqs2)
-├── 03_extract_esm_embeddings.py   # Step 3: ESM-2 extraction
-├── 04_build_retrieval_index.py    # Step 4: FAISS index building
-├── 05_build_training_cache.py     # Step 5: Memory-mapped cache
-├── 06_train.py                    # Step 6: Model training
-├── 07_evaluate.py                 # Step 7: Model evaluation
-├── 08_train_imputation.py         # Step 8: Imputation model training
-├── 09_eval_imputation.py          # Step 9: Imputation model evaluation
-├── predict.py                     # Inference engine
-├── app.py                         # Gradio web UI
-├── config.py
-├── model.py
-├── dataset.py
-├── structure_selection.py
-├── pdb_utils.py
-├── rcsb_search.py
-├── alphafold_utils.py
-├── retrieval.py
-├── cluster_sequences.py
-├── alignment.py
-├── data_quality.py
-├── random_coil.py
-├── physics_features.py
-├── distance_features.py
-├── spatial_neighbors.py
-├── imputation_model.py
-├── imputation_dataset.py
+shift_prediction/
+├── main.py                           # Unified pipeline: cache + train
+├── inference.py                      # Single-PDB shift prediction
+├── 00_fetch_bmrb_shifts.py           # Step 0: BMRB data download
+├── 01_build_datasets.py              # Step 1: Structure selection + dataset compilation
+├── cluster_sequences.py              # Step 2: Sequence clustering
+├── 03_extract_esm_embeddings.py      # Step 3: ESM-2 extraction
+├── 04_build_retrieval_index.py       # Step 4: FAISS index building
+├── 05_build_training_cache.py        # Step 5: Memory-mapped cache
+├── 06_train.py                       # Step 6: Model training
+├── 07_evaluate.py                    # Step 7: Model evaluation
+├── 08_train_imputation.py            # Step 8: Imputation training
+├── 09_eval_imputation.py             # Step 9: Imputation evaluation
+├── config.py                         # Central configuration
+├── model.py                          # Model architecture
+├── dataset.py                        # Cached dataset
+├── retrieval.py                      # FAISS retrieval
+├── pdb_utils.py                      # PDB parsing + DSSP
+├── distance_features.py              # Distance feature computation
+├── spatial_neighbors.py              # Spatial neighbor finder
+├── alignment.py                      # Sequence alignment
+├── structure_selection.py            # Chain/model selection
+├── data_quality.py                   # Data filtering with provenance
+├── analyze_data_quality.py           # Comprehensive data cleaning
+├── random_coil.py                    # Random coil shift tables
+├── alphafold_utils.py                # AlphaFold DB download
+├── rcsb_search.py                    # RCSB PDB API
+├── imputation_model.py               # Imputation model
+├── imputation_dataset.py             # Imputation dataset
 ├── requirements.txt
-├── README.md
-├── data/
-│   ├── chemical_shifts.csv          # BMRB shift data
-│   ├── pairs.csv                    # BMRB -> PDB ID mappings
-│   ├── structure_data_hybrid.csv    # Primary dataset (experimental + AlphaFold)
-│   ├── structure_data_experimental.csv
-│   ├── structure_data_alphafold.csv
-│   ├── identity_clusters_90.json    # Sequence identity exclusion map
-│   ├── esm_embeddings.h5            # ESM-2 embeddings
-│   ├── retrieval_indices/           # Per-fold FAISS indices
-│   ├── cache/                       # Pre-computed retrieval caches
-│   ├── pdbs/                        # Downloaded PDB files
-│   ├── alphafold/                   # Downloaded AlphaFold structures
-│   └── build_log.csv               # Data provenance log
-├── checkpoints/
-│   ├── best_retrieval_fold1.pt
-│   ├── best_imputation_fold1.pt
-│   └── training_provenance_fold1.json
-└── eval_results/
-    ├── evaluation_fold1.json
-    ├── per_shift_metrics_fold1.csv
-    └── plots_fold1/
+├── data/                             # Hybrid dataset (primary)
+│   ├── structure_data_hybrid.csv
+│   ├── chemical_shifts.csv
+│   ├── pairs.csv
+│   ├── esm_embeddings.h5
+│   ├── retrieval_indices/            # Per-fold FAISS indices
+│   ├── cache/                        # Per-fold training caches
+│   ├── checkpoints/                  # Model checkpoints
+│   ├── pdbs/                         # Experimental PDB structures
+│   ├── alphafold/                    # AlphaFold structures
+│   └── build_log.csv
+├── data_alphafold/                   # AlphaFold-only dataset
+│   ├── structure_data_hybrid.csv -> structure_data_alphafold.csv
+│   ├── cache/
+│   └── checkpoints/
+└── data_experimental/                # Experimental-only dataset
+    ├── structure_data_hybrid.csv -> structure_data_experimental.csv
+    ├── cache/
+    └── checkpoints/
 ```

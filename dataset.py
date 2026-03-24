@@ -66,16 +66,14 @@ def parse_distance_columns(columns):
     return dist_cols
 
 
-def build_atom_vocabulary(dist_col_info):
-    """Build vocabulary of unique atom types from distance columns."""
-    atoms = set()
-    for _, atom1, atom2 in dist_col_info:
-        atoms.add(atom1)
-        atoms.add(atom2)
+def build_atom_vocabulary(dist_col_info=None):
+    """Return canonical atom vocabulary from config.
 
-    atom_list = sorted(atoms)
-    atom_to_idx = {a: i for i, a in enumerate(atom_list)}
-    return atom_list, atom_to_idx
+    Always returns the same vocabulary regardless of which distance columns
+    are present, ensuring caches and models are interchangeable across datasets.
+    """
+    from config import ATOM_TYPES, ATOM_TO_IDX
+    return list(ATOM_TYPES), dict(ATOM_TO_IDX)
 
 
 def parse_shift_columns(columns):
@@ -141,6 +139,9 @@ class CachedRetrievalDataset(Dataset):
         # Store normalization stats for retrieved shifts
         self._setup_retrieval_normalization(stats, shift_cols)
 
+        # Per-AA normalization (if available in stats)
+        self._setup_per_aa_normalization(stats, shift_cols)
+
         # Load samples list
         self.samples = np.load(self.cache_dir / 'samples.npy')
 
@@ -177,6 +178,48 @@ class CachedRetrievalDataset(Dataset):
             self.retrieval_stds,
             torch.ones_like(self.retrieval_stds)
         )
+
+    def _setup_per_aa_normalization(self, stats, shift_cols):
+        """Build per-(AA, shift) normalization tensors.
+
+        When available, targets are re-normalized from global z-scores to
+        per-AA z-scores on the fly: z_aa = (raw - aa_mean) / aa_std.
+        This prevents large errors on shifts that span different chemical
+        environments across amino acids (e.g., CD1: LEU=24 ppm, TYR=132 ppm).
+        """
+        from config import STANDARD_RESIDUES
+
+        self.per_aa_means = None
+        self.per_aa_stds = None
+        self.use_per_aa_norm = False
+
+        if stats is None or shift_cols is None:
+            return
+        per_aa = stats.get('per_aa')
+        if not per_aa:
+            return
+
+        n_aa = len(STANDARD_RESIDUES)
+        n_shifts = len(shift_cols)
+
+        # Build (n_aa, n_shifts) tensors of per-AA mean/std
+        # Fall back to global stats for missing AA/shift combos
+        means = torch.zeros(n_aa, n_shifts)
+        stds = torch.ones(n_aa, n_shifts)
+
+        for aa_idx, aa_name in enumerate(STANDARD_RESIDUES):
+            aa_stats = per_aa.get(aa_name, {})
+            for si, col in enumerate(shift_cols):
+                if col in aa_stats:
+                    means[aa_idx, si] = aa_stats[col]['mean']
+                    stds[aa_idx, si] = max(aa_stats[col]['std'], 0.1)
+                elif col in stats:
+                    means[aa_idx, si] = stats[col]['mean']
+                    stds[aa_idx, si] = max(stats[col]['std'], 0.1)
+
+        self.per_aa_means = means
+        self.per_aa_stds = stds
+        self.use_per_aa_norm = True
 
     def _load_structural_data(self):
         """Load compact structural features into memory."""
@@ -344,9 +387,17 @@ class CachedRetrievalDataset(Dataset):
                 else:
                     neighbor_valid[k] = False
 
-        # Targets
-        shift_target = self.flat_shifts[global_idx]
+        # Targets — re-normalize per-AA if stats available
+        shift_target = self.flat_shifts[global_idx]  # globally z-normalized
         shift_mask = self.flat_shift_mask[global_idx]
+
+        if self.use_per_aa_norm and self.per_aa_means is not None:
+            aa_idx = self.flat_residue_idx[global_idx].item()
+            if aa_idx < self.per_aa_means.shape[0]:
+                # Convert: global_z -> raw_ppm -> per_aa_z
+                raw = shift_target * self.retrieval_stds + self.retrieval_means
+                shift_target = (raw - self.per_aa_means[aa_idx]) / self.per_aa_stds[aa_idx]
+                shift_target = torch.where(shift_mask, shift_target, torch.zeros_like(shift_target))
 
         # Clean NaN
         neighbor_angles = torch.where(torch.isnan(neighbor_angles),

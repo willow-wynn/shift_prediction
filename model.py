@@ -14,13 +14,11 @@ Architecture:
     - 2x SelfAttentionLayer: neighbors attend to each other
     - 3x ShiftSpecificCrossAttention: per-shift query embeddings attend to neighbors
     - DirectTransferHead: learned scoring → weighted shift average
-    - Dual gating: direct_gate + retrieval_gate for graceful fallback
+    - retrieval_gate: blends direct transfer with structure-only prediction
 
   Prediction:
     - struct_pred: structure-only MLP head
-    - attn_pred: attention-based retrieval head
-    - direct_pred: direct shift transfer
-    - retrieval_pred = dg * direct_pred + (1-dg) * attn_pred
+    - retrieval_pred: direct shift transfer (learned weighted average of neighbor shifts)
     - final_pred = rg * retrieval_pred + (1-rg) * struct_pred
 """
 
@@ -544,26 +542,14 @@ class ShiftPredictorWithRetrieval(nn.Module):
 
         # ========== Prediction heads ==========
 
-        # Structure-only prediction
+        # Structure-only prediction (wider to handle per-AA shift diversity)
         self.struct_head = nn.Sequential(
-            nn.Linear(base_encoder_dim, 512), nn.GELU(), nn.Dropout(head_dropout),
-            nn.Linear(512, 256), nn.GELU(), nn.Dropout(head_dropout),
+            nn.Linear(base_encoder_dim, 1024), nn.GELU(), nn.Dropout(head_dropout),
+            nn.Linear(1024, 512), nn.GELU(), nn.Dropout(head_dropout),
+            nn.Linear(512, 256), nn.GELU(), nn.Dropout(head_dropout * 0.5),
             nn.Linear(256, n_shifts))
 
-        # Attention-based retrieval prediction (per-shift)
-        # Input: shift_ctx (retrieval_hidden) + base_encoding (base_encoder_dim)
-        self.attn_head = nn.Sequential(
-            nn.Linear(retrieval_hidden + base_encoder_dim, retrieval_hidden),
-            nn.GELU(), nn.Dropout(head_dropout),
-            nn.Linear(retrieval_hidden, 1))
-
-        # Dual gates
-        # direct_gate: blend direct transfer vs attention prediction
-        self.direct_gate = nn.Sequential(
-            nn.Linear(retrieval_hidden + 1, 96), nn.GELU(),
-            nn.Linear(96, 1), nn.Sigmoid())
-
-        # retrieval_gate: blend retrieval vs structure-only
+        # retrieval_gate: blend direct transfer vs structure-only
         self.retrieval_gate = nn.Sequential(
             nn.Linear(retrieval_hidden + base_encoder_dim + 1, 192), nn.GELU(),
             nn.Linear(192, 1), nn.Sigmoid())
@@ -633,14 +619,44 @@ class ShiftPredictorWithRetrieval(nn.Module):
         x_center = x[:, center_idx, :]  # (B, cnn_out_dim)
 
         # Spatial neighbor distance embeddings
+        # For each neighbor, combine query's intra-residue distances + neighbor's
+        # intra-residue distances + the CA-CA cross-residue distance into one
+        # attention set. This lets the model learn inter-residue geometry by
+        # jointly attending over both residues' distance features.
         neighbor_dist_embeddings = None
         if neighbor_atom1_idx is not None and neighbor_distances is not None:
             K_sp = neighbor_atom1_idx.size(1)
             M_sp = neighbor_atom1_idx.size(2)
-            nb_a1 = neighbor_atom1_idx.view(B * K_sp, 1, M_sp)
-            nb_a2 = neighbor_atom2_idx.view(B * K_sp, 1, M_sp)
-            nb_d = neighbor_distances.view(B * K_sp, 1, M_sp)
-            nb_m = neighbor_dist_mask.view(B * K_sp, 1, M_sp)
+
+            # Query center distances: (B, M) -> expand to (B, K_sp, M)
+            center_w = distances.size(1) // 2
+            q_a1 = atom1_idx[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+            q_a2 = atom2_idx[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+            q_d = distances[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+            q_m = dist_mask[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+
+            # CA-CA distance as a single "distance pair" with special atom indices
+            # Use CA atom index (index 1 in canonical vocab) for both
+            ca_idx = 1  # CA in ATOM_TYPES
+            ca_a1 = torch.full((B, K_sp, 1), ca_idx, dtype=torch.long, device=distances.device)
+            ca_a2 = torch.full((B, K_sp, 1), ca_idx, dtype=torch.long, device=distances.device)
+            ca_d = neighbor_dist.unsqueeze(-1)  # (B, K_sp, 1)
+            ca_m = neighbor_valid.unsqueeze(-1)  # (B, K_sp, 1)
+
+            # Concatenate: query distances + CA-CA + neighbor distances
+            # Total distance pairs per neighbor: M + 1 + M
+            joint_a1 = torch.cat([q_a1, ca_a1, neighbor_atom1_idx], dim=-1)  # (B, K_sp, 2M+1)
+            joint_a2 = torch.cat([q_a2, ca_a2, neighbor_atom2_idx], dim=-1)
+            joint_d = torch.cat([q_d, ca_d, neighbor_distances], dim=-1)
+            joint_m = torch.cat([q_m, ca_m, neighbor_dist_mask], dim=-1)
+
+            # Reshape for distance attention: (B*K_sp, 1, 2M+1)
+            D_joint = joint_a1.size(-1)
+            nb_a1 = joint_a1.reshape(B * K_sp, 1, D_joint)
+            nb_a2 = joint_a2.reshape(B * K_sp, 1, D_joint)
+            nb_d = joint_d.reshape(B * K_sp, 1, D_joint)
+            nb_m = joint_m.reshape(B * K_sp, 1, D_joint)
+
             nb_dist_emb = self.distance_attention(nb_a1, nb_a2, nb_d, nb_m)
             neighbor_dist_embeddings = nb_dist_emb.squeeze(1).view(B, K_sp, -1)
 
@@ -697,29 +713,19 @@ class ShiftPredictorWithRetrieval(nn.Module):
             shift_ctx = c if shift_ctx is None else shift_ctx + c
         # shift_ctx: (B, n_shifts, retrieval_hidden)
 
-        # Attention-based prediction: combine shift context with structural encoding
-        S = self.n_shifts
-        ctx_exp = base_encoding.unsqueeze(1).expand(-1, S, -1)
-        attn_pred = self.attn_head(
-            torch.cat([shift_ctx, ctx_exp], dim=-1)).squeeze(-1)  # (B, n_shifts)
-
         # Direct transfer prediction
-        direct_pred = self.direct_transfer(
+        retrieval_pred = self.direct_transfer(
             nbr_enc, retrieved_shifts, retrieved_shift_masks, retrieved_valid)
 
-        # ========== Dual gating ==========
+        # ========== Retrieval gate ==========
         valid_3d = retrieved_valid.unsqueeze(-1) & retrieved_shift_masks
         n_valid_norm = (valid_3d.float().sum(dim=1) / max(K, 1)).unsqueeze(-1)  # (B, n_shifts, 1)
 
-        # Direct gate: blend direct transfer vs attention prediction
-        dg = self.direct_gate(
-            torch.cat([shift_ctx, n_valid_norm], dim=-1)).squeeze(-1)  # (B, n_shifts)
-        retrieval_pred = dg * direct_pred + (1 - dg) * attn_pred
-        retrieval_pred = retrieval_pred * retrieved_valid.any(dim=1, keepdim=True).float()
-
-        # Retrieval gate: blend retrieval vs structure-only
+        S = self.n_shifts
+        ctx_exp = base_encoding.unsqueeze(1).expand(-1, S, -1)
         rg = self.retrieval_gate(
             torch.cat([shift_ctx, ctx_exp, n_valid_norm], dim=-1)).squeeze(-1)  # (B, n_shifts)
+        retrieval_pred = retrieval_pred * retrieved_valid.any(dim=1, keepdim=True).float()
         predictions = rg * retrieval_pred + (1 - rg) * struct_pred
 
         predictions = torch.where(
