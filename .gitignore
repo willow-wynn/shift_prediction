@@ -1,31 +1,13 @@
-# Data files — key datasets tracked via git-lfs, rest regenerable
-data/*
-# Dataset CSVs (LFS)
-!data/chemical_shifts.csv
-!data/structure_data_hybrid.csv
-!data/structure_data_hybrid_cleaned.csv
-!data/structure_data_hybrid_cleaned_log.json
-!data/structure_data_hybrid_cleaned_summary.txt
-!data/pairs.csv
-!data/build_log.csv
-# ESM embeddings (LFS)
-!data/esm_embeddings.h5
-# Sequence identity clusters
-!data/identity_clusters_90.json
-# Retrieval indices (LFS)
-# Retrieval indices are 26GB — regenerable, not tracked
-data/retrieval_indices/
-# AlphaFold mapping (small JSON, not the PDBs)
-!data/alphafold/
-data/alphafold/*
-!data/alphafold/bmrb_uniprot_mapping.json
-!data/alphafold/new_uniprot_mappings*.json
+# Data (large files, regenerable)
+data/
 
-# Generated output dirs
+# Generated outputs
 cache/
 checkpoints/
 eval_results/
 eval_imputation_results/
+wandb/
+wandb_runs/
 
 # Python
 __pycache__/
@@ -34,15 +16,10 @@ __pycache__/
 *.egg-info/
 .eggs/
 
-# OS
+# IDE/OS
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
-
-# IDE
-.vscode/
-.idea/
 *.swp
 *.swo
-
-# Experiment tracking
-wandb/
