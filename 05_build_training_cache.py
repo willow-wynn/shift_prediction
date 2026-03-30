@@ -63,6 +63,7 @@ from config import (
     K_SPATIAL_NEIGHBORS,
     MAX_VALID_DISTANCES,
     STRUCT_DIST_COLS, STRUCT_SC_COLS, N_STRUCT_FEATURES,
+    BOND_GEOM_COLS, N_BOND_GEOM,
 )
 
 
@@ -297,6 +298,9 @@ def build_cache_for_fold(
     # Compact structural feature vector (for retrieval neighbor encoder)
     flat_query_struct = np.zeros((total_residues, N_STRUCT_FEATURES), dtype=np.float32)
 
+    # Inter-residue bond geometry (4 features per residue)
+    flat_bond_geom = np.zeros((total_residues, N_BOND_GEOM), dtype=np.float32)
+
     # Protein tracking
     protein_offsets = []
     protein_lookup_offsets = []
@@ -461,6 +465,14 @@ def build_cache_for_fold(
         # Compact structural feature vector
         extract_struct_features(pdf, start_idx, n, flat_query_struct)
 
+        # Inter-residue bond geometry
+        for bi, col in enumerate(BOND_GEOM_COLS):
+            if col in pdf.columns:
+                vals = pdf[col].values
+                valid = ~np.isnan(vals)
+                # Normalize: divide by 10 A (same scale as intra-residue distances)
+                flat_bond_geom[start_idx:start_idx + n, bi] = np.where(valid, vals / 10.0, 0.0)
+
         # Build samples (only residues with at least one observed shift)
         for local_idx in range(n):
             global_idx = start_idx + local_idx
@@ -496,6 +508,7 @@ def build_cache_for_fold(
     np.save(sd / 'protein_max_res.npy', np.array(protein_max_res, dtype=np.int32))
 
     np.save(sd / 'query_struct.npy', flat_query_struct)
+    np.save(sd / 'bond_geom.npy', flat_bond_geom)
 
     with open(sd / 'bmrb_mapping.json', 'w') as f:
         json.dump(idx_to_bmrb, f)

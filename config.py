@@ -83,6 +83,17 @@ DATASET_DIRS = {
 }
 
 # ============================================================================
+# Inter-Residue Bond Geometry Columns
+# ============================================================================
+BOND_GEOM_COLS = [
+    'bond_ca_prev',       # ||CA(i) - CA(i-1)||
+    'bond_ca_next',       # ||CA(i) - CA(i+1)||
+    'bond_peptide_fwd',   # ||C(i) - N(i+1)||  (forward peptide bond)
+    'bond_peptide_bkwd',  # ||C(i-1) - N(i)||  (backward peptide bond)
+]
+N_BOND_GEOM = len(BOND_GEOM_COLS)
+
+# ============================================================================
 # Dense Distance Columns
 # ============================================================================
 BACKBONE_CORE_ATOMS = ['C', 'CA', 'N', 'O']

@@ -44,7 +44,7 @@ from config import (
     STANDARD_RESIDUES, RESIDUE_TO_IDX, N_RESIDUE_TYPES,
     SS_TYPES, SS_TO_IDX, N_SS_TYPES,
     MISMATCH_TYPES, MISMATCH_TO_IDX, N_MISMATCH_TYPES,
-    DSSP_COLS,
+    DSSP_COLS, N_BOND_GEOM,
 )
 
 
@@ -269,6 +269,13 @@ class CachedRetrievalDataset(Dataset):
             self.flat_query_struct = None
             self.n_struct_features = 0
 
+        # Inter-residue bond geometry
+        bond_geom_path = sd / 'bond_geom.npy'
+        if bond_geom_path.exists():
+            self.flat_bond_geom = torch.from_numpy(np.load(bond_geom_path))
+        else:
+            self.flat_bond_geom = None
+
     def _mmap_retrieval_data(self):
         """Memory-map retrieval data from disk."""
         rd = self.cache_dir / 'retrieval'
@@ -387,6 +394,16 @@ class CachedRetrievalDataset(Dataset):
                 else:
                     neighbor_valid[k] = False
 
+        # Bond geometry per window position
+        if self.flat_bond_geom is not None:
+            bond_geom = torch.zeros(W, N_BOND_GEOM, dtype=torch.float32)
+            for w in range(W):
+                if is_valid[w]:
+                    res_idx_w = safe_idx[w].item()
+                    bond_geom[w] = self.flat_bond_geom[res_idx_w]
+        else:
+            bond_geom = torch.zeros(W, N_BOND_GEOM, dtype=torch.float32)
+
         # Targets — re-normalize per-AA if stats available
         shift_target = self.flat_shifts[global_idx]  # globally z-normalized
         shift_mask = self.flat_shift_mask[global_idx]
@@ -483,6 +500,7 @@ class CachedRetrievalDataset(Dataset):
             'neighbor_atom2_idx': neighbor_atom2_idx,
             'neighbor_distances': neighbor_distances,
             'neighbor_dist_mask': neighbor_dist_mask,
+            'bond_geom': bond_geom,
 
             # Targets
             'shift_target': shift_target,

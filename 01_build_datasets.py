@@ -800,6 +800,49 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
 
         rows.append(row)
 
+    # --- Inter-residue backbone bond geometry ---
+    # Second pass: compute distances between sequential neighbors.
+    # These require coordinates from adjacent residues which are only
+    # available after the full protein has been processed.
+    rows_by_rid = {r['residue_id']: r for r in rows if 'ca_x' in r}
+    sorted_row_rids = sorted(rows_by_rid.keys())
+
+    for i, rid in enumerate(sorted_row_rids):
+        r = rows_by_rid[rid]
+        ca_i = np.array([r['ca_x'], r['ca_y'], r['ca_z']])
+
+        atoms_i = struct_data[rid]['atoms'] if rid in struct_data else {}
+
+        # Previous residue (i-1)
+        if i > 0:
+            prev_rid = sorted_row_rids[i - 1]
+            rp = rows_by_rid[prev_rid]
+            ca_prev = np.array([rp['ca_x'], rp['ca_y'], rp['ca_z']])
+            r['bond_ca_prev'] = float(np.linalg.norm(ca_i - ca_prev))
+
+            # Peptide bond backward: C(i-1) -> N(i)
+            atoms_prev = struct_data.get(prev_rid, {}).get('atoms', {})
+            if 'C' in atoms_prev and 'N' in atoms_i:
+                c_prev = atoms_prev['C']
+                n_i = atoms_i['N']
+                if np.all(np.isfinite(c_prev)) and np.all(np.isfinite(n_i)):
+                    r['bond_peptide_bkwd'] = float(np.linalg.norm(n_i - c_prev))
+
+        # Next residue (i+1)
+        if i < len(sorted_row_rids) - 1:
+            next_rid = sorted_row_rids[i + 1]
+            rn = rows_by_rid[next_rid]
+            ca_next = np.array([rn['ca_x'], rn['ca_y'], rn['ca_z']])
+            r['bond_ca_next'] = float(np.linalg.norm(ca_i - ca_next))
+
+            # Peptide bond forward: C(i) -> N(i+1)
+            atoms_next = struct_data.get(next_rid, {}).get('atoms', {})
+            if 'C' in atoms_i and 'N' in atoms_next:
+                c_i = atoms_i['C']
+                n_next = atoms_next['N']
+                if np.all(np.isfinite(c_i)) and np.all(np.isfinite(n_next)):
+                    r['bond_peptide_fwd'] = float(np.linalg.norm(n_next - c_i))
+
     return rows
 
 

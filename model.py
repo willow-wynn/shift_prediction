@@ -42,6 +42,7 @@ from config import (
     SPATIAL_ATTN_HIDDEN,
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
+    N_BOND_GEOM,
 )
 
 
@@ -484,7 +485,11 @@ class ShiftPredictorWithRetrieval(nn.Module):
             self.dssp_proj = None
             dssp_dim = 0
 
-        cnn_input_dim = dist_attn_hidden + 64 + 32 + 16 + 16 + dssp_dim
+        # Inter-residue bond geometry (CA-CA distances, peptide bond lengths)
+        self.bond_proj = nn.Linear(N_BOND_GEOM, 16)
+        bond_dim = 16
+
+        cnn_input_dim = dist_attn_hidden + 64 + 32 + 16 + 16 + dssp_dim + bond_dim
 
         self.input_norm = nn.LayerNorm(cnn_input_dim)
         self.input_dropout_layer = nn.Dropout(input_dropout)
@@ -580,6 +585,8 @@ class ShiftPredictorWithRetrieval(nn.Module):
         # Spatial neighbor distance features
         neighbor_atom1_idx=None, neighbor_atom2_idx=None,
         neighbor_distances=None, neighbor_dist_mask=None,
+        # Inter-residue bond geometry
+        bond_geom=None,
         # Retrieval inputs
         query_residue_code=None,
         retrieved_shifts=None, retrieved_shift_masks=None,
@@ -602,11 +609,16 @@ class ShiftPredictorWithRetrieval(nn.Module):
         mismatch_emb = self.mismatch_embed(mismatch_idx)
         valid_emb = self.valid_embed(is_valid.unsqueeze(-1))
 
+        # Bond geometry projection
+        if bond_geom is None:
+            bond_geom = torch.zeros(B, distances.size(1), N_BOND_GEOM, device=distances.device)
+        bond_emb = self.bond_proj(bond_geom)
+
         if self.dssp_proj is not None:
             dssp_emb = self.dssp_proj(dssp_features)
-            window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, dssp_emb], dim=-1)
+            window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, dssp_emb, bond_emb], dim=-1)
         else:
-            window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb], dim=-1)
+            window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, bond_emb], dim=-1)
 
         x = self.input_dropout_layer(self.input_norm(window_feat))
 

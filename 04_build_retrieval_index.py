@@ -197,6 +197,13 @@ def build_fold_indices(
     fold_provenance = {}
 
     for exclude_fold in folds:
+        # Skip if index already exists
+        index_path = os.path.join(output_dir, f'index_exclude_fold_{exclude_fold}.faiss')
+        metadata_path = os.path.join(output_dir, f'metadata_exclude_fold_{exclude_fold}.pkl')
+        if os.path.exists(index_path) and os.path.exists(metadata_path):
+            print(f"\n  Fold {exclude_fold}: index already exists, skipping")
+            continue
+
         print(f"\n{'=' * 50}")
         print(f"Building index excluding fold {exclude_fold}")
         print(f"{'=' * 50}")

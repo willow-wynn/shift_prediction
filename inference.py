@@ -32,6 +32,7 @@ from config import (
     STRUCT_DIST_COLS, STRUCT_SC_COLS, N_STRUCT_FEATURES,
     AA_3_TO_1, ESM_MODEL_NAME, ESM_EMBED_DIM, ESM_REPR_LAYER,
     FAISS_NPROBE,
+    N_BOND_GEOM,
 )
 from model import ShiftPredictorWithRetrieval
 from pdb_utils import parse_pdb, run_dssp
@@ -144,6 +145,47 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
     print(f"  Computing spatial neighbors...")
     spatial_data = {rid: aa_data[rid] for rid in res_ids}
     neighbors = find_neighbors(spatial_data, k=K_SPATIAL_NEIGHBORS)
+
+    # Pre-compute inter-residue bond geometry
+    print(f"  Computing bond geometry...")
+    bond_geom_by_rid = {}
+    for i, rid in enumerate(res_ids):
+        bg = np.zeros(N_BOND_GEOM, dtype=np.float32)
+        atoms_i = aa_data[rid]['atoms']
+
+        # Previous residue
+        if i > 0:
+            prev_rid = res_ids[i - 1]
+            atoms_prev = aa_data[prev_rid]['atoms']
+            if 'CA' in atoms_i and 'CA' in atoms_prev:
+                ca_i = atoms_i['CA']
+                ca_prev = atoms_prev['CA']
+                if np.all(np.isfinite(ca_i)) and np.all(np.isfinite(ca_prev)):
+                    bg[0] = np.linalg.norm(ca_i - ca_prev) / 10.0  # bond_ca_prev
+
+            if 'C' in atoms_prev and 'N' in atoms_i:
+                c_prev = atoms_prev['C']
+                n_i = atoms_i['N']
+                if np.all(np.isfinite(c_prev)) and np.all(np.isfinite(n_i)):
+                    bg[3] = np.linalg.norm(n_i - c_prev) / 10.0  # bond_peptide_bkwd
+
+        # Next residue
+        if i < len(res_ids) - 1:
+            next_rid = res_ids[i + 1]
+            atoms_next = aa_data[next_rid]['atoms']
+            if 'CA' in atoms_i and 'CA' in atoms_next:
+                ca_i = atoms_i['CA']
+                ca_next = atoms_next['CA']
+                if np.all(np.isfinite(ca_i)) and np.all(np.isfinite(ca_next)):
+                    bg[1] = np.linalg.norm(ca_i - ca_next) / 10.0  # bond_ca_next
+
+            if 'C' in atoms_i and 'N' in atoms_next:
+                c_i = atoms_i['C']
+                n_next = atoms_next['N']
+                if np.all(np.isfinite(c_i)) and np.all(np.isfinite(n_next)):
+                    bg[2] = np.linalg.norm(n_next - c_i) / 10.0  # bond_peptide_fwd
+
+        bond_geom_by_rid[rid] = bg
 
     # Build per-residue feature tensors
     W = 2 * CONTEXT_WINDOW + 1
@@ -294,6 +336,12 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
             if col in feats:
                 query_struct[off + ci] = feats[col]
 
+        # Bond geometry per window position
+        bond_geom = torch.zeros(W, N_BOND_GEOM, dtype=torch.float32)
+        for w, wrid in enumerate(window_rids):
+            if wrid >= 0 and wrid in bond_geom_by_rid:
+                bond_geom[w] = torch.from_numpy(bond_geom_by_rid[wrid])
+
         residues.append({
             'residue_id': center_rid,
             'residue_name': res_name,
@@ -318,6 +366,7 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
             'neighbor_dist_mask': neighbor_dist_mask,
             'query_residue_code': query_residue_code,
             'query_struct': query_struct,
+            'bond_geom': bond_geom,
         })
 
     return residues, res_ids
