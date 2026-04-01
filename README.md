@@ -80,9 +80,9 @@ python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb --c
 
 ## Architecture
 
-**Base encoder:** Per-residue distance attention over all intramolecular atom pairs → 5-layer residual CNN over ±5 residue window → spatial neighbor attention (K=5, min 4 residue separation) → 1472-dim encoding
+**Base encoder:** Per-residue distance attention over all intramolecular atom pairs → 5-layer residual CNN over ±5 residue window → multi-head cross-attention over K=5 spatial neighbors (4 heads, min 4 residue separation; CNN center output queries against neighbor keys/values) → 1472-dim encoding
 
-**Retrieval pathway:** FAISS nearest-neighbor retrieval (K=32) → neighbor encoder → self-attention (2 layers) → shift-specific cross-attention (3 layers) → direct transfer head → learned gating blends retrieval with structure-only prediction
+**Retrieval pathway:** FAISS nearest-neighbor retrieval (K=32, same-protein exclusion) → neighbor encoder → self-attention (2 layers) → shift-specific cross-attention (3 layers) → direct transfer head → learned gating blends retrieval with structure-only prediction
 
 **Features per residue:** 88 atom-type distance pairs, residue/SS/mismatch embeddings, DSSP hydrogen bond geometry, phi/psi angles, inter-residue peptide bond lengths and CA-CA distances
 
