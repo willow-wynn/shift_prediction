@@ -425,14 +425,14 @@ class DirectTransferHead(nn.Module):
 # Full Model with Retrieval
 # ============================================================================
 
-class ShiftPredictorWithRetrieval(nn.Module):
-    """Chemical shift prediction with V9-style retrieval augmentation.
+class ShiftPredictor(nn.Module):
+    """Chemical shift prediction with optional retrieval augmentation.
 
     Architecture:
-      Base encoder: Distance attention + CNN + Spatial
-      Retrieval: Neighbor encoder + self-attn + shift-specific cross-attn
-                 + direct transfer + dual gating
-      Prediction: struct_pred, retrieval_pred blended by learned gates
+      Base encoder: Distance attention + CNN + spatial cross-attention
+      Retrieval (optional): Neighbor encoder + self-attn + shift-specific
+                 cross-attn + direct transfer + learned gating
+      Prediction: struct_pred (blended with retrieval_pred when retrieval enabled)
     """
 
     def __init__(
@@ -452,7 +452,8 @@ class ShiftPredictorWithRetrieval(nn.Module):
         head_dropout: float = HEAD_DROPOUT,
         spatial_hidden: int = SPATIAL_ATTN_HIDDEN,
         k_spatial: int = 5,
-        # Retrieval params
+        # Retrieval params (ignored when use_retrieval=False)
+        use_retrieval: bool = True,
         retrieval_hidden: int = RETRIEVAL_HIDDEN,
         retrieval_heads: int = RETRIEVAL_HEADS,
         retrieval_dropout: float = RETRIEVAL_DROPOUT,
@@ -468,7 +469,8 @@ class ShiftPredictorWithRetrieval(nn.Module):
 
         self.n_shifts = n_shifts
         self.n_residue_types = n_residue_types
-        self.retrieval_dropout_rate = retrieval_dropout
+        self.use_retrieval = use_retrieval
+        self.retrieval_dropout_rate = retrieval_dropout if use_retrieval else 0.0
 
         # ========== Base encoder ==========
         self.distance_attention = DistanceAttentionPerPosition(
@@ -521,51 +523,43 @@ class ShiftPredictorWithRetrieval(nn.Module):
         )
 
         base_encoder_dim = cnn_out_dim + spatial_hidden
+        self._base_encoder_dim = base_encoder_dim
 
-        # ========== Retrieval pathway (V9-style) ==========
-        # Note: RC correction removed — retrieval uses only same-AA-type neighbors
-
-        # Neighbor encoder + self-attention
-        self.neighbor_encoder = RetrievalNeighborEncoder(
-            n_residue_types, n_shifts, n_struct, retrieval_hidden,
-            k=k_retrieved, dropout=retrieval_dropout)
-
-        self.self_attn_layers = nn.ModuleList([
-            SelfAttentionLayer(retrieval_hidden, retrieval_heads, retrieval_dropout)
-            for _ in range(n_self_attn)])
-
-        # Shift-specific cross-attention (3 layers with residual FFN)
-        self.cross_attn_layers = nn.ModuleList([
-            ShiftSpecificCrossAttention(
-                retrieval_hidden, n_shifts, retrieval_heads, retrieval_dropout)
-            for _ in range(n_cross_attn)])
-        self.cross_ffn_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(retrieval_hidden, retrieval_hidden * 2), nn.GELU(),
-                nn.Dropout(retrieval_dropout),
-                nn.Linear(retrieval_hidden * 2, retrieval_hidden),
-                nn.LayerNorm(retrieval_hidden))
-            for _ in range(n_cross_attn)])
-
-        # Direct transfer head
-        self.direct_transfer = DirectTransferHead(
-            retrieval_hidden, n_shifts, retrieval_dropout)
-
-        # ========== Prediction heads ==========
-
-        # Structure-only prediction (wider to handle per-AA shift diversity)
+        # ========== Prediction head ==========
         self.struct_head = nn.Sequential(
             nn.Linear(base_encoder_dim, 1024), nn.GELU(), nn.Dropout(head_dropout),
             nn.Linear(1024, 512), nn.GELU(), nn.Dropout(head_dropout),
             nn.Linear(512, 256), nn.GELU(), nn.Dropout(head_dropout * 0.5),
             nn.Linear(256, n_shifts))
 
-        # retrieval_gate: blend direct transfer vs structure-only
-        self.retrieval_gate = nn.Sequential(
-            nn.Linear(retrieval_hidden + base_encoder_dim + 1, 192), nn.GELU(),
-            nn.Linear(192, 1), nn.Sigmoid())
+        # ========== Retrieval pathway (optional) ==========
+        if use_retrieval:
+            self.neighbor_encoder = RetrievalNeighborEncoder(
+                n_residue_types, n_shifts, n_struct, retrieval_hidden,
+                k=k_retrieved, dropout=retrieval_dropout)
 
-        self._base_encoder_dim = base_encoder_dim
+            self.self_attn_layers = nn.ModuleList([
+                SelfAttentionLayer(retrieval_hidden, retrieval_heads, retrieval_dropout)
+                for _ in range(n_self_attn)])
+
+            self.cross_attn_layers = nn.ModuleList([
+                ShiftSpecificCrossAttention(
+                    retrieval_hidden, n_shifts, retrieval_heads, retrieval_dropout)
+                for _ in range(n_cross_attn)])
+            self.cross_ffn_layers = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(retrieval_hidden, retrieval_hidden * 2), nn.GELU(),
+                    nn.Dropout(retrieval_dropout),
+                    nn.Linear(retrieval_hidden * 2, retrieval_hidden),
+                    nn.LayerNorm(retrieval_hidden))
+                for _ in range(n_cross_attn)])
+
+            self.direct_transfer = DirectTransferHead(
+                retrieval_hidden, n_shifts, retrieval_dropout)
+
+            self.retrieval_gate = nn.Sequential(
+                nn.Linear(retrieval_hidden + base_encoder_dim + 1, 192), nn.GELU(),
+                nn.Linear(192, 1), nn.Sigmoid())
 
         # Initialize output layers to zero
         with torch.no_grad():
@@ -691,6 +685,9 @@ class ShiftPredictorWithRetrieval(nn.Module):
         # ========== Structure-only prediction ==========
         struct_pred = self.struct_head(base_encoding)  # (B, n_shifts)
 
+        if not self.use_retrieval:
+            return struct_pred
+
         # ========== Retrieval pathway ==========
         # Only use neighbors of the same amino acid type as the query
         same_aa_mask = (retrieved_residue_codes == query_residue_code.unsqueeze(1))
@@ -761,10 +758,14 @@ def create_model(
     n_atom_types: int,
     n_shifts: int = 49,
     **kwargs,
-) -> ShiftPredictorWithRetrieval:
+) -> ShiftPredictor:
     """Create model with sensible defaults from config."""
-    return ShiftPredictorWithRetrieval(
+    return ShiftPredictor(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
         **kwargs,
     )
+
+
+# Backward compatibility alias
+ShiftPredictorWithRetrieval = ShiftPredictor

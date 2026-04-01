@@ -65,42 +65,12 @@ from config import (
     STRUCT_DIST_COLS, STRUCT_SC_COLS, N_STRUCT_FEATURES,
     BOND_GEOM_COLS, N_BOND_GEOM,
 )
-
-
-# ============================================================================
-# Utility Functions (same as dataset.py)
-# ============================================================================
-
-def parse_distance_columns(columns):
-    """Parse distance column names to extract atom pairs."""
-    dist_cols = []
-    pattern = re.compile(r'^dist_([A-Z0-9]+)_([A-Z0-9]+)$')
-    for col in columns:
-        match = pattern.match(col)
-        if match:
-            atom1, atom2 = match.groups()
-            dist_cols.append((col, atom1, atom2))
-    return dist_cols
-
-
-def build_atom_vocabulary(dist_col_info=None):
-    """Return canonical atom vocabulary from config.
-
-    Always returns the same vocabulary regardless of which distance columns
-    are present, ensuring caches and models are interchangeable across datasets.
-    """
-    from config import ATOM_TYPES, ATOM_TO_IDX
-    return list(ATOM_TYPES), dict(ATOM_TO_IDX)
-
-
-def parse_shift_columns(columns):
-    """Get chemical shift columns."""
-    return sorted([c for c in columns if c.endswith('_shift')])
-
-
-def get_dssp_columns(df_columns):
-    """Get available DSSP columns."""
-    return [c for c in DSSP_COLS if c in df_columns]
+from dataset import (
+    parse_distance_columns,
+    build_atom_vocabulary,
+    parse_shift_columns,
+    get_dssp_columns,
+)
 
 
 def extract_struct_features(pdf, start_idx, n, flat_struct):

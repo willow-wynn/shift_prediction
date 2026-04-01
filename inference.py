@@ -4,14 +4,17 @@ Single-PDB inference: predict chemical shifts from a PDB structure.
 
 Usage:
     python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb
-    python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb --chain A
-    python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb -o predictions.csv
+    python inference.py --model data/checkpoints/best_fold1.pt --pdb 1UBQ --chain A -o shifts.csv
+    python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb --no_retrieval
+    python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb --index_dir data/retrieval_indices
 """
 
 import argparse
 import json
 import os
 import sys
+import tempfile
+import urllib.request
 import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -373,30 +376,127 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
 
 
 # ============================================================================
-# Retrieval (optional — falls back gracefully if unavailable)
+# Retrieval
 # ============================================================================
 
-def get_retrieval_features(residues, n_shifts, k_retrieved, esm_embeddings=None,
-                           retriever=None):
-    """Add retrieval features to residue dicts.
-
-    If ESM embeddings and retriever are provided, performs actual retrieval.
-    Otherwise, fills with zeros (model falls back to structure-only via gating).
-    """
+def _fill_empty_retrieval(residues, n_shifts, k_retrieved):
+    """Fill retrieval tensors with zeros (structure-only fallback)."""
     K = k_retrieved
-
     for res in residues:
-        if esm_embeddings is not None and retriever is not None:
-            # TODO: implement live retrieval
-            pass
-
-        # Fallback: no retrieval (model will use structure-only pathway)
         res['retrieved_shifts'] = torch.zeros(K, n_shifts, dtype=torch.float32)
         res['retrieved_shift_masks'] = torch.zeros(K, n_shifts, dtype=torch.bool)
         res['retrieved_residue_codes'] = torch.zeros(K, dtype=torch.long)
         res['retrieved_distances'] = torch.zeros(K, dtype=torch.float32)
         res['retrieved_valid'] = torch.zeros(K, dtype=torch.bool)
         res['neighbor_struct'] = torch.zeros(K, N_STRUCT_FEATURES, dtype=torch.float32)
+
+
+def extract_base_encodings(model, residues, device, n_shifts, k_retrieved, batch_size=64):
+    """Run a structure-only forward pass and capture base_encoding via hook."""
+    _fill_empty_retrieval(residues, n_shifts, k_retrieved)
+
+    captured = {}
+    def hook_fn(module, inp, out):
+        captured['base_encoding'] = inp[0].detach().cpu()
+    handle = model.struct_head[0].register_forward_hook(hook_fn)
+
+    model.eval()
+    all_encodings = []
+    for i in range(0, len(residues), batch_size):
+        batch_residues = residues[i:i + batch_size]
+        batch = {}
+        keys = [k for k in batch_residues[0].keys()
+                if k not in ('residue_id', 'residue_name') and isinstance(batch_residues[0][k], torch.Tensor)]
+        for k in keys:
+            batch[k] = torch.stack([r[k] for r in batch_residues])
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+        with torch.no_grad():
+            ctx = autocast('cuda') if device == 'cuda' else nullcontext()
+            with ctx:
+                model(**batch)
+        all_encodings.append(captured['base_encoding'].numpy())
+
+    handle.remove()
+    return np.concatenate(all_encodings, axis=0)
+
+
+def get_retrieval_features(model, residues, device, n_shifts, k_retrieved, stats,
+                           shift_cols, index_dir, batch_size=64):
+    """Compute embeddings, query FAISS, and populate retrieval tensors.
+
+    Falls back to structure-only if index_dir is not available.
+    """
+    if index_dir is None or not os.path.exists(index_dir):
+        print("  No retrieval index found — using structure-only mode")
+        _fill_empty_retrieval(residues, n_shifts, k_retrieved)
+        return residues
+
+    # Step 1: Extract base_encoding embeddings via structure-only forward pass
+    print("  Extracting structure embeddings for retrieval...")
+    embeddings = extract_base_encodings(model, residues, device, n_shifts,
+                                        k_retrieved, batch_size)
+
+    # Step 2: Load retriever and query
+    from retrieval import Retriever
+    import faiss
+
+    # Use fold 1 index (at inference on new proteins, fold doesn't matter)
+    fold_indices = [f for f in os.listdir(index_dir) if f.startswith('index_exclude_fold_')]
+    if not fold_indices:
+        print("  No FAISS index found — using structure-only mode")
+        _fill_empty_retrieval(residues, n_shifts, k_retrieved)
+        return residues
+
+    # Pick any fold's index
+    fold_num = int(fold_indices[0].split('_')[-1].replace('.faiss', ''))
+    print(f"  Loading retrieval index (fold {fold_num} excluded)...")
+    retriever = Retriever(index_dir, exclude_fold=fold_num, k=k_retrieved)
+
+    # Query with a dummy BMRB ID (new protein won't match anything in the index)
+    query_bmrb_ids = ['__inference__'] * len(residues)
+    embeddings = embeddings.astype(np.float32)
+
+    print(f"  Retrieving {k_retrieved} neighbors for {len(residues)} residues...")
+    results = retriever.retrieve(embeddings, query_bmrb_ids, k=k_retrieved)
+
+    # Step 3: Build normalization tensors from stats
+    means = []
+    stds = []
+    for col in shift_cols:
+        if col in stats:
+            means.append(stats[col]['mean'])
+            stds.append(max(stats[col]['std'], 1e-6))
+        else:
+            means.append(0.0)
+            stds.append(1.0)
+    means_t = torch.tensor(means, dtype=torch.float32)
+    stds_t = torch.tensor(stds, dtype=torch.float32)
+
+    # Step 4: Populate retrieval tensors
+    K = k_retrieved
+    for i, res in enumerate(residues):
+        shifts = torch.from_numpy(results['shifts'][i].astype(np.float32))
+        shift_masks = torch.from_numpy(results['shift_masks'][i])
+
+        # Normalize retrieved shifts to match training
+        shifts = (shifts - means_t.unsqueeze(0)) / stds_t.unsqueeze(0)
+        shifts = torch.clamp(shifts, -10, 10)
+        shifts = torch.where(torch.isnan(shifts), torch.zeros_like(shifts), shifts)
+
+        res['retrieved_shifts'] = shifts
+        res['retrieved_shift_masks'] = shift_masks
+        res['retrieved_residue_codes'] = torch.from_numpy(
+            results['residue_codes'][i].astype(np.int64))
+        res['retrieved_distances'] = torch.from_numpy(
+            results['distances'][i].astype(np.float32))
+        res['retrieved_valid'] = torch.from_numpy(
+            (results['indices'][i] >= 0).astype(bool))
+        res['neighbor_struct'] = torch.zeros(K, N_STRUCT_FEATURES, dtype=torch.float32)
+
+    n_valid = sum(int(res['retrieved_valid'].sum()) for res in residues)
+    avg_valid = n_valid / max(len(residues), 1)
+    print(f"  Retrieved avg {avg_valid:.1f}/{K} valid neighbors per residue")
 
     return residues
 
@@ -406,7 +506,13 @@ def get_retrieval_features(residues, n_shifts, k_retrieved, esm_embeddings=None,
 # ============================================================================
 
 def predict(model, residues, device, stats, shift_cols, batch_size=64):
-    """Run model inference on extracted features."""
+    """Run model inference on extracted features.
+
+    Denormalizes using per-AA stats when available (matching training normalization),
+    falling back to global stats otherwise.
+    """
+    per_aa_stats = stats.get('per_aa', {})
+
     model.eval()
     all_preds = []
 
@@ -427,11 +533,17 @@ def predict(model, residues, device, stats, shift_cols, batch_size=64):
             with ctx:
                 pred = model(**batch)  # (B, n_shifts)
 
-        # Denormalize
+        # Denormalize using per-AA stats when available
         pred_np = pred.cpu().numpy()
-        for si, col in enumerate(shift_cols):
-            if col in stats:
-                pred_np[:, si] = pred_np[:, si] * stats[col]['std'] + stats[col]['mean']
+        for j, res in enumerate(batch_residues):
+            aa_idx = int(res['query_residue_code'])
+            aa_name = STANDARD_RESIDUES[aa_idx] if aa_idx < len(STANDARD_RESIDUES) else None
+            for si, col in enumerate(shift_cols):
+                aa_s = per_aa_stats.get(aa_name, {}).get(col) if aa_name else None
+                if aa_s:
+                    pred_np[j, si] = pred_np[j, si] * aa_s['std'] + aa_s['mean']
+                elif col in stats:
+                    pred_np[j, si] = pred_np[j, si] * stats[col]['std'] + stats[col]['mean']
 
         all_preds.append(pred_np)
 
@@ -446,12 +558,17 @@ def main():
     parser = argparse.ArgumentParser(
         description='Predict chemical shifts from a PDB structure')
     parser.add_argument('--model', required=True, help='Model checkpoint path')
-    parser.add_argument('--pdb', required=True, help='PDB file path')
+    parser.add_argument('--pdb', required=True,
+                        help='PDB file path or 4-letter PDB ID (e.g. 1UBQ)')
     parser.add_argument('--chain', default=None, help='Chain ID (default: all)')
     parser.add_argument('-o', '--output', default=None,
                         help='Output CSV path (default: stdout)')
     parser.add_argument('--device', default=None, help='Device (auto-detected)')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--index_dir', default=None,
+                        help='Retrieval index directory (auto-detected from checkpoint if not set)')
+    parser.add_argument('--no_retrieval', action='store_true',
+                        help='Disable retrieval (structure-only prediction)')
     parser.add_argument('--backbone_only', action='store_true',
                         help='Only output backbone shifts (CA, CB, C, N, H, HA)')
     args = parser.parse_args()
@@ -464,8 +581,8 @@ def main():
     print("=" * 60)
     print("  Chemical Shift Prediction from PDB")
     print("=" * 60)
-    print(f"  Model: {args.model}")
-    print(f"  PDB:   {args.pdb}")
+    print(f"  Model:  {args.model}")
+    print(f"  Input:  {args.pdb}")
     print(f"  Chain:  {args.chain or 'all'}")
     print(f"  Device: {device}")
 
@@ -478,16 +595,49 @@ def main():
     k_retrieved = info['k_retrieved']
     print(f"  Epoch {info['epoch']}, {len(shift_cols)} shift types, {info['n_atom_types']} atom types")
 
+    # Resolve PDB path: download if given a PDB ID
+    pdb_path = args.pdb
+    _tmpfile = None
+    if not os.path.exists(pdb_path) and len(pdb_path) == 4 and pdb_path.isalnum():
+        pdb_id = pdb_path.upper()
+        url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
+        print(f"\n  Downloading {pdb_id} from RCSB...")
+        try:
+            _tmpfile = tempfile.NamedTemporaryFile(suffix='.pdb', delete=False)
+            urllib.request.urlretrieve(url, _tmpfile.name)
+            pdb_path = _tmpfile.name
+            print(f"  Downloaded to {pdb_path}")
+        except Exception as e:
+            print(f"  ERROR: Failed to download {pdb_id}: {e}")
+            sys.exit(1)
+
     # Extract features from PDB
     print(f"\nExtracting features...")
-    residues, res_ids = extract_features_from_pdb(args.pdb, chain_id=args.chain,
+    residues, res_ids = extract_features_from_pdb(pdb_path, chain_id=args.chain,
                                                    atom_to_idx=atom_to_idx)
     if not residues:
         print("ERROR: No features extracted")
         sys.exit(1)
 
-    # Add retrieval features (zeros for now — structure-only mode)
-    residues = get_retrieval_features(residues, len(shift_cols), k_retrieved)
+    # Add retrieval features
+    index_dir = args.index_dir
+    if not args.no_retrieval and index_dir is None:
+        # Auto-detect: check common locations (newest first)
+        for candidate in [
+            'data/struct_retrieval_v2/retrieval_indices',
+            'data/struct_retrieval/retrieval_indices',
+            'data/retrieval_indices',
+        ]:
+            if os.path.exists(candidate):
+                index_dir = candidate
+                break
+
+    if args.no_retrieval:
+        index_dir = None
+
+    residues = get_retrieval_features(
+        model, residues, device, len(shift_cols), k_retrieved,
+        stats, shift_cols, index_dir, args.batch_size)
 
     # Run inference
     print(f"\nRunning inference on {len(residues)} residues...")
@@ -530,6 +680,10 @@ def main():
         print(f"  {name:3s}: mean={np.mean(vals):.2f}  std={np.std(vals):.2f}  "
               f"range=[{np.min(vals):.1f}, {np.max(vals):.1f}]")
     print("=" * 60)
+
+    # Clean up downloaded PDB
+    if _tmpfile is not None:
+        os.unlink(_tmpfile.name)
 
 
 if __name__ == '__main__':

@@ -26,35 +26,44 @@ python 01_build_datasets.py --online
 
 # 2. Extract ESM-2 embeddings (2560-dim per residue)
 python 03_extract_esm_embeddings.py
-
-# (Optional) Cluster sequences at 90% identity
-# python cluster_sequences.py  # requires MMseqs2
 ```
 
 ### Training
 
-```bash
-# Build caches + train (hybrid dataset, fold 1 held out)
-python main.py --data hybrid --fold 1 --epochs 150
+All training modes use a single script:
 
-# Or step by step:
+```bash
+# Full retrieval model (default)
+python train.py --data hybrid --fold 1 --epochs 150
+
+# Structure-only (no retrieval components)
+python train.py --data hybrid --fold 1 --epochs 200 --structure_only
+
+# Frozen base encoder, train retrieval only
+python train.py --data hybrid --fold 1 --epochs 150 \
+    --freeze_base --base_checkpoint runs/hybrid_struct_fold1/checkpoints/best.pt
+```
+
+Caches are built automatically if missing. Step-by-step cache building:
+
+```bash
 python 04_build_retrieval_index.py     # FAISS indices
 python 05_build_training_cache.py      # Memory-mapped caches
-python 06_train.py --fold 1            # Train
-python 07_evaluate.py --model data/checkpoints/best_fold1.pt --fold 1
 ```
+
+Output goes to `runs/<run_name>/checkpoints/`.
 
 ### Structure-bootstrapped retrieval (no ESM needed)
 
-Train a pure structure model, extract its embeddings, use those for retrieval:
+Train a structure model, extract its embeddings, use those for retrieval:
 
 ```bash
 # Phase 1: Train structure-only model
-python train_structure_only.py --fold 1 --epochs 200
+python train.py --data hybrid --fold 1 --epochs 200 --structure_only
 
 # Phase 2: Extract structure embeddings
 python 03b_extract_struct_embeddings.py \
-    --checkpoint data/struct_only/checkpoints/best_struct_fold1.pt \
+    --checkpoint runs/hybrid_struct_fold1/checkpoints/best.pt \
     --output data/struct_retrieval/struct_embeddings.h5
 
 # Phase 3: Build FAISS indices + caches from structure embeddings
@@ -65,23 +74,32 @@ python 05_build_training_cache.py --embeddings data/struct_retrieval/struct_embe
     --output_dir data/struct_retrieval/cache
 
 # Phase 4: Train retrieval with frozen base encoder
-python train_retrieval_frozen.py \
-    --struct_checkpoint data/struct_only/checkpoints/best_struct_fold1.pt \
-    --cache_dir data/struct_retrieval/cache --fold 1 --epochs 150
+python train.py --data hybrid --fold 1 --epochs 150 \
+    --freeze_base --base_checkpoint runs/hybrid_struct_fold1/checkpoints/best.pt
 ```
 
 ### Inference
 
 ```bash
-python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb
-python inference.py --model data/checkpoints/best_fold1.pt --pdb protein.pdb --chain A -o shifts.csv
+# From a PDB file
+python inference.py --model runs/hybrid_retrieval_fold1/checkpoints/best.pt --pdb protein.pdb
+
+# From a PDB ID (downloads from RCSB)
+python inference.py --model runs/hybrid_retrieval_fold1/checkpoints/best.pt --pdb 1UBQ --chain A
+
+# With retrieval (specify index directory)
+python inference.py --model checkpoint.pt --pdb protein.pdb \
+    --index_dir data/struct_retrieval/retrieval_indices
+
+# Save to CSV
+python inference.py --model checkpoint.pt --pdb protein.pdb -o results/shifts.csv
 ```
 
 ## Architecture
 
 **Base encoder:** Per-residue distance attention over all intramolecular atom pairs → 5-layer residual CNN over ±5 residue window → multi-head cross-attention over K=5 spatial neighbors (4 heads, min 4 residue separation; CNN center output queries against neighbor keys/values) → 1472-dim encoding
 
-**Retrieval pathway:** FAISS nearest-neighbor retrieval (K=32, same-protein exclusion) → neighbor encoder → self-attention (2 layers) → shift-specific cross-attention (3 layers) → direct transfer head → learned gating blends retrieval with structure-only prediction
+**Retrieval pathway (optional):** FAISS nearest-neighbor retrieval (K=32, same-protein exclusion) → neighbor encoder → self-attention (2 layers) → shift-specific cross-attention (3 layers) → direct transfer head → learned gating blends retrieval with structure-only prediction
 
 **Features per residue:** 88 atom-type distance pairs, residue/SS/mismatch embeddings, DSSP hydrogen bond geometry, phi/psi angles, inter-residue peptide bond lengths and CA-CA distances
 
@@ -102,17 +120,13 @@ Three structure sources via `--data`:
 |--------|-------------|
 | `00_fetch_bmrb_shifts.py` | Download chemical shifts from BMRB |
 | `01_build_datasets.py` | Build structure datasets from PDB/AlphaFold |
-| `cluster_sequences.py` | MMseqs2 sequence clustering (optional) |
 | `03_extract_esm_embeddings.py` | ESM-2 embedding extraction |
 | `03b_extract_struct_embeddings.py` | Structure model embedding extraction |
 | `04_build_retrieval_index.py` | FAISS index building |
 | `05_build_training_cache.py` | Memory-mapped training cache |
-| `06_train.py` | Model training |
+| `train.py` | Unified training (structure-only, retrieval, frozen-base) |
 | `07_evaluate.py` | Model evaluation with baselines and plots |
-| `main.py` | Unified cache + train pipeline |
-| `inference.py` | Single-PDB prediction |
-| `train_structure_only.py` | Structure-only model (no retrieval) |
-| `train_retrieval_frozen.py` | Retrieval training with frozen base encoder |
+| `inference.py` | Single-PDB prediction (file or PDB ID) |
 | `08_train_imputation.py` | Shift imputation model training |
 | `09_eval_imputation.py` | Imputation evaluation |
 
@@ -120,8 +134,9 @@ Three structure sources via `--data`:
 | Module | Description |
 |--------|-------------|
 | `config.py` | All constants, paths, hyperparameters |
-| `model.py` | Neural network architecture |
+| `model.py` | Neural network architecture (`ShiftPredictor`) |
 | `dataset.py` | Memory-mapped cached dataset |
+| `training_utils.py` | Training loop, loss functions, freeze helpers |
 | `retrieval.py` | FAISS retrieval with same-protein exclusion |
 | `pdb_utils.py` | PDB parsing, DSSP |
 | `distance_features.py` | Intramolecular distance computation |
@@ -140,5 +155,4 @@ All in `config.py`. Key settings:
 
 - Model: CNN [256, 512, 768, 1024, 1280], K=5 spatial neighbors, K=32 retrieved
 - Training: lr=2e-4, batch=1024, Huber δ=0.5, cosine annealing (T₀=50, T_mult=2)
-- ESM-2: esm2_t36_3B_UR50D, layer 36, 2560-dim
 - 88 canonical atom types, 49 shift types
