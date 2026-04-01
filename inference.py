@@ -100,7 +100,7 @@ def load_model(checkpoint_path, device):
 # Feature Extraction from PDB
 # ============================================================================
 
-def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
+def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None, dssp_stats=None):
     """Extract all features needed for the model from a PDB file.
 
     Returns:
@@ -230,7 +230,7 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
                 if a1 in atom_to_idx and a2 in atom_to_idx:
                     atom1_idx[w, n_valid] = atom_to_idx[a1]
                     atom2_idx[w, n_valid] = atom_to_idx[a2]
-                    distances[w, n_valid] = val
+                    distances[w, n_valid] = max(-5.0, min(val / 10.0, 10.0))
                     dist_mask[w, n_valid] = True
                     n_valid += 1
 
@@ -264,7 +264,13 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
                 ss_idx[w] = SS_TO_IDX.get(ss, SS_TO_IDX.get('UNK', N_SS_TYPES))
                 for di, dcol in enumerate(DSSP_COLS):
                     val = dssp_entry.get(dcol, 0.0)
-                    dssp_features[w, di] = float(val) if val is not None else 0.0
+                    val = float(val) if val is not None else 0.0
+                    if dssp_stats and dcol in dssp_stats:
+                        mean = dssp_stats[dcol]['mean']
+                        std = dssp_stats[dcol]['std']
+                        val = (val - mean) / std if std > 1e-6 else val - mean
+                        val = max(-10.0, min(val, 10.0))
+                    dssp_features[w, di] = val
 
         # Spatial neighbors
         nb_info = neighbors.get(center_rid, {'ids': [-1]*K_SPATIAL_NEIGHBORS,
@@ -319,7 +325,7 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None):
                     if a1 in atom_to_idx and a2 in atom_to_idx:
                         neighbor_atom1_idx[k, n_valid] = atom_to_idx[a1]
                         neighbor_atom2_idx[k, n_valid] = atom_to_idx[a2]
-                        neighbor_distances[k, n_valid] = val
+                        neighbor_distances[k, n_valid] = max(-5.0, min(val / 10.0, 10.0))
                         neighbor_dist_mask[k, n_valid] = True
                         n_valid += 1
 
@@ -611,10 +617,21 @@ def main():
             print(f"  ERROR: Failed to download {pdb_id}: {e}")
             sys.exit(1)
 
+    # Load DSSP normalization stats
+    dssp_stats = None
+    dssp_stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dssp_stats.json')
+    if os.path.exists(dssp_stats_path):
+        with open(dssp_stats_path) as f:
+            dssp_stats = json.load(f)
+        print(f"  DSSP stats loaded ({len(dssp_stats)} features)")
+    else:
+        print(f"  WARNING: No DSSP stats found at {dssp_stats_path} — DSSP features will not be normalized")
+
     # Extract features from PDB
     print(f"\nExtracting features...")
     residues, res_ids = extract_features_from_pdb(pdb_path, chain_id=args.chain,
-                                                   atom_to_idx=atom_to_idx)
+                                                   atom_to_idx=atom_to_idx,
+                                                   dssp_stats=dssp_stats)
     if not residues:
         print("ERROR: No features extracted")
         sys.exit(1)
