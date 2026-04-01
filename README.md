@@ -10,7 +10,6 @@ pip install -r requirements.txt
 
 External tools needed:
 - [DSSP](https://github.com/PDB-REDO/dssp) (secondary structure assignment)
-- [MMseqs2](https://github.com/soedinglab/MMseqs2) (sequence clustering, step 02)
 
 ## Pipeline
 
@@ -25,11 +24,11 @@ python 00_fetch_bmrb_shifts.py
 # 1. Build datasets: find PDB/AlphaFold structures, align, compute features
 python 01_build_datasets.py --online
 
-# 2. Cluster sequences at 90% identity (for retrieval exclusion)
-python cluster_sequences.py
-
-# 3. Extract ESM-2 embeddings (2560-dim per residue)
+# 2. Extract ESM-2 embeddings (2560-dim per residue)
 python 03_extract_esm_embeddings.py
+
+# (Optional) Cluster sequences at 90% identity
+# python cluster_sequences.py  # requires MMseqs2
 ```
 
 ### Training
@@ -103,7 +102,7 @@ Three structure sources via `--data`:
 |--------|-------------|
 | `00_fetch_bmrb_shifts.py` | Download chemical shifts from BMRB |
 | `01_build_datasets.py` | Build structure datasets from PDB/AlphaFold |
-| `cluster_sequences.py` | MMseqs2 sequence clustering |
+| `cluster_sequences.py` | MMseqs2 sequence clustering (optional) |
 | `03_extract_esm_embeddings.py` | ESM-2 embedding extraction |
 | `03b_extract_struct_embeddings.py` | Structure model embedding extraction |
 | `04_build_retrieval_index.py` | FAISS index building |
@@ -123,7 +122,7 @@ Three structure sources via `--data`:
 | `config.py` | All constants, paths, hyperparameters |
 | `model.py` | Neural network architecture |
 | `dataset.py` | Memory-mapped cached dataset |
-| `retrieval.py` | FAISS retrieval with identity exclusion |
+| `retrieval.py` | FAISS retrieval with same-protein exclusion |
 | `pdb_utils.py` | PDB parsing, DSSP |
 | `distance_features.py` | Intramolecular distance computation |
 | `spatial_neighbors.py` | KD-tree spatial neighbor finder |
