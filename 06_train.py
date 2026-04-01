@@ -641,6 +641,10 @@ def main():
         torch.cuda.empty_cache()
     gc.collect()
 
+    # ========== Compile model ==========
+    if device == 'cuda':
+        model = torch.compile(model)
+
     # ========== Optimizer and scheduler ==========
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(

@@ -333,6 +333,9 @@ def main():
     n_total = sum(p.numel() for p in model.parameters())
     print(f"  Total params: {n_total:,}  Trainable: {n_trainable:,}")
 
+    if device == 'cuda':
+        model = torch.compile(model)
+
     # Only optimize trainable params
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(

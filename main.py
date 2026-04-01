@@ -287,6 +287,9 @@ def run_training(args, data_dir, cache_dir, output_dir):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {n_params:,}")
 
+    if device == 'cuda':
+        model = torch.compile(model)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=50, T_mult=2, eta_min=args.lr * 0.01)

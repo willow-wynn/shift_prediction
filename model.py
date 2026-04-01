@@ -129,10 +129,12 @@ class SpatialNeighborAttention(nn.Module):
 
     def __init__(self, n_residue_types, n_ss_types, k_neighbors=5,
                  embed_dim=64, hidden_dim=256, dropout=0.30,
-                 dist_attn_hidden=None):
+                 dist_attn_hidden=None, query_dim=None, n_heads=4):
         super().__init__()
 
         self.k = k_neighbors
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
 
         self.residue_embed = nn.Embedding(n_residue_types + 1, embed_dim)
         self.ss_embed = nn.Embedding(n_ss_types + 1, embed_dim // 2)
@@ -149,19 +151,11 @@ class SpatialNeighborAttention(nn.Module):
             self.dist_proj = None
             combined_dim = embed_dim + embed_dim // 2 + embed_dim // 2
 
-        self.attn_score = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-        self.value_net = nn.Sequential(
-            nn.Linear(combined_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        self.q_proj = nn.Linear(query_dim, hidden_dim)
+        self.k_proj = nn.Linear(combined_dim, hidden_dim)
+        self.v_proj = nn.Linear(combined_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.attn_drop = nn.Dropout(dropout)
 
         self.fallback_embed = nn.Parameter(torch.zeros(hidden_dim))
         self.out_dim = hidden_dim
@@ -169,6 +163,7 @@ class SpatialNeighborAttention(nn.Module):
     def forward(self, neighbor_res_idx, neighbor_ss_idx,
                 neighbor_dist, neighbor_seq_sep, neighbor_angles,
                 neighbor_valid,
+                query_encoding=None,
                 neighbor_dist_embeddings=None):
         """
         Args:
@@ -178,6 +173,7 @@ class SpatialNeighborAttention(nn.Module):
             neighbor_seq_sep: (B, K) sequence separations
             neighbor_angles: (B, K, 4) sin/cos of phi/psi
             neighbor_valid: (B, K) validity mask
+            query_encoding: (B, query_dim) center residue encoding from CNN
             neighbor_dist_embeddings: (B, K, dist_attn_hidden) structural embeddings from distance features
         """
         B = neighbor_res_idx.size(0)
@@ -206,12 +202,21 @@ class SpatialNeighborAttention(nn.Module):
 
         any_valid = neighbor_valid.any(dim=1)
 
-        scores = self.attn_score(combined).squeeze(-1)
-        scores = scores.masked_fill(~neighbor_valid, -1e4)
-        attn_weights = F.softmax(scores, dim=-1)
+        # Multi-head cross-attention: center queries against neighbor keys/values
+        H, HD = self.n_heads, self.head_dim
+        K = combined.size(1)
 
-        values = self.value_net(combined)
-        output = (values * attn_weights.unsqueeze(-1)).sum(dim=1)
+        Q = self.q_proj(query_encoding).view(B, 1, H, HD).transpose(1, 2)  # (B, H, 1, HD)
+        Kp = self.k_proj(combined).view(B, K, H, HD).transpose(1, 2)       # (B, H, K, HD)
+        V = self.v_proj(combined).view(B, K, H, HD).transpose(1, 2)        # (B, H, K, HD)
+
+        scores = torch.matmul(Q, Kp.transpose(-2, -1)) / (HD ** 0.5)      # (B, H, 1, K)
+        scores = scores.masked_fill(~neighbor_valid.unsqueeze(1).unsqueeze(2), -1e4)
+        attn_weights = self.attn_drop(F.softmax(scores, dim=-1))
+
+        out = torch.matmul(attn_weights, V)                                # (B, H, 1, HD)
+        out = out.transpose(1, 2).contiguous().view(B, H * HD)             # (B, hidden_dim)
+        output = self.out_proj(out)
 
         fallback = self.fallback_embed.unsqueeze(0).expand(B, -1)
         output = torch.where(any_valid.unsqueeze(-1), output, fallback)
@@ -437,7 +442,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
         n_ss_types: int = N_SS_TYPES,
         n_mismatch_types: int = N_MISMATCH_TYPES,
         n_dssp: int = len(DSSP_COLS),
-        n_shifts: int = 6,
+        n_shifts: int = 49,
         dist_attn_embed: int = DIST_ATTN_EMBED,
         dist_attn_hidden: int = DIST_ATTN_HIDDEN,
         cnn_channels: list = None,
@@ -512,6 +517,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
             hidden_dim=spatial_hidden,
             dropout=0.30,
             dist_attn_hidden=dist_attn_hidden,
+            query_dim=cnn_out_dim,
         )
 
         base_encoder_dim = cnn_out_dim + spatial_hidden
@@ -676,6 +682,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
             neighbor_res_idx, neighbor_ss_idx,
             neighbor_dist, neighbor_seq_sep, neighbor_angles,
             neighbor_valid,
+            query_encoding=x_center,
             neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
 
@@ -752,7 +759,7 @@ class ShiftPredictorWithRetrieval(nn.Module):
 
 def create_model(
     n_atom_types: int,
-    n_shifts: int = 6,
+    n_shifts: int = 49,
     **kwargs,
 ) -> ShiftPredictorWithRetrieval:
     """Create model with sensible defaults from config."""

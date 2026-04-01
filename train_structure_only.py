@@ -74,7 +74,7 @@ class StructureOnlyModel(nn.Module):
         n_ss_types=N_SS_TYPES,
         n_mismatch_types=N_MISMATCH_TYPES,
         n_dssp=len(DSSP_COLS),
-        n_shifts=6,
+        n_shifts=49,
         dist_attn_embed=DIST_ATTN_EMBED,
         dist_attn_hidden=DIST_ATTN_HIDDEN,
         cnn_channels=None,
@@ -140,6 +140,7 @@ class StructureOnlyModel(nn.Module):
             hidden_dim=spatial_hidden,
             dropout=0.30,
             dist_attn_hidden=dist_attn_hidden,
+            query_dim=cnn_out_dim,
         )
 
         base_encoder_dim = cnn_out_dim + spatial_hidden
@@ -236,6 +237,7 @@ class StructureOnlyModel(nn.Module):
             neighbor_res_idx, neighbor_ss_idx,
             neighbor_dist, neighbor_seq_sep, neighbor_angles,
             neighbor_valid,
+            query_encoding=x_center,
             neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
 
@@ -475,6 +477,9 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters: {n_params:,}")
+
+    if device == 'cuda':
+        model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(

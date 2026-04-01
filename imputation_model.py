@@ -478,6 +478,7 @@ class ShiftImputationModel(nn.Module):
             embed_dim=64,
             hidden_dim=spatial_hidden,
             dropout=0.30,
+            query_dim=struct_cnn_out,
         )
 
         base_encoder_dim = struct_cnn_out + spatial_hidden
@@ -587,6 +588,7 @@ class ShiftImputationModel(nn.Module):
             neighbor_res_idx, neighbor_ss_idx,
             neighbor_dist, neighbor_seq_sep, neighbor_angles,
             neighbor_valid,
+            query_encoding=x_center,
         )
 
         base_encoding = torch.cat([x_center, x_spatial], dim=-1)
