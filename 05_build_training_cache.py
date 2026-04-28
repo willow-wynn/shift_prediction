@@ -503,140 +503,172 @@ def build_cache_for_fold(
     gc.collect()
 
     # ========== Build retrieval data (with checkpoint/resume) ==========
-    print("      Building retrieval data (in batches)...")
+    no_retrieval = (embedding_lookup is None or retriever is None)
 
     rd = cache_path / 'retrieval'
     checkpoint_file = rd / '_checkpoint.txt'
 
-    resume_from = 0
-    if checkpoint_file.exists():
-        try:
-            resume_from = int(checkpoint_file.read_text().strip())
-            print(f"      RESUMING from batch starting at index {resume_from}")
-        except Exception:
-            resume_from = 0
-
-    mmap_mode = 'r+' if resume_from > 0 else 'w+'
-
-    retrieved_shifts = np.lib.format.open_memmap(
-        rd / 'shifts.npy', mode=mmap_mode, dtype=np.float16,
-        shape=(total_residues, K, n_shifts),
-    )
-    retrieved_shift_masks = np.lib.format.open_memmap(
-        rd / 'shift_masks.npy', mode=mmap_mode, dtype=bool,
-        shape=(total_residues, K, n_shifts),
-    )
-    retrieved_residue_codes = np.lib.format.open_memmap(
-        rd / 'residue_codes.npy', mode=mmap_mode, dtype=np.int16,
-        shape=(total_residues, K),
-    )
-    retrieved_distances = np.lib.format.open_memmap(
-        rd / 'distances.npy', mode=mmap_mode, dtype=np.float16,
-        shape=(total_residues, K),
-    )
-    retrieved_valid = np.lib.format.open_memmap(
-        rd / 'valid.npy', mode=mmap_mode, dtype=bool,
-        shape=(total_residues, K),
-    )
-    neighbor_struct = np.lib.format.open_memmap(
-        rd / 'neighbor_struct.npy', mode=mmap_mode, dtype=np.float16,
-        shape=(total_residues, K, N_STRUCT_FEATURES),
-    )
-
-    # Build a global_idx -> struct_features lookup for neighbor struct
-    # (flat_query_struct is still in memory from the structural pass)
-
-    # Retrieval stats accumulators
+    # Retrieval stats accumulators (always defined)
     total_queries = 0
     total_valid_queries = 0
     total_valid_retrieved = 0
     sim_sum = 0.0
     retrieval_failures = 0
 
-    total_batches = (total_residues + retrieval_batch_size - 1) // retrieval_batch_size
-    start_batch = resume_from // retrieval_batch_size
+    if no_retrieval:
+        # Skip allocating the multi-GB retrieval arrays entirely.
+        # The dataset will detect missing files and synthesize zeros in __getitem__.
+        print("      No-retrieval mode: skipping retrieval array allocation.")
+        # Make sure stale files from prior builds are removed so the dataset
+        # correctly detects "no retrieval".
+        for fname in ('shifts.npy', 'shift_masks.npy', 'residue_codes.npy',
+                      'distances.npy', 'valid.npy', 'neighbor_struct.npy',
+                      '_checkpoint.txt'):
+            fp = rd / fname
+            if fp.exists():
+                fp.unlink()
+    else:
+        print("      Building retrieval data (in batches)...")
 
-    for batch_start in tqdm(
-        range(resume_from, total_residues, retrieval_batch_size),
-        desc="      Retrieval batches",
-        initial=start_batch,
-        total=total_batches,
-    ):
-        batch_end = min(batch_start + retrieval_batch_size, total_residues)
-        batch_indices = list(range(batch_start, batch_end))
+        resume_from = 0
+        if checkpoint_file.exists():
+            try:
+                resume_from = int(checkpoint_file.read_text().strip())
+                print(f"      RESUMING from batch starting at index {resume_from}")
+            except Exception:
+                resume_from = 0
 
-        batch_bmrb_ids = []
-        batch_res_ids = []
+        mmap_mode = 'r+' if resume_from > 0 else 'w+'
 
-        for global_idx in batch_indices:
-            bmrb_id = idx_to_bmrb[str(global_idx)]
-            rid = global_to_resid[str(global_idx)]
-            batch_bmrb_ids.append(bmrb_id)
-            batch_res_ids.append(rid)
+        retrieved_shifts = np.lib.format.open_memmap(
+            rd / 'shifts.npy', mode=mmap_mode, dtype=np.float16,
+            shape=(total_residues, K, n_shifts),
+        )
+        retrieved_shift_masks = np.lib.format.open_memmap(
+            rd / 'shift_masks.npy', mode=mmap_mode, dtype=bool,
+            shape=(total_residues, K, n_shifts),
+        )
+        retrieved_residue_codes = np.lib.format.open_memmap(
+            rd / 'residue_codes.npy', mode=mmap_mode, dtype=np.int16,
+            shape=(total_residues, K),
+        )
+        retrieved_distances = np.lib.format.open_memmap(
+            rd / 'distances.npy', mode=mmap_mode, dtype=np.float16,
+            shape=(total_residues, K),
+        )
+        retrieved_valid = np.lib.format.open_memmap(
+            rd / 'valid.npy', mode=mmap_mode, dtype=bool,
+            shape=(total_residues, K),
+        )
+        neighbor_struct = np.lib.format.open_memmap(
+            rd / 'neighbor_struct.npy', mode=mmap_mode, dtype=np.float16,
+            shape=(total_residues, K, N_STRUCT_FEATURES),
+        )
+        total_batches = (total_residues + retrieval_batch_size - 1) // retrieval_batch_size
+        start_batch = resume_from // retrieval_batch_size
 
-        total_queries += len(batch_indices)
+        # Precompute struct features aligned to FAISS index positions so the
+        # per-neighbor lookup can be pure fancy indexing (replaces an
+        # (n_valid × K) Python loop that was 1–2s/batch).
+        struct_by_faiss_idx = None
+        if struct_lookup is not None and retriever is not None:
+            n_meta = len(retriever.meta_bmrb_ids)
+            struct_by_faiss_idx = np.zeros((n_meta, N_STRUCT_FEATURES), dtype=np.float32)
+            meta_bmrb = retriever.meta_bmrb_ids
+            meta_resid = retriever.meta_residue_ids
+            for i in range(n_meta):
+                feat = struct_lookup.get((str(meta_bmrb[i]), int(meta_resid[i])))
+                if feat is not None:
+                    struct_by_faiss_idx[i] = feat
 
-        try:
-            batch_embeddings, batch_valid_mask = embedding_lookup.get_batch(
-                batch_bmrb_ids, batch_res_ids,
-            )
-        except Exception as e:
-            retrieval_failures += len(batch_indices)
-            print(f"      WARNING: Embedding lookup failed for batch "
-                  f"{batch_start}-{batch_end}: {e}")
-            checkpoint_file.write_text(str(batch_end))
-            continue
+        for batch_start in tqdm(
+            range(resume_from, total_residues, retrieval_batch_size),
+            desc="      Retrieval batches",
+            initial=start_batch,
+            total=total_batches,
+        ):
+            batch_end = min(batch_start + retrieval_batch_size, total_residues)
+            batch_indices = list(range(batch_start, batch_end))
 
-        valid_indices = np.where(batch_valid_mask)[0]
-        total_valid_queries += len(valid_indices)
+            batch_bmrb_ids = []
+            batch_res_ids = []
 
-        if len(valid_indices) > 0:
-            valid_embeddings = batch_embeddings[valid_indices]
-            valid_bmrb_ids = [batch_bmrb_ids[i] for i in valid_indices]
+            for global_idx in batch_indices:
+                bmrb_id = idx_to_bmrb[str(global_idx)]
+                rid = global_to_resid[str(global_idx)]
+                batch_bmrb_ids.append(bmrb_id)
+                batch_res_ids.append(rid)
+
+            total_queries += len(batch_indices)
 
             try:
-                results = retriever.retrieve(
-                    query_embeddings=valid_embeddings,
-                    query_bmrb_ids=valid_bmrb_ids,
-                    k=K,
+                batch_embeddings, batch_valid_mask = embedding_lookup.get_batch(
+                    batch_bmrb_ids, batch_res_ids,
                 )
             except Exception as e:
-                retrieval_failures += len(valid_indices)
-                print(f"      WARNING: Retrieval failed for batch "
+                retrieval_failures += len(batch_indices)
+                print(f"      WARNING: Embedding lookup failed for batch "
                       f"{batch_start}-{batch_end}: {e}")
                 checkpoint_file.write_text(str(batch_end))
                 continue
 
-            # Store retrieval results
-            global_indices_arr = batch_start + valid_indices
-            retrieved_shifts[global_indices_arr] = results['shifts']
-            retrieved_shift_masks[global_indices_arr] = results['shift_masks']
-            retrieved_residue_codes[global_indices_arr] = results['residue_codes']
-            retrieved_distances[global_indices_arr] = results['distances']
-            retrieved_valid[global_indices_arr] = results['indices'] >= 0
+            valid_indices = np.where(batch_valid_mask)[0]
+            total_valid_queries += len(valid_indices)
 
-            # Look up structural features for retrieved neighbors
-            if struct_lookup is not None:
-                n_valid = len(valid_indices)
-                nbr_bmrb = results['bmrb_ids']      # (n_valid, K) object array
-                nbr_resid = results['residue_ids']   # (n_valid, K)
-                nbr_struct_batch = np.zeros((n_valid, K, N_STRUCT_FEATURES), dtype=np.float32)
-                for qi in range(n_valid):
-                    for ki in range(K):
-                        if results['indices'][qi, ki] >= 0:
-                            key = (str(nbr_bmrb[qi, ki]), int(nbr_resid[qi, ki]))
-                            feat = struct_lookup.get(key)
-                            if feat is not None:
-                                nbr_struct_batch[qi, ki] = feat
-                neighbor_struct[global_indices_arr] = nbr_struct_batch
+            if len(valid_indices) > 0:
+                valid_embeddings = batch_embeddings[valid_indices]
+                valid_bmrb_ids = [batch_bmrb_ids[i] for i in valid_indices]
 
-            # Accumulate retrieval stats
-            valid_mask = results['indices'] >= 0
-            total_valid_retrieved += valid_mask.sum()
-            if valid_mask.any():
-                sim_sum += results['distances'][valid_mask].sum()
+                try:
+                    results = retriever.retrieve(
+                        query_embeddings=valid_embeddings,
+                        query_bmrb_ids=valid_bmrb_ids,
+                        k=K,
+                    )
+                except Exception as e:
+                    retrieval_failures += len(valid_indices)
+                    print(f"      WARNING: Retrieval failed for batch "
+                          f"{batch_start}-{batch_end}: {e}")
+                    checkpoint_file.write_text(str(batch_end))
+                    continue
 
-        # Flush and checkpoint every batch
+                # Store retrieval results
+                global_indices_arr = batch_start + valid_indices
+                retrieved_shifts[global_indices_arr] = results['shifts']
+                retrieved_shift_masks[global_indices_arr] = results['shift_masks']
+                retrieved_residue_codes[global_indices_arr] = results['residue_codes']
+                retrieved_distances[global_indices_arr] = results['distances']
+                retrieved_valid[global_indices_arr] = results['indices'] >= 0
+
+                # Look up structural features for retrieved neighbors via
+                # fancy indexing (was: 160k python dict.get() calls per batch).
+                if struct_by_faiss_idx is not None:
+                    result_idx = results['indices']  # (n_valid, K), -1 for invalid
+                    safe = np.where(result_idx >= 0, result_idx, 0)
+                    nbr_struct_batch = struct_by_faiss_idx[safe]
+                    nbr_struct_batch[result_idx < 0] = 0
+                    neighbor_struct[global_indices_arr] = nbr_struct_batch
+
+                # Accumulate retrieval stats
+                valid_mask = results['indices'] >= 0
+                total_valid_retrieved += valid_mask.sum()
+                if valid_mask.any():
+                    sim_sum += results['distances'][valid_mask].sum()
+
+            # Flush and checkpoint every batch
+            retrieved_shifts.flush()
+            retrieved_shift_masks.flush()
+            retrieved_residue_codes.flush()
+            retrieved_distances.flush()
+            retrieved_valid.flush()
+            neighbor_struct.flush()
+
+            checkpoint_file.write_text(str(batch_end))
+
+            if (batch_end % (retrieval_batch_size * 10)) == 0:
+                gc.collect()
+
+        # Final flush
         retrieved_shifts.flush()
         retrieved_shift_masks.flush()
         retrieved_residue_codes.flush()
@@ -644,29 +676,17 @@ def build_cache_for_fold(
         retrieved_valid.flush()
         neighbor_struct.flush()
 
-        checkpoint_file.write_text(str(batch_end))
-
-        if (batch_end % (retrieval_batch_size * 10)) == 0:
-            gc.collect()
-
-    # Final flush
-    retrieved_shifts.flush()
-    retrieved_shift_masks.flush()
-    retrieved_residue_codes.flush()
-    retrieved_distances.flush()
-    retrieved_valid.flush()
-    neighbor_struct.flush()
-
-    if checkpoint_file.exists():
-        checkpoint_file.unlink()
-        print("      Retrieval data complete - checkpoint removed")
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
+            print("      Retrieval data complete - checkpoint removed")
 
     # Retrieval stats
     avg_sim = sim_sum / max(total_valid_retrieved, 1)
     avg_coverage = total_valid_retrieved / max(total_valid_queries * K, 1)
 
-    del retrieved_shifts, retrieved_shift_masks, retrieved_residue_codes
-    del retrieved_distances, retrieved_valid, neighbor_struct
+    if not no_retrieval:
+        del retrieved_shifts, retrieved_shift_masks, retrieved_residue_codes
+        del retrieved_distances, retrieved_valid, neighbor_struct
     del flat_query_struct
     gc.collect()
 
@@ -678,6 +698,11 @@ def build_cache_for_fold(
                 'mean': float(stats[col]['mean']),
                 'std': float(stats[col]['std']),
             }
+    # Preserve per-AA and DSSP stats
+    if 'per_aa' in stats:
+        stats_for_json['per_aa'] = stats['per_aa']
+    if 'dssp' in stats:
+        stats_for_json['dssp'] = stats['dssp']
 
     config = {
         'n_atom_types': n_atom_types,
@@ -755,6 +780,19 @@ def main():
         '--device', default='cpu',
         help='Device for FAISS retrieval (default: cpu)',
     )
+    parser.add_argument(
+        '--no_retrieval', action='store_true',
+        help='Build structure-only cache (zero-filled retrieval arrays, no embeddings/FAISS needed)',
+    )
+    parser.add_argument(
+        '--reuse_stats_from', default=None,
+        help='Path to existing cache stats. Can be EITHER a specific fold '
+             'directory (e.g. .../cache/fold_1/) — in which case ALL folds '
+             'being built use THAT fold\'s stats (correct for training with '
+             'a fixed test fold) — OR a parent directory with fold_1..fold_5 '
+             'subdirs, in which case each fold_k uses its own stats (useful '
+             'only for reproducing an exact prior build).',
+    )
     args = parser.parse_args()
 
     if args.embeddings is None:
@@ -762,7 +800,15 @@ def main():
     if args.index_dir is None:
         args.index_dir = os.path.join(args.data_dir, 'retrieval_indices')
     if args.output_dir is None:
-        args.output_dir = os.path.join(args.data_dir, 'cache')
+        # Default to 1TB drive — retrieval caches are ~30 GB per fold, main disk
+        # is chronically tight. A symlink at <data_dir>/cache is created below.
+        ds_name = os.path.basename(os.path.abspath(args.data_dir))
+        args.output_dir = f'/home/brooks/1TB/Wynn/{ds_name}_cache'
+        # Create symlink from <data_dir>/cache → output_dir so train.py picks it up
+        link_path = os.path.join(args.data_dir, 'cache')
+        if not os.path.exists(link_path):
+            os.makedirs(args.output_dir, exist_ok=True)
+            os.symlink(args.output_dir, link_path)
 
     print("=" * 60)
     print("Training Cache Builder (Better Data Pipeline)")
@@ -784,6 +830,13 @@ def main():
         if os.path.exists(candidate):
             csv_path = candidate
             break
+    # Fallback: if only per-fold files exist, use fold_1 as a column-header source
+    # (later passes are already per-fold-aware so we don't need a combined CSV).
+    if csv_path is None:
+        fold1_csv = os.path.join(args.data_dir, 'structure_data_hybrid_fold_1.csv')
+        if os.path.exists(fold1_csv):
+            csv_path = fold1_csv
+            print(f"  No combined CSV found; using {csv_path} for header inspection")
     if csv_path is None:
         candidates = [f for f in os.listdir(args.data_dir) if f.endswith('.csv')]
         raise FileNotFoundError(
@@ -870,12 +923,16 @@ def main():
     gc.collect()
     print(f"  Built lookup for {len(struct_lookup):,} residues in {time.time()-t0:.1f}s")
 
-    # Import retrieval module
-    from retrieval import Retriever, EmbeddingLookup
+    if not args.no_retrieval:
+        # Import retrieval module
+        from retrieval import Retriever, EmbeddingLookup
 
-    # Load embedding lookup once
-    print(f"\nLoading embedding lookup from {args.embeddings}...")
-    embedding_lookup = EmbeddingLookup(args.embeddings)
+        # Load embedding lookup once
+        print(f"\nLoading embedding lookup from {args.embeddings}...")
+        embedding_lookup = EmbeddingLookup(args.embeddings)
+    else:
+        print("\n*** NO-RETRIEVAL MODE: skipping embeddings/FAISS ***")
+        embedding_lookup = None
 
     all_provenance = {}
     os.makedirs(args.output_dir, exist_ok=True)
@@ -888,13 +945,35 @@ def main():
         print(f"  FOLD {fold}")
         print(f"{'=' * 50}")
 
-        # Compute normalization stats from training data using light_df
-        train_mask = light_df[fold_col] != fold
-        stats = compute_normalization_stats(
-            light_df[train_mask], shift_cols, dssp_cols)
-        n_train = train_mask.sum()
-        print(f"    Stats from {light_df.loc[train_mask, 'bmrb_id'].nunique()} "
-              f"training proteins ({n_train:,} residues)")
+        # Stats source (resolve ONCE before the fold loop if reusing; here we
+        # resolve per-fold only if the reuse path points at a parent dir).
+        if args.reuse_stats_from:
+            p = args.reuse_stats_from
+            # Prefer explicit fold dir (use those stats for ALL folds being built)
+            if os.path.exists(os.path.join(p, 'config.json')):
+                ref_cfg = os.path.join(p, 'config.json')
+            else:
+                # Parent-dir form: ref/fold_k/config.json, per-fold
+                ref_cfg = os.path.join(p, f'fold_{fold}', 'config.json')
+            if not os.path.exists(ref_cfg):
+                raise FileNotFoundError(
+                    f"--reuse_stats_from set but {ref_cfg} missing")
+            with open(ref_cfg) as _f:
+                _ref = json.load(_f)
+            stats = _ref['stats']
+            print(f"    Stats LOADED FROM {ref_cfg}")
+            if _ref.get('shift_cols') and _ref['shift_cols'] != shift_cols:
+                raise ValueError(
+                    f"shift_cols mismatch between reference cache and current CSV.\n"
+                    f"  ref: {_ref['shift_cols'][:5]}... ({len(_ref['shift_cols'])})\n"
+                    f"  cur: {shift_cols[:5]}... ({len(shift_cols)})")
+        else:
+            train_mask = light_df[fold_col] != fold
+            stats = compute_normalization_stats(
+                light_df[train_mask], shift_cols, dssp_cols)
+            n_train = train_mask.sum()
+            print(f"    Stats from {light_df.loc[train_mask, 'bmrb_id'].nunique()} "
+                  f"training proteins ({n_train:,} residues)")
 
         # Load fold data — try per-fold CSV first (memory-efficient), fall back to filtering
         fold_csv = os.path.join(args.data_dir, f'structure_data_hybrid_fold_{fold}.csv')
@@ -916,15 +995,34 @@ def main():
         print(f"    Loaded {fold_df['bmrb_id'].nunique()} proteins, "
               f"{len(fold_df):,} residues in {time.time()-t0:.1f}s")
 
-        # Load retriever
-        print(f"    Loading FAISS index (excluding fold {fold})...")
-        retriever = Retriever(
-            index_dir=args.index_dir,
-            exclude_fold=fold,
-            k=args.k,
-            nprobe=FAISS_NPROBE,
-            device=args.device,
-        )
+        if not args.no_retrieval:
+            # Each fold_k cache retrieves from ONLY fold k residues (intra-fold
+            # design). At training time, train.py loads the other folds' caches,
+            # so training samples never retrieve test-fold shifts — no leakage.
+            # Prefer the new 'only' index; fall back to legacy 'exclude' if
+            # that's all that exists (for old retrieval_indices dirs).
+            only_idx = os.path.join(args.index_dir, f'index_only_fold_{fold}.faiss')
+            if os.path.exists(only_idx):
+                print(f"    Loading intra-fold index (only fold {fold})...")
+                retriever = Retriever(
+                    index_dir=args.index_dir,
+                    only_fold=fold,
+                    k=args.k,
+                    nprobe=FAISS_NPROBE,
+                    device=args.device,
+                )
+            else:
+                print(f"    WARNING: no index_only_fold_{fold}.faiss found. "
+                      f"Falling back to legacy exclude-fold index.")
+                retriever = Retriever(
+                    index_dir=args.index_dir,
+                    exclude_fold=fold,
+                    k=args.k,
+                    nprobe=FAISS_NPROBE,
+                    device=args.device,
+                )
+        else:
+            retriever = None
 
         # Build cache
         cache_dir = os.path.join(args.output_dir, f'fold_{fold}')
@@ -952,14 +1050,17 @@ def main():
         print(f"    Cache built in {elapsed:.1f}s")
 
         # Free fold data and retriever
-        del fold_df, retriever
+        del fold_df
+        if retriever is not None:
+            del retriever
         gc.collect()
 
     # Cleanup
     del light_df, struct_lookup
 
     # Close embedding lookup
-    embedding_lookup.close()
+    if embedding_lookup is not None:
+        embedding_lookup.close()
 
     # ---- Final Provenance Report ----
     print("\n" + "=" * 60)

@@ -276,20 +276,46 @@ class CachedRetrievalDataset(Dataset):
             self.flat_bond_geom = None
 
     def _mmap_retrieval_data(self):
-        """Memory-map retrieval data from disk."""
+        """Memory-map retrieval data from disk.
+
+        If the retrieval files are missing (no_retrieval cache), all retrieval
+        attributes are set to None and __getitem__ synthesizes zero tensors.
+        This avoids allocating tens of GB of zero-filled mmaps for caches built
+        with --no_retrieval.
+        """
         rd = self.cache_dir / 'retrieval'
 
-        # These are memory-mapped, NOT loaded into RAM
-        self.retrieved_shifts = np.load(rd / 'shifts.npy', mmap_mode='r')
-        self.retrieved_shift_masks = np.load(rd / 'shift_masks.npy', mmap_mode='r')
-        self.retrieved_residue_codes = np.load(rd / 'residue_codes.npy', mmap_mode='r')
-        self.retrieved_distances = np.load(rd / 'distances.npy', mmap_mode='r')
-        self.retrieved_valid = np.load(rd / 'valid.npy', mmap_mode='r')
+        if not (rd / 'shifts.npy').exists():
+            self.retrieved_shifts = None
+            self.retrieved_shift_masks = None
+            self.retrieved_residue_codes = None
+            self.retrieved_distances = None
+            self.retrieved_valid = None
+            self.retrieved_neighbor_struct = None
+            self.retrieval_compact = False
+            return
+
+        # Compact format (_compact.flag present): retrieval arrays are indexed by
+        # sample idx (0..n_samples) instead of global_idx, so only rows for
+        # shift-having samples are stored — ~4x smaller on disk, fits in RAM.
+        self.retrieval_compact = (rd / '_compact.flag').exists()
+
+        # For compact caches the full retrieval arrays are small enough to live
+        # in RAM (~3.5 GB per fold × 5 folds = ~17 GB total). Loading fully
+        # eliminates random HDD reads during shuffled training. For non-compact
+        # caches the arrays are 4x bigger and we stay on mmap.
+        load_mode = None if self.retrieval_compact else 'r'
+
+        self.retrieved_shifts = np.load(rd / 'shifts.npy', mmap_mode=load_mode)
+        self.retrieved_shift_masks = np.load(rd / 'shift_masks.npy', mmap_mode=load_mode)
+        self.retrieved_residue_codes = np.load(rd / 'residue_codes.npy', mmap_mode=load_mode)
+        self.retrieved_distances = np.load(rd / 'distances.npy', mmap_mode=load_mode)
+        self.retrieved_valid = np.load(rd / 'valid.npy', mmap_mode=load_mode)
 
         # Neighbor structural features (may not exist in older caches)
         nbr_struct_path = rd / 'neighbor_struct.npy'
         if nbr_struct_path.exists():
-            self.retrieved_neighbor_struct = np.load(nbr_struct_path, mmap_mode='r')
+            self.retrieved_neighbor_struct = np.load(nbr_struct_path, mmap_mode=load_mode)
         else:
             self.retrieved_neighbor_struct = None
 
@@ -426,34 +452,45 @@ class CachedRetrievalDataset(Dataset):
         # Query residue code
         query_residue_code = self.flat_residue_idx[global_idx]
 
-        # Retrieval data (from mmap)
-        retrieved_shifts = torch.from_numpy(
-            self.retrieved_shifts[global_idx].astype(np.float32)
-        )
-        retrieved_shift_masks = torch.from_numpy(
-            self.retrieved_shift_masks[global_idx].astype(bool)
-        )
-        retrieved_residue_codes = torch.from_numpy(
-            self.retrieved_residue_codes[global_idx].astype(np.int64)
-        )
-        retrieved_distances = torch.from_numpy(
-            self.retrieved_distances[global_idx].astype(np.float32)
-        )
-        retrieved_valid = torch.from_numpy(
-            self.retrieved_valid[global_idx].astype(bool)
-        )
+        # Retrieval data (from mmap, or zero-filled for no_retrieval caches).
+        # When cache is compact, retrieval rows are indexed by sample idx
+        # (== the __getitem__ arg); otherwise by global_idx (legacy).
+        retr_idx = idx if self.retrieval_compact else global_idx
 
-        # Normalize retrieved shifts (CRITICAL: must match target normalization)
-        if self.retrieval_means is not None:
-            # Shape: (K, n_shifts) - normalize each shift column
-            retrieved_shifts = (retrieved_shifts - self.retrieval_means) / self.retrieval_stds
-            # Clamp to reasonable range and handle NaN
-            retrieved_shifts = torch.clamp(retrieved_shifts, -10, 10)
-            retrieved_shifts = torch.where(
-                torch.isnan(retrieved_shifts),
-                torch.zeros_like(retrieved_shifts),
-                retrieved_shifts
+        if self.retrieved_shifts is None:
+            retrieved_shifts = torch.zeros(K, self.n_shifts, dtype=torch.float32)
+            retrieved_shift_masks = torch.zeros(K, self.n_shifts, dtype=torch.bool)
+            retrieved_residue_codes = torch.zeros(K, dtype=torch.int64)
+            retrieved_distances = torch.zeros(K, dtype=torch.float32)
+            retrieved_valid = torch.zeros(K, dtype=torch.bool)
+        else:
+            retrieved_shifts = torch.from_numpy(
+                self.retrieved_shifts[retr_idx].astype(np.float32)
             )
+            retrieved_shift_masks = torch.from_numpy(
+                self.retrieved_shift_masks[retr_idx].astype(bool)
+            )
+            retrieved_residue_codes = torch.from_numpy(
+                self.retrieved_residue_codes[retr_idx].astype(np.int64)
+            )
+            retrieved_distances = torch.from_numpy(
+                self.retrieved_distances[retr_idx].astype(np.float32)
+            )
+            retrieved_valid = torch.from_numpy(
+                self.retrieved_valid[retr_idx].astype(bool)
+            )
+
+            # Normalize retrieved shifts (CRITICAL: must match target normalization)
+            if self.retrieval_means is not None:
+                # Shape: (K, n_shifts) - normalize each shift column
+                retrieved_shifts = (retrieved_shifts - self.retrieval_means) / self.retrieval_stds
+                # Clamp to reasonable range and handle NaN
+                retrieved_shifts = torch.clamp(retrieved_shifts, -10, 10)
+                retrieved_shifts = torch.where(
+                    torch.isnan(retrieved_shifts),
+                    torch.zeros_like(retrieved_shifts),
+                    retrieved_shifts
+                )
 
         # Query structural features
         if self.flat_query_struct is not None:
@@ -469,7 +506,7 @@ class CachedRetrievalDataset(Dataset):
         # Neighbor structural features
         if self.retrieved_neighbor_struct is not None:
             neighbor_struct = torch.from_numpy(
-                self.retrieved_neighbor_struct[global_idx].astype(np.float32))
+                self.retrieved_neighbor_struct[retr_idx].astype(np.float32))
             neighbor_struct = torch.where(
                 torch.isnan(neighbor_struct),
                 torch.zeros_like(neighbor_struct),
