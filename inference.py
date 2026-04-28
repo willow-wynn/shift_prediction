@@ -70,6 +70,18 @@ def load_model(checkpoint_path, device):
     spatial_hidden = clean_sd.get('spatial_attention.fallback_embed', torch.zeros(192)).shape[0]
     retrieval_hidden = clean_sd.get('cross_attn_layers.0.shift_embed.weight', torch.zeros(1, 320)).shape[-1]
 
+    # Detect whether the checkpoint includes retrieval-module weights. If not,
+    # build a struct-only model — otherwise the retrieval pathway is initialized
+    # with RANDOM weights and forward() blends random predictions into the output.
+    retrieval_prefixes = ('neighbor_encoder.', 'self_attn_layers.',
+                          'cross_attn_layers.', 'cross_ffn_layers.',
+                          'direct_transfer.', 'retrieval_gate.')
+    has_retrieval = any(k.startswith(retrieval_prefixes) for k in clean_sd)
+    # Also trust the mode field if present
+    ckpt_mode = checkpoint.get('mode')
+    if ckpt_mode == 'struct':
+        has_retrieval = False
+
     model = ShiftPredictorWithRetrieval(
         n_atom_types=n_atom_types,
         n_residue_types=N_RESIDUE_TYPES,
@@ -80,10 +92,18 @@ def load_model(checkpoint_path, device):
         cnn_channels=cnn_channels,
         spatial_hidden=spatial_hidden,
         retrieval_hidden=retrieval_hidden,
+        use_retrieval=has_retrieval,
     ).to(device)
 
     filtered = {k: v for k, v in clean_sd.items() if not k.startswith('physics_encoder.')}
-    model.load_state_dict(filtered, strict=False)
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    # Warn loudly if anything unexpected happens
+    if missing:
+        print(f"  WARNING: {len(missing)} missing keys on load (first: {missing[:3]})")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} unexpected keys in checkpoint (first: {unexpected[:3]})")
+    if not has_retrieval:
+        print(f"  Loaded as structure-only (no retrieval module)")
     model.eval()
 
     return model, {
@@ -428,7 +448,7 @@ def extract_base_encodings(model, residues, device, n_shifts, k_retrieved, batch
 
 
 def get_retrieval_features(model, residues, device, n_shifts, k_retrieved, stats,
-                           shift_cols, index_dir, batch_size=64):
+                           shift_cols, index_dir, batch_size=64, bmrb_id=None):
     """Compute embeddings, query FAISS, and populate retrieval tensors.
 
     Falls back to structure-only if index_dir is not available.
@@ -459,8 +479,9 @@ def get_retrieval_features(model, residues, device, n_shifts, k_retrieved, stats
     print(f"  Loading retrieval index (fold {fold_num} excluded)...")
     retriever = Retriever(index_dir, exclude_fold=fold_num, k=k_retrieved)
 
-    # Query with a dummy BMRB ID (new protein won't match anything in the index)
-    query_bmrb_ids = ['__inference__'] * len(residues)
+    # Use actual BMRB ID for same-protein exclusion, or dummy for new proteins
+    exclude_id = bmrb_id if bmrb_id else '__inference__'
+    query_bmrb_ids = [exclude_id] * len(residues)
     embeddings = embeddings.astype(np.float32)
 
     print(f"  Retrieving {k_retrieved} neighbors for {len(residues)} residues...")
@@ -577,6 +598,8 @@ def main():
                         help='Disable retrieval (structure-only prediction)')
     parser.add_argument('--backbone_only', action='store_true',
                         help='Only output backbone shifts (CA, CB, C, N, H, HA)')
+    parser.add_argument('--bmrb', default=None,
+                        help='BMRB ID for same-protein exclusion during retrieval')
     args = parser.parse_args()
 
     if args.device is None:
@@ -617,15 +640,19 @@ def main():
             print(f"  ERROR: Failed to download {pdb_id}: {e}")
             sys.exit(1)
 
-    # Load DSSP normalization stats
-    dssp_stats = None
-    dssp_stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dssp_stats.json')
-    if os.path.exists(dssp_stats_path):
-        with open(dssp_stats_path) as f:
-            dssp_stats = json.load(f)
-        print(f"  DSSP stats loaded ({len(dssp_stats)} features)")
+    # Load DSSP normalization stats — prefer the checkpoint's stats['dssp']
+    # (matches training distribution) and fall back to the global dssp_stats.json
+    dssp_stats = stats.get('dssp') if isinstance(stats, dict) else None
+    if dssp_stats:
+        print(f"  DSSP stats from checkpoint ({len(dssp_stats)} features)")
     else:
-        print(f"  WARNING: No DSSP stats found at {dssp_stats_path} — DSSP features will not be normalized")
+        dssp_stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dssp_stats.json')
+        if os.path.exists(dssp_stats_path):
+            with open(dssp_stats_path) as f:
+                dssp_stats = json.load(f)
+            print(f"  DSSP stats from {dssp_stats_path} ({len(dssp_stats)} features)")
+        else:
+            print(f"  WARNING: No DSSP stats found — DSSP features will not be normalized")
 
     # Extract features from PDB
     print(f"\nExtracting features...")
@@ -654,7 +681,7 @@ def main():
 
     residues = get_retrieval_features(
         model, residues, device, len(shift_cols), k_retrieved,
-        stats, shift_cols, index_dir, args.batch_size)
+        stats, shift_cols, index_dir, args.batch_size, bmrb_id=args.bmrb)
 
     # Run inference
     print(f"\nRunning inference on {len(residues)} residues...")

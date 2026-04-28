@@ -657,8 +657,9 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--fold', type=int, default=1,
                         help='Fold used for evaluation (test fold)')
-    parser.add_argument('--output_dir', type=str, default='evaluation_results',
-                        help='Directory for evaluation outputs')
+    parser.add_argument('--output_dir', type=str,
+                        default='/home/brooks/1TB/Wynn/results/evaluation_results',
+                        help='Directory for evaluation outputs (default: 1TB drive)')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/mps/cpu, auto-detected if omitted)')
     parser.add_argument('--plots', action='store_true',
