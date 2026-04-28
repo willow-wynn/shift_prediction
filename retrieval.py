@@ -37,49 +37,77 @@ class Retriever:
     """
     Handles retrieval of similar residues using FAISS indices.
 
-    The retriever automatically excludes:
-    1. Residues from the held-out test fold
-    2. Residues from the same protein as the query
+    Two supported modes (set via `mode` kwarg):
+      - 'only' (new, default): retrieve from a single fold's residues. The
+        index file naming is index_only_fold_{k}.faiss. Used by the current
+        cache design: each fold_k/ cache retrieves from fold k's residues.
+        When train.py loads the OTHER folds' caches, it automatically gets
+        retrievals from different folds than the test fold — no leakage.
+      - 'exclude' (legacy): retrieve from all folds except fold k. File is
+        index_exclude_fold_{k}.faiss. Kept for back-compat with older caches.
+
+    Always excludes same-protein matches (by bmrb_id).
     """
 
     def __init__(
         self,
         index_dir: str,
-        exclude_fold: int,
+        exclude_fold: int = None,
+        only_fold: int = None,
         k: int = K_RETRIEVED,
         nprobe: int = FAISS_NPROBE,
         device: str = 'cpu',
+        mode: str = None,
     ):
         """
-        Initialize retriever for a specific fold configuration.
+        Initialize retriever. Exactly one of (exclude_fold, only_fold) must be set,
+        or pass `mode` along with the fold number via exclude_fold.
 
         Args:
             index_dir: Directory containing FAISS indices and metadata
-            exclude_fold: Which fold to exclude (the test fold)
-            k: Number of neighbors to retrieve
-            nprobe: Number of clusters to search (higher = more accurate but slower)
-            device: 'cpu' or 'cuda'
+            exclude_fold: (legacy) fold to exclude from retrieval pool
+            only_fold: (new) fold to retrieve from exclusively
+            k, nprobe, device: as before
+            mode: 'only' or 'exclude' (auto-detected from which kwarg is set)
         """
         self.index_dir = index_dir
-        self.exclude_fold = exclude_fold
         self.k = k
         self.nprobe = nprobe
         self.device = device
 
-        # Load index
-        index_path = os.path.join(index_dir, f'index_exclude_fold_{exclude_fold}.faiss')
-        print(f"Loading FAISS index from {index_path}...")
+        # Resolve mode
+        if only_fold is not None:
+            self.mode = 'only'
+            self.fold = only_fold
+        elif exclude_fold is not None:
+            self.mode = mode or 'exclude'
+            self.fold = exclude_fold
+        else:
+            raise ValueError("Must pass either only_fold or exclude_fold")
+        self.exclude_fold = exclude_fold  # kept for back-compat with callers
+        self.only_fold = only_fold
+
+        # Resolve index + metadata paths
+        prefix = 'only' if self.mode == 'only' else 'exclude'
+        index_path = os.path.join(index_dir, f'index_{prefix}_fold_{self.fold}.faiss')
+        metadata_path = os.path.join(index_dir, f'metadata_{prefix}_fold_{self.fold}.pkl')
+
+        print(f"Loading FAISS index from {index_path}... (mode: {self.mode})")
         self.index = faiss.read_index(index_path)
         self.index.nprobe = nprobe
 
-        # Optionally move to GPU
+        # Optionally move to GPU (uses cuVS backend if available — required
+        # for Blackwell / sm_120 since FAISS' native CUDA kernels don't yet
+        # target RTX 50-series).
         if device == 'cuda' and faiss.get_num_gpus() > 0:
             print("  Moving index to GPU...")
-            gpu_res = faiss.StandardGpuResources()
-            self.index = faiss.index_cpu_to_gpu(gpu_res, 0, self.index)
+            self._gpu_res = faiss.StandardGpuResources()
+            co = faiss.GpuClonerOptions()
+            if hasattr(co, 'use_cuvs'):
+                co.use_cuvs = True
+            self.index = faiss.index_cpu_to_gpu(self._gpu_res, 0, self.index, co)
 
         # Load metadata
-        metadata_path = os.path.join(index_dir, f'metadata_exclude_fold_{exclude_fold}.pkl')
         print(f"Loading metadata from {metadata_path}...")
         with open(metadata_path, 'rb') as f:
             self.metadata = pickle.load(f)
@@ -98,27 +126,21 @@ class Retriever:
         print(f"  Shift columns: {len(self.shift_cols)}")
 
     def _build_protein_lookup(self):
-        """Build lookup table mapping FAISS index -> protein ID for fast exclusion."""
-        self.idx_to_bmrb = np.array([
-            m['bmrb_id'] for m in self.metadata
-        ])
+        """Flatten metadata into dense numpy arrays for vectorized retrieve()."""
+        n = len(self.metadata)
+        n_shifts = len(self.shift_cols)
 
-        # Create mapping from bmrb_id to set of indices (for fast exclusion)
-        self.bmrb_to_indices = {}
-        for idx, bmrb_id in enumerate(self.idx_to_bmrb):
-            if bmrb_id not in self.bmrb_to_indices:
-                self.bmrb_to_indices[bmrb_id] = []
-            self.bmrb_to_indices[bmrb_id].append(idx)
+        self.meta_bmrb_ids = np.array([m['bmrb_id'] for m in self.metadata], dtype=object)
+        self.meta_residue_ids = np.array([m['residue_id'] for m in self.metadata], dtype=np.int32)
+        self.meta_residue_codes = np.array([m['residue_code'] for m in self.metadata], dtype=np.int32)
 
-        for k in self.bmrb_to_indices:
-            self.bmrb_to_indices[k] = set(self.bmrb_to_indices[k])
+        self.meta_shifts = np.empty((n, n_shifts), dtype=np.float32)
+        self.meta_shift_masks = np.empty((n, n_shifts), dtype=bool)
+        for i, m in enumerate(self.metadata):
+            self.meta_shifts[i] = m['shifts']
+            self.meta_shift_masks[i] = m['shift_mask']
 
-    def _get_exclusion_set(self, query_bmrb):
-        """Get the full set of FAISS indices to exclude for a query protein.
-
-        Only excludes residues from the exact same protein.
-        """
-        return set(self.bmrb_to_indices.get(query_bmrb, set()))
+        self.idx_to_bmrb = self.meta_bmrb_ids  # kept for any legacy callers
 
     def retrieve(
         self,
@@ -149,50 +171,57 @@ class Retriever:
         n_shifts = len(self.shift_cols)
 
         # Normalize queries (FAISS inner product = cosine similarity for normalized vectors)
-        query_embeddings = query_embeddings.copy()
+        query_embeddings = np.ascontiguousarray(query_embeddings, dtype=np.float32)
         faiss.normalize_L2(query_embeddings)
 
-        # Retrieve more than k to allow for same-protein filtering
-        k_extra = k + 50  # Get extras to filter
+        # Retrieve more than k to allow for same-protein filtering. Same-protein
+        # hits are rare in a large pool (a ~200-residue protein in a ~2M-residue
+        # index yields 0–5 same-protein hits in the top ~40 typically), so k+10
+        # is plenty.
+        k_extra = k + 10
 
         distances, indices = self.index.search(query_embeddings, k_extra)
 
-        # Initialize output arrays
+        # Vectorized filter: mark invalid / same-protein positions.
+        query_bmrb_arr = np.asarray([str(b) for b in query_bmrb_ids], dtype=object)
+        safe_idx = np.where(indices >= 0, indices, 0)  # clip -1 for safe gather
+        retrieved_bmrb_raw = self.meta_bmrb_ids[safe_idx]           # (nq, ke)
+        invalid = indices < 0
+        same_protein = retrieved_bmrb_raw == query_bmrb_arr[:, None]
+        keep = ~(invalid | same_protein)
+
+        # FAISS returns candidates in distance-sorted order, so "top-k valid" is
+        # just "the first k True entries in each row of `keep`".
+        rank = np.cumsum(keep, axis=1)  # (nq, ke), 1-indexed rank among valids
+        select = keep & (rank <= k)     # (nq, ke)
+        dest_col = rank - 1             # 0-indexed destination column
+
+        # Scatter selected (row, col) -> out[row, dest_col[row, col]]
+        r, c = np.nonzero(select)
+        dc = dest_col[r, c]
+        sel_idx = indices[r, c]  # source FAISS index
+
         out_indices = np.full((n_queries, k), -1, dtype=np.int64)
         out_distances = np.zeros((n_queries, k), dtype=np.float32)
-        out_bmrb_ids = np.empty((n_queries, k), dtype=object)
-        out_residue_ids = np.zeros((n_queries, k), dtype=np.int32)
-        out_residue_codes = np.zeros((n_queries, k), dtype=np.int32)
-        out_shifts = np.zeros((n_queries, k, n_shifts), dtype=np.float32)
-        out_shift_masks = np.zeros((n_queries, k, n_shifts), dtype=bool)
+        out_indices[r, dc] = sel_idx
+        out_distances[r, dc] = distances[r, c]
 
-        # Filter same-protein and >90% identity matches
-        for q in range(n_queries):
-            query_bmrb = str(query_bmrb_ids[q])
-            exclude_set = self._get_exclusion_set(query_bmrb)
+        # Gather metadata via fancy indexing (use safe_out for -1 positions)
+        safe_out = np.where(out_indices >= 0, out_indices, 0)
+        out_residue_ids = self.meta_residue_ids[safe_out].astype(np.int32)
+        out_residue_codes = self.meta_residue_codes[safe_out].astype(np.int32)
+        out_shifts = self.meta_shifts[safe_out]
+        out_shift_masks = self.meta_shift_masks[safe_out]
+        out_bmrb_ids = self.meta_bmrb_ids[safe_out]
 
-            count = 0
-            for i in range(k_extra):
-                idx = indices[q, i]
-                if idx == -1:  # Invalid
-                    continue
-                if idx in exclude_set:  # Same protein
-                    continue
-
-                # Valid neighbor
-                out_indices[q, count] = idx
-                out_distances[q, count] = distances[q, i]
-
-                meta = self.metadata[idx]
-                out_bmrb_ids[q, count] = meta['bmrb_id']
-                out_residue_ids[q, count] = meta['residue_id']
-                out_residue_codes[q, count] = meta['residue_code']
-                out_shifts[q, count] = meta['shifts']
-                out_shift_masks[q, count] = meta['shift_mask']
-
-                count += 1
-                if count >= k:
-                    break
+        # Zero out positions where the slot is invalid (fewer than k valid hits).
+        invalid_out = out_indices < 0
+        if invalid_out.any():
+            out_residue_ids[invalid_out] = 0
+            out_residue_codes[invalid_out] = 0
+            out_shifts[invalid_out] = 0
+            out_shift_masks[invalid_out] = False
+            out_bmrb_ids[invalid_out] = ''
 
         return {
             'indices': out_indices,

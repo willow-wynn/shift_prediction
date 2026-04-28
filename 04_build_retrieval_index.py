@@ -90,9 +90,15 @@ def load_embeddings_and_shifts(
 
     print(f"  Loaded {len(embeddings_by_protein)} proteins from HDF5")
 
-    # Load shifts from CSV
+    # Load shifts from CSV — only the columns we actually need (saves GB)
     print("Loading shifts from CSV...")
-    df = pd.read_csv(csv_path, dtype={'bmrb_id': str})
+    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    keep = ['bmrb_id', 'residue_id', 'residue_code']
+    for c in ('split', 'fold'):
+        if c in header:
+            keep.append(c)
+    keep.extend([c for c in header if c in shift_cols])
+    df = pd.read_csv(csv_path, usecols=keep, dtype={'bmrb_id': str}, low_memory=False)
     csv_proteins = df['bmrb_id'].nunique()
     provenance['proteins_in_csv'] = csv_proteins
 
@@ -176,13 +182,157 @@ def load_embeddings_and_shifts(
 # Index Building
 # ============================================================================
 
+def build_fold_indices_streaming(
+    h5_path: str,
+    fold_assignments: dict,
+    shift_data: dict,
+    output_dir: str,
+    folds: list,
+    shift_cols: list,
+    use_gpu: bool = True,
+    mode: str = 'only',
+):
+    """Memory-efficient fold index builder: loads embeddings per-fold only.
+
+    Never holds the full embeddings dataset in RAM (~55 GB for AF dataset).
+    For each target_fold, opens the HDF5 file and loads only the proteins
+    that belong to (or excluding) that fold, then builds the index.
+    """
+    import gc
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Determine embedding dimension from h5
+    with h5py.File(h5_path, 'r') as h5f:
+        sample_bmrb = next(iter(h5f['embeddings'].keys()))
+        embed_dim = h5f['embeddings'][sample_bmrb]['embeddings'].shape[1]
+    print(f"Embedding dimension: {embed_dim}")
+    print(f"Building indices (mode={mode}) for folds: {folds}")
+
+    fold_provenance = {}
+    prefix = 'only' if mode == 'only' else 'exclude'
+
+    for target_fold in folds:
+        index_path = os.path.join(output_dir, f'index_{prefix}_fold_{target_fold}.faiss')
+        metadata_path = os.path.join(output_dir, f'metadata_{prefix}_fold_{target_fold}.pkl')
+        if os.path.exists(index_path) and os.path.exists(metadata_path):
+            print(f"\n  Fold {target_fold}: index exists, skipping")
+            continue
+
+        print(f"\n{'=' * 50}")
+        tag = 'ONLY' if mode == 'only' else 'excluding'
+        print(f"Building index {tag} fold {target_fold}")
+        print(f"{'=' * 50}")
+
+        # Select bmrb_ids to include in this index
+        if mode == 'only':
+            target_bmrbs = [b for b, f in fold_assignments.items() if f == target_fold]
+        else:
+            target_bmrbs = [b for b, f in fold_assignments.items() if f != target_fold]
+        print(f"  Target proteins: {len(target_bmrbs)}")
+
+        all_embeddings = []
+        all_metadata = []
+        residues_by_fold = {}
+
+        with h5py.File(h5_path, 'r') as h5f:
+            emb_group = h5f['embeddings']
+            for bmrb_str in tqdm(target_bmrbs, desc="  Loading embeddings"):
+                if bmrb_str not in emb_group:
+                    continue
+                if bmrb_str not in shift_data:
+                    continue
+                prot_emb = emb_group[bmrb_str]['embeddings'][:].astype(np.float32)
+                prot_rids = emb_group[bmrb_str]['residue_ids'][:]
+                sd = shift_data[bmrb_str]
+                shifts = sd['shifts']
+                shift_mask = sd['shift_mask']
+                residue_codes = sd['residue_codes']
+                fold_val = fold_assignments[bmrb_str]
+                residues_by_fold[fold_val] = residues_by_fold.get(fold_val, 0) + len(prot_rids)
+
+                for i in range(len(prot_rids)):
+                    all_embeddings.append(prot_emb[i])
+                    all_metadata.append({
+                        'bmrb_id': bmrb_str,
+                        'residue_id': int(prot_rids[i]),
+                        'residue_code': int(residue_codes[i]),
+                        'shifts': shifts[i].tolist(),
+                        'shift_mask': shift_mask[i].tolist(),
+                    })
+
+        if not all_embeddings:
+            print(f"  Skip: no data matched for fold {target_fold}")
+            continue
+
+        all_embeddings = np.array(all_embeddings, dtype=np.float32)
+        total_residues = len(all_embeddings)
+        print(f"  Total residues in index: {total_residues:,}")
+        for f_val in sorted(residues_by_fold):
+            print(f"    Fold {f_val}: {residues_by_fold[f_val]:,} residues")
+
+        faiss.normalize_L2(all_embeddings)
+        n_list = max(100, min(4096, total_residues // 100))
+        print(f"  Building IVF index with {n_list} clusters...")
+
+        quantizer = faiss.IndexFlatIP(embed_dim)
+        index = faiss.IndexIVFFlat(quantizer, embed_dim, n_list, faiss.METRIC_INNER_PRODUCT)
+
+        if total_residues > 500_000:
+            train_indices = np.random.choice(total_residues, 500_000, replace=False)
+            train_subset = all_embeddings[train_indices]
+        else:
+            train_subset = all_embeddings
+
+        if use_gpu and faiss.get_num_gpus() > 0:
+            print("  Using GPU for training...")
+            gpu_res = faiss.StandardGpuResources()
+            gpu_index = faiss.index_cpu_to_gpu(gpu_res, 0, index)
+            gpu_index.train(train_subset)
+            index = faiss.index_gpu_to_cpu(gpu_index)
+        else:
+            index.train(train_subset)
+        index.add(all_embeddings)
+        index.nprobe = FAISS_NPROBE
+
+        faiss.write_index(index, index_path)
+        print(f"  Saved index to {index_path}")
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(all_metadata, f)
+        print(f"  Saved metadata ({len(all_metadata):,} entries) to {metadata_path}")
+
+        fold_provenance[target_fold] = {
+            'mode': mode,
+            'total_residues': total_residues,
+            'residues_by_fold': residues_by_fold,
+            'n_ivf_clusters': n_list,
+            'nprobe': FAISS_NPROBE,
+        }
+
+        # Free memory before next fold
+        del all_embeddings, all_metadata, index
+        if 'gpu_res' in locals(): del gpu_res
+        gc.collect()
+
+    return fold_provenance
+
+
 def build_fold_indices(
     data: dict,
     output_dir: str,
     folds: list,
     use_gpu: bool = True,
+    mode: str = 'only',
 ):
-    """Build FAISS indices for specified folds, with full provenance logging."""
+    """Build FAISS indices for specified folds, with full provenance logging.
+
+    Two modes:
+      - 'only'    (default, correct): for each fold k, index contains ONLY fold k
+        residues. Used with the per-fold cache design where fold_k/ retrieves
+        from fold k's residues. train.py loads other-fold caches for training,
+        so training samples never retrieve test-fold residues.
+      - 'exclude' (legacy): for each fold k, index contains all residues EXCEPT
+        fold k. Had subtle train/test leakage — kept for back-compat only.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     # Determine embedding dimension
@@ -192,32 +342,38 @@ def build_fold_indices(
 
     all_folds = sorted(set(v['fold'] for v in data.values()))
     print(f"All folds found in data: {all_folds}")
-    print(f"Building indices for excluded folds: {folds}")
+    print(f"Building indices (mode={mode}) for folds: {folds}")
 
     fold_provenance = {}
+    prefix = 'only' if mode == 'only' else 'exclude'
 
-    for exclude_fold in folds:
+    for target_fold in folds:
         # Skip if index already exists
-        index_path = os.path.join(output_dir, f'index_exclude_fold_{exclude_fold}.faiss')
-        metadata_path = os.path.join(output_dir, f'metadata_exclude_fold_{exclude_fold}.pkl')
+        index_path = os.path.join(output_dir, f'index_{prefix}_fold_{target_fold}.faiss')
+        metadata_path = os.path.join(output_dir, f'metadata_{prefix}_fold_{target_fold}.pkl')
         if os.path.exists(index_path) and os.path.exists(metadata_path):
-            print(f"\n  Fold {exclude_fold}: index already exists, skipping")
+            print(f"\n  Fold {target_fold}: index already exists, skipping")
             continue
 
         print(f"\n{'=' * 50}")
-        print(f"Building index excluding fold {exclude_fold}")
+        if mode == 'only':
+            print(f"Building index containing ONLY fold {target_fold}")
+        else:
+            print(f"Building index excluding fold {target_fold}")
         print(f"{'=' * 50}")
 
-        # Collect embeddings from all other folds
         all_embeddings = []
         all_metadata = []
-
         proteins_included = 0
         proteins_excluded = 0
         residues_by_fold = {}
 
         for bmrb_id, prot_data in data.items():
-            if prot_data['fold'] == exclude_fold:
+            if mode == 'only':
+                include = (prot_data['fold'] == target_fold)
+            else:
+                include = (prot_data['fold'] != target_fold)
+            if not include:
                 proteins_excluded += 1
                 continue
 
@@ -240,7 +396,7 @@ def build_fold_indices(
         total_residues = len(all_embeddings)
 
         print(f"  Proteins included: {proteins_included}")
-        print(f"  Proteins excluded (fold {exclude_fold}): {proteins_excluded}")
+        print(f"  Proteins excluded: {proteins_excluded}")
         print(f"  Total residues in index: {total_residues:,}")
         for f_val in sorted(residues_by_fold):
             print(f"    Fold {f_val}: {residues_by_fold[f_val]:,} residues")
@@ -281,20 +437,15 @@ def build_fold_indices(
         index.add(all_embeddings)
         index.nprobe = FAISS_NPROBE
 
-        # Save index
-        index_path = os.path.join(output_dir, f'index_exclude_fold_{exclude_fold}.faiss')
+        # Save index + metadata using the mode-specific prefix
         faiss.write_index(index, index_path)
         print(f"  Saved index to {index_path}")
-
-        # Save metadata
-        metadata_path = os.path.join(
-            output_dir, f'metadata_exclude_fold_{exclude_fold}.pkl',
-        )
         with open(metadata_path, 'wb') as f:
             pickle.dump(all_metadata, f)
         print(f"  Saved metadata ({len(all_metadata):,} entries) to {metadata_path}")
 
-        fold_provenance[exclude_fold] = {
+        fold_provenance[target_fold] = {
+            'mode': mode,
             'proteins_included': proteins_included,
             'proteins_excluded': proteins_excluded,
             'total_residues': total_residues,
@@ -329,7 +480,9 @@ def main():
     )
     parser.add_argument(
         '--output_dir', default=None,
-        help='Output directory for indices (default: <data_dir>/retrieval_indices)',
+        help='Output directory for indices (default: /home/brooks/1TB/Wynn/'
+             '<data_dir_basename>/retrieval_indices — 1TB drive, since FAISS '
+             'indices are ~12 GB each × 5 folds)',
     )
     parser.add_argument(
         '--folds', type=int, nargs='+', default=[1, 2, 3, 4, 5],
@@ -339,12 +492,21 @@ def main():
         '--no_gpu', action='store_true',
         help='Disable GPU for index building',
     )
+    parser.add_argument(
+        '--mode', choices=['only', 'exclude'], default='only',
+        help='Index semantics. "only" (default, correct): each fold_k index '
+             'contains only fold k residues, matching the per-fold cache '
+             'design where fold_k/ retrieves from fold k. "exclude" (legacy, '
+             'leaky): each fold_k index contains everything except fold k.',
+    )
     args = parser.parse_args()
 
     if args.embeddings is None:
         args.embeddings = os.path.join(args.data_dir, 'esm_embeddings.h5')
     if args.output_dir is None:
-        args.output_dir = os.path.join(args.data_dir, 'retrieval_indices')
+        # Default to 1TB drive to avoid filling main disk (~60 GB per dataset)
+        ds_name = os.path.basename(os.path.abspath(args.data_dir))
+        args.output_dir = f'/home/brooks/1TB/Wynn/{ds_name}_retrieval_indices'
 
     print("=" * 60)
     print("FAISS Retrieval Index Builder (Better Data Pipeline)")
@@ -358,14 +520,36 @@ def main():
     print(f"  GPU:             {'disabled' if args.no_gpu else 'enabled'}")
     print()
 
-    # Locate compiled CSV
-    # Try common dataset names in order of preference
+    # Locate compiled CSV — try full names first, then per-fold files if present
     csv_path = None
-    for name in ['structure_data_hybrid.csv', 'structure_data.csv', 'compiled_dataset.csv', 'sidechain_structure_data.csv', 'small_structure_data.csv']:
+    for name in ['structure_data_hybrid.csv', 'structure_data.csv',
+                 'compiled_dataset.csv', 'sidechain_structure_data.csv',
+                 'small_structure_data.csv']:
         candidate = os.path.join(args.data_dir, name)
         if os.path.exists(candidate):
             csv_path = candidate
             break
+    # Fallback: if only per-fold CSVs exist, virtually concatenate them.
+    per_fold_csvs = [os.path.join(args.data_dir, f'structure_data_hybrid_fold_{f}.csv')
+                     for f in range(1, 6)]
+    if csv_path is None and all(os.path.exists(p) for p in per_fold_csvs):
+        print("  No single CSV found; concatenating per-fold files in memory")
+        parts = []
+        for p in per_fold_csvs:
+            # Use only the columns we actually need for index building
+            hdr = pd.read_csv(p, nrows=0).columns
+            keep = [c for c in hdr if c == 'bmrb_id' or c == 'residue_id'
+                    or c == 'residue_code' or c == 'split'
+                    or c.endswith('_shift') or c.endswith('_ambiguity_code')]
+            parts.append(pd.read_csv(p, usecols=keep, dtype={'bmrb_id': str}, low_memory=False))
+        df_full = pd.concat(parts, ignore_index=True)
+        del parts
+        # Write a temp combined csv for downstream consumers (or pass directly)
+        tmp_csv = os.path.join(args.output_dir, '_tmp_combined.csv')
+        os.makedirs(args.output_dir, exist_ok=True)
+        df_full.to_csv(tmp_csv, index=False)
+        del df_full
+        csv_path = tmp_csv
     if csv_path is None:
         candidates = [f for f in os.listdir(args.data_dir) if f.endswith('.csv')]
         raise FileNotFoundError(
@@ -378,12 +562,55 @@ def main():
     shift_cols = get_shift_columns(df_sample.columns.tolist())
     print(f"Shift columns ({len(shift_cols)}): {shift_cols}")
 
-    # Load data
-    data, load_provenance = load_embeddings_and_shifts(
-        h5_path=args.embeddings,
-        csv_path=csv_path,
-        shift_cols=shift_cols,
-    )
+    # Memory-efficient path: do NOT load all embeddings upfront. Instead
+    # read fold assignments + shifts from CSV (small), then stream embeddings
+    # per-fold from HDF5 inside build_fold_indices_streaming().
+    print("Loading fold + shift data from CSV (memory-efficient)...")
+    header = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    keep = ['bmrb_id', 'residue_id', 'residue_code']
+    fold_col = None
+    for c in ('split', 'fold'):
+        if c in header:
+            keep.append(c); fold_col = c
+    keep.extend([c for c in header if c in shift_cols])
+    df = pd.read_csv(csv_path, usecols=keep, dtype={'bmrb_id': str}, low_memory=False)
+    print(f"  CSV: {len(df):,} rows, {df['bmrb_id'].nunique()} proteins")
+
+    # Fold assignments (one per bmrb_id)
+    fold_assignments = df.groupby('bmrb_id')[fold_col].first().astype(int).to_dict()
+
+    # For each bmrb_id, open its h5 group once to get stored residue_ids,
+    # then fill shifts/mask/residue_codes arrays aligned to those rids.
+    print("Building per-protein shift arrays (aligned to h5 residue_ids)...")
+    shift_data = {}
+    with h5py.File(args.embeddings, 'r') as h5f:
+        emb_group = h5f['embeddings']
+        for bmrb_id, protein_df in tqdm(df.groupby('bmrb_id'), desc='  proteins'):
+            bmrb_str = str(bmrb_id)
+            if bmrb_str not in emb_group:
+                continue
+            stored_rids = emb_group[bmrb_str]['residue_ids'][:]
+            rid_to_idx = {int(rid): i for i, rid in enumerate(stored_rids)}
+            n_res = len(stored_rids)
+            shifts = np.zeros((n_res, len(shift_cols)), dtype=np.float32)
+            shift_mask = np.zeros((n_res, len(shift_cols)), dtype=bool)
+            residue_codes = np.zeros(n_res, dtype=np.int32)
+            protein_df = protein_df.sort_values('residue_id')
+            for _, row in protein_df.iterrows():
+                rid = int(row['residue_id'])
+                if rid not in rid_to_idx: continue
+                idx = rid_to_idx[rid]
+                code = str(row.get('residue_code', 'UNK')).upper()
+                residue_codes[idx] = RESIDUE_TO_IDX.get(code, RESIDUE_TO_IDX['UNK'])
+                for si, col in enumerate(shift_cols):
+                    v = row.get(col)
+                    if v is not None and pd.notna(v):
+                        shifts[idx, si] = float(v)
+                        shift_mask[idx, si] = True
+            shift_data[bmrb_str] = {'shifts': shifts, 'shift_mask': shift_mask,
+                                    'residue_codes': residue_codes}
+    del df
+    print(f"  Shift data built for {len(shift_data)} proteins")
 
     # Save shift columns
     os.makedirs(args.output_dir, exist_ok=True)
@@ -392,13 +619,17 @@ def main():
         json.dump(shift_cols, f)
     print(f"\nSaved shift_cols.json ({len(shift_cols)} columns)")
 
-    # Build indices
+    # Build indices (streaming — loads embeddings per fold only)
     t0 = time.time()
-    fold_provenance = build_fold_indices(
-        data=data,
+    fold_provenance = build_fold_indices_streaming(
+        h5_path=args.embeddings,
+        fold_assignments=fold_assignments,
+        shift_data=shift_data,
         output_dir=args.output_dir,
         folds=args.folds,
+        shift_cols=shift_cols,
         use_gpu=not args.no_gpu,
+        mode=args.mode,
     )
     elapsed = time.time() - t0
 
@@ -418,19 +649,12 @@ def main():
     print("\n" + "=" * 60)
     print("PROVENANCE REPORT")
     print("=" * 60)
-    print(f"  Data loading:")
-    print(f"    Proteins in HDF5:         {load_provenance['proteins_in_h5']}")
-    print(f"    Proteins in CSV:          {load_provenance['proteins_in_csv']}")
-    print(f"    Proteins matched:         {load_provenance['proteins_matched']}")
-    print(f"    Removed (no fold):        {load_provenance['proteins_no_fold']}")
-    print(f"    Removed (no shifts):      {load_provenance['proteins_no_shifts']}")
-    print(f"    Removed (not in HDF5):    {load_provenance['proteins_not_in_h5']}")
+    print(f"  Proteins with fold assignments: {len(fold_assignments)}")
+    print(f"  Proteins with shift data:       {len(shift_data)}")
     print()
     print(f"  Index building ({elapsed:.1f}s):")
     for fold_k, fp in sorted(fold_provenance.items()):
-        print(f"    Fold {fold_k} excluded:")
-        print(f"      Proteins in index:  {fp['proteins_included']}")
-        print(f"      Proteins excluded:  {fp['proteins_excluded']}")
+        print(f"    Fold {fold_k} ({fp.get('mode', 'only')}):")
         print(f"      Residues in index:  {fp['total_residues']:,}")
         print(f"      IVF clusters:       {fp['n_ivf_clusters']}")
     print("=" * 60)
