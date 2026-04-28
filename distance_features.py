@@ -129,3 +129,78 @@ def compute_all_distance_features(atoms):
     features.update(calc_all_distances(atoms))
     features.update(calc_sidechain_summary(atoms))
     return features
+
+
+def calc_cross_residue_distances(atoms_self, atoms_other,
+                                  heavy_cutoff=8.0, h_cutoff=6.0):
+    """Compute cross-residue atom-pair distances under H-rules.
+
+    Used by Phase 1 sidechain-aware features. The center residue (atoms_self)
+    is paired against another residue (atoms_other) — a sequence-window
+    neighbor or a spatial neighbor — with the same H-heavy rules used for
+    intra-residue distances:
+      - heavy-heavy:   include up to heavy_cutoff
+      - hydrogen-heavy: include up to h_cutoff (any direction)
+      - hydrogen-hydrogen: exclude
+
+    Args:
+        atoms_self:  Dict atom_name -> np.array([x, y, z]) for the center residue
+        atoms_other: Dict atom_name -> np.array([x, y, z]) for the partner residue
+        heavy_cutoff: Distance cutoff (Å) for heavy-heavy pairs
+        h_cutoff: Distance cutoff (Å) for H-heavy pairs
+
+    Returns:
+        List of (a1_name, a2_name, distance) tuples, sorted ascending by
+        distance. Names are NOT lexicographically reordered — a1 is always
+        the atom from atoms_self and a2 is always from atoms_other, so the
+        caller can apply per-side semantics if needed.
+    """
+    self_heavy = []
+    self_hyd = []
+    for name, coord in atoms_self.items():
+        if not np.all(np.isfinite(coord)):
+            continue
+        cls = classify_atom(name)
+        if cls == 'heavy':
+            self_heavy.append((name, coord))
+        elif cls == 'hydrogen':
+            self_hyd.append((name, coord))
+
+    other_heavy = []
+    other_hyd = []
+    for name, coord in atoms_other.items():
+        if not np.all(np.isfinite(coord)):
+            continue
+        cls = classify_atom(name)
+        if cls == 'heavy':
+            other_heavy.append((name, coord))
+        elif cls == 'hydrogen':
+            other_hyd.append((name, coord))
+
+    pairs = []
+
+    # Heavy-heavy
+    for (n1, c1) in self_heavy:
+        for (n2, c2) in other_heavy:
+            d = float(np.linalg.norm(c1 - c2))
+            if np.isfinite(d) and d <= heavy_cutoff:
+                pairs.append((n1, n2, d))
+
+    # H(self) -> heavy(other)
+    for (n1, c1) in self_hyd:
+        for (n2, c2) in other_heavy:
+            d = float(np.linalg.norm(c1 - c2))
+            if np.isfinite(d) and d <= h_cutoff:
+                pairs.append((n1, n2, d))
+
+    # heavy(self) -> H(other)
+    for (n1, c1) in self_heavy:
+        for (n2, c2) in other_hyd:
+            d = float(np.linalg.norm(c1 - c2))
+            if np.isfinite(d) and d <= h_cutoff:
+                pairs.append((n1, n2, d))
+
+    # H-H excluded (matches intra rule)
+
+    pairs.sort(key=lambda t: t[2])
+    return pairs

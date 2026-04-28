@@ -44,6 +44,7 @@ from config import (
     SS_TYPES, SS_TO_IDX, N_SS_TYPES,
     MISMATCH_TYPES, MISMATCH_TO_IDX, N_MISMATCH_TYPES,
     DSSP_COLS, N_BOND_GEOM,
+    MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES,
 )
 
 
@@ -128,6 +129,10 @@ class CachedRetrievalDataset(Dataset):
         self.k_spatial = config['k_spatial']
         self.max_valid_distances = config['max_valid_distances']
         self.total_residues = config['total_residues']
+        # Cross-residue distance features (Phase 1). Default to global config
+        # constants so backward-compat caches without these keys still work.
+        self.max_cross_distances = config.get('max_cross_distances', MAX_CROSS_DISTANCES)
+        self.n_cross_offset_types = config.get('n_cross_offset_types', N_CROSS_OFFSET_TYPES)
 
         # Load stats from config if not provided (for backward compatibility)
         if stats is None and 'stats' in config:
@@ -250,6 +255,24 @@ class CachedRetrievalDataset(Dataset):
         self.flat_dist_atom1 = np.load(sd / 'dist_atom1.npy', mmap_mode='r')
         self.flat_dist_atom2 = np.load(sd / 'dist_atom2.npy', mmap_mode='r')
         self.flat_dist_values = np.load(sd / 'dist_values.npy', mmap_mode='r')
+
+        # Cross-residue distances (Phase 1). Backward-compat: if the cross
+        # arrays don't exist, set to None and __getitem__ will zero-fill.
+        cross_a1_path = sd / 'cross_atom1.npy'
+        if cross_a1_path.exists():
+            self.flat_cross_atom1 = np.load(sd / 'cross_atom1.npy', mmap_mode='r')
+            self.flat_cross_atom2 = np.load(sd / 'cross_atom2.npy', mmap_mode='r')
+            self.flat_cross_offset = np.load(sd / 'cross_offset.npy', mmap_mode='r')
+            self.flat_cross_values = np.load(sd / 'cross_values.npy', mmap_mode='r')
+            self.flat_cross_count = torch.from_numpy(np.load(sd / 'cross_count.npy'))
+            self.has_cross_features = True
+        else:
+            self.flat_cross_atom1 = None
+            self.flat_cross_atom2 = None
+            self.flat_cross_offset = None
+            self.flat_cross_values = None
+            self.flat_cross_count = None
+            self.has_cross_features = False
 
         # BMRB ID mapping for retrieval
         with open(sd / 'bmrb_mapping.json', 'r') as f:
@@ -429,6 +452,30 @@ class CachedRetrievalDataset(Dataset):
         else:
             bond_geom = torch.zeros(W, N_BOND_GEOM, dtype=torch.float32)
 
+        # Cross-residue distance features at the center position (Phase 1).
+        # Only the center residue gets cross-pairs — window non-center positions
+        # get only intra (their CNN aggregation already mixes spatial context).
+        # Backward-compat: zero-filled tensors when cross arrays absent.
+        M_CR = self.max_cross_distances
+        cross_atom1_idx = torch.full((M_CR,), self.n_atom_types, dtype=torch.long)
+        cross_atom2_idx = torch.full((M_CR,), self.n_atom_types, dtype=torch.long)
+        cross_offset_idx = torch.full((M_CR,), self.n_cross_offset_types, dtype=torch.long)
+        cross_distances = torch.zeros(M_CR, dtype=torch.float32)
+        cross_dist_mask = torch.zeros(M_CR, dtype=torch.bool)
+        if self.has_cross_features and self.flat_cross_count is not None:
+            nc = int(self.flat_cross_count[global_idx].item())
+            if nc > 0:
+                nc = min(nc, M_CR)
+                cross_atom1_idx[:nc] = torch.from_numpy(
+                    self.flat_cross_atom1[global_idx, :nc].astype(np.int64))
+                cross_atom2_idx[:nc] = torch.from_numpy(
+                    self.flat_cross_atom2[global_idx, :nc].astype(np.int64))
+                cross_offset_idx[:nc] = torch.from_numpy(
+                    self.flat_cross_offset[global_idx, :nc].astype(np.int64))
+                cross_distances[:nc] = torch.from_numpy(
+                    self.flat_cross_values[global_idx, :nc].astype(np.float32))
+                cross_dist_mask[:nc] = True
+
         # Targets — re-normalize per-AA if stats available
         shift_target = self.flat_shifts[global_idx]  # globally z-normalized
         shift_mask = self.flat_shift_mask[global_idx]
@@ -537,6 +584,13 @@ class CachedRetrievalDataset(Dataset):
             'neighbor_distances': neighbor_distances,
             'neighbor_dist_mask': neighbor_dist_mask,
             'bond_geom': bond_geom,
+
+            # Cross-residue distance features (center residue only)
+            'cross_atom1_idx': cross_atom1_idx,
+            'cross_atom2_idx': cross_atom2_idx,
+            'cross_offset_idx': cross_offset_idx,
+            'cross_distances': cross_distances,
+            'cross_dist_mask': cross_dist_mask,
 
             # Targets
             'shift_target': shift_target,

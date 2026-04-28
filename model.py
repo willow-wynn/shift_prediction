@@ -43,6 +43,7 @@ from config import (
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
     N_BOND_GEOM,
+    MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES, CROSS_OFFSET_EMBED_DIM,
 )
 
 
@@ -114,6 +115,89 @@ class DistanceAttentionPerPosition(nn.Module):
         fallback = self.fallback_embed.view(1, 1, -1).expand(B, W, -1)
         output = torch.where(any_valid.unsqueeze(-1), output, fallback)
 
+        return output
+
+
+class CrossDistanceAttention(nn.Module):
+    """Attention over CROSS-residue atom-pair distances at the center position.
+
+    Identical structure to DistanceAttentionPerPosition except:
+      - Each pair carries an offset code (which neighbor residue the partner
+        atom belongs to: ±5 sequence window or one of 5 spatial neighbors).
+        Encoded as a small embedding concatenated alongside atom embeddings.
+      - Optionally shares the atom_embed weights with the intra module so
+        the meaning of an atom type is consistent across both pathways.
+      - Operates on a single position per sample (B, 1, M_CR), since only
+        the center residue gets cross-features in Phase 1.
+    """
+
+    def __init__(self, n_atom_types, n_offset_types,
+                 atom_embed_dim=32, offset_embed_dim=8,
+                 hidden_dim=256, dropout=0.25,
+                 shared_atom_embed: nn.Embedding = None):
+        super().__init__()
+
+        self.n_atom_types = n_atom_types
+        self.n_offset_types = n_offset_types
+        self.atom_embed_dim = atom_embed_dim
+        self.offset_embed_dim = offset_embed_dim
+        self.hidden_dim = hidden_dim
+
+        if shared_atom_embed is not None:
+            self.atom_embed = shared_atom_embed
+        else:
+            self.atom_embed = nn.Embedding(
+                n_atom_types + 1, atom_embed_dim, padding_idx=n_atom_types)
+        self.offset_embed = nn.Embedding(
+            n_offset_types + 1, offset_embed_dim, padding_idx=n_offset_types)
+        # Initialize offset embedding to zero so a freshly-introduced cross
+        # pathway makes no contribution at start of training (lets the model
+        # rediscover the cross signal incrementally).
+        with torch.no_grad():
+            self.offset_embed.weight.zero_()
+
+        input_dim = atom_embed_dim * 2 + offset_embed_dim + 1
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.attn_score = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+        self.value_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.fallback_embed = nn.Parameter(torch.zeros(hidden_dim))
+        self.out_dim = hidden_dim
+
+    def forward(self, atom1_idx, atom2_idx, offset_idx, distances, mask):
+        """Args all shaped (B, 1, M_CR). Returns (B, 1, hidden_dim)."""
+        B, P, D = distances.shape
+
+        atom1_emb = self.atom_embed(atom1_idx)        # (B, 1, M_CR, atom_dim)
+        atom2_emb = self.atom_embed(atom2_idx)
+        off_emb = self.offset_embed(offset_idx)        # (B, 1, M_CR, off_dim)
+
+        distances = distances * mask.float()
+        combined = torch.cat([
+            atom1_emb, atom2_emb, off_emb, distances.unsqueeze(-1)
+        ], dim=-1)
+
+        hidden = self.input_proj(combined)
+        scores = self.attn_score(hidden).squeeze(-1)
+        any_valid = mask.any(dim=2)
+        scores = scores.masked_fill(~mask, -1e4)
+        attn_weights = F.softmax(scores, dim=-1)
+        values = self.value_proj(hidden)
+        output = (values * attn_weights.unsqueeze(-1)).sum(dim=2)
+        fallback = self.fallback_embed.view(1, 1, -1).expand(B, P, -1)
+        output = torch.where(any_valid.unsqueeze(-1), output, fallback)
         return output
 
 
@@ -480,6 +564,23 @@ class ShiftPredictor(nn.Module):
             dropout=0.25
         )
 
+        # Cross-residue distance attention (Phase 1 sidechain-aware features).
+        # Shares atom_embed weights with the intra distance attention so atom
+        # type semantics stay consistent across both pathways. Output is
+        # added as a residual at the center window position before the CNN.
+        # Output is zero at init (offset_embed.weight starts at zero, see
+        # CrossDistanceAttention.__init__) so old checkpoints behave
+        # identically until cross-features are wired in via training.
+        self.cross_distance_attention = CrossDistanceAttention(
+            n_atom_types=n_atom_types,
+            n_offset_types=N_CROSS_OFFSET_TYPES,
+            atom_embed_dim=dist_attn_embed,
+            offset_embed_dim=CROSS_OFFSET_EMBED_DIM,
+            hidden_dim=dist_attn_hidden,
+            dropout=0.25,
+            shared_atom_embed=self.distance_attention.atom_embed,
+        )
+
         self.residue_embed = nn.Embedding(n_residue_types + 1, 64)
         self.ss_embed = nn.Embedding(n_ss_types + 1, 32)
         self.mismatch_embed = nn.Embedding(n_mismatch_types + 1, 16)
@@ -585,6 +686,9 @@ class ShiftPredictor(nn.Module):
         # Spatial neighbor distance features
         neighbor_atom1_idx=None, neighbor_atom2_idx=None,
         neighbor_distances=None, neighbor_dist_mask=None,
+        # Cross-residue distance features (Phase 1: center residue only)
+        cross_atom1_idx=None, cross_atom2_idx=None, cross_offset_idx=None,
+        cross_distances=None, cross_dist_mask=None,
         # Inter-residue bond geometry
         bond_geom=None,
         # Retrieval inputs
@@ -603,6 +707,25 @@ class ShiftPredictor(nn.Module):
 
         # ========== Base encoder ==========
         dist_emb = self.distance_attention(atom1_idx, atom2_idx, distances, dist_mask)
+
+        # Cross-residue features at the center position (Phase 1).
+        # When cross_* tensors are absent (old caches) or all-masked, the
+        # CrossDistanceAttention falls back to its (zero-initialized) fallback
+        # embedding so this is identity for legacy checkpoints/caches.
+        if cross_atom1_idx is not None and cross_distances is not None:
+            cross_a1 = cross_atom1_idx.unsqueeze(1)         # (B, 1, M_CR)
+            cross_a2 = cross_atom2_idx.unsqueeze(1)
+            cross_off = cross_offset_idx.unsqueeze(1)
+            cross_d = cross_distances.unsqueeze(1)
+            cross_m = cross_dist_mask.unsqueeze(1)
+            cross_emb = self.cross_distance_attention(
+                cross_a1, cross_a2, cross_off, cross_d, cross_m
+            ).squeeze(1)                                     # (B, hidden_dim)
+            W = dist_emb.size(1)
+            center_w = W // 2
+            mask_w = torch.zeros(W, device=dist_emb.device)
+            mask_w[center_w] = 1.0
+            dist_emb = dist_emb + cross_emb.unsqueeze(1) * mask_w.view(1, -1, 1)
 
         res_emb = self.residue_embed(residue_idx)
         ss_emb = self.ss_embed(ss_idx)

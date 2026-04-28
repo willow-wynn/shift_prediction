@@ -179,6 +179,25 @@ RETRIEVAL_DROPOUT = 0.3
 MAX_VALID_DISTANCES = 400
 
 # ============================================================================
+# Cross-residue distance features (Phase 1 of sidechain-aware features)
+# ============================================================================
+# Cross-residue heavy-heavy + H-heavy atom-pair distances between the center
+# residue and (a) ±CONTEXT_WINDOW sequence neighbors and (b) the K_SPATIAL_NEIGHBORS
+# spatial neighbors. These give the model line-of-sight to ring-current
+# (TYR/PHE/TRP), disulfide (CYS/MET), and H-bond geometry that the intra-only
+# distance attention cannot see.
+MAX_CROSS_DISTANCES = 200            # per residue, distance-ascending priority pruning
+CROSS_DIST_CUTOFF   = 8.0            # Å — heavy-heavy cutoff
+CROSS_H_CUTOFF      = 6.0            # Å — H-to-heavy cutoff (H is closer)
+# Offset code space: 0=intra (reserved), 1..(2*CONTEXT_WINDOW+1)=window neighbors
+# (signed -CW..+CW shifted to 1..(2*CW+1) excluding center=CW+1 which is unused),
+# (2*CW+2)..(2*CW+1+K_SPATIAL_NEIGHBORS)=spatial slots, last id = padding.
+N_CROSS_OFFSET_TYPES = 1 + (2 * CONTEXT_WINDOW + 1) + K_SPATIAL_NEIGHBORS
+# = 1 + 11 + 5 = 17 ids (0=intra, 1..11=window, 12..16=spatial). +1 reserved
+# for padding handled inside the embedding (padding_idx = N_CROSS_OFFSET_TYPES).
+CROSS_OFFSET_EMBED_DIM = 8
+
+# ============================================================================
 # RCSB / AlphaFold API
 # ============================================================================
 RCSB_SEARCH_URL = 'https://search.rcsb.org/rcsbsearch/v2/query'

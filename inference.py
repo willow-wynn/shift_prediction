@@ -36,10 +36,12 @@ from config import (
     AA_3_TO_1, ESM_MODEL_NAME, ESM_EMBED_DIM, ESM_REPR_LAYER,
     FAISS_NPROBE,
     N_BOND_GEOM,
+    MAX_CROSS_DISTANCES, CROSS_DIST_CUTOFF, CROSS_H_CUTOFF,
+    N_CROSS_OFFSET_TYPES,
 )
 from model import ShiftPredictorWithRetrieval
 from pdb_utils import parse_pdb, run_dssp
-from distance_features import compute_all_distance_features
+from distance_features import compute_all_distance_features, calc_cross_residue_distances
 from spatial_neighbors import find_neighbors
 
 
@@ -371,6 +373,66 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None, dssp_st
             if wrid >= 0 and wrid in bond_geom_by_rid:
                 bond_geom[w] = torch.from_numpy(bond_geom_by_rid[wrid])
 
+        # Cross-residue distance pairs (Phase 1).
+        # MUST mirror the cache builder exactly (gated by parity test):
+        #   - heavy×heavy with heavy_cutoff, H×heavy with h_cutoff
+        #   - offset code: 0=intra (unused here), 1..2*CW+1 = window
+        #     (-CW..+CW shifted to 1..2*CW+1, slot CW+1 = self is unused),
+        #     2*CW+2..2*CW+1+K_SP = spatial slots
+        #   - skip spatial neighbors that are also in the ±CW window (dedup)
+        #   - sort by distance ascending, take top MAX_CROSS_DISTANCES
+        #   - apply same /10 clip as intra
+        M_CR = MAX_CROSS_DISTANCES
+        cross_atom1_idx = torch.full((M_CR,), n_atom_types, dtype=torch.long)
+        cross_atom2_idx = torch.full((M_CR,), n_atom_types, dtype=torch.long)
+        cross_offset_idx = torch.full((M_CR,), N_CROSS_OFFSET_TYPES, dtype=torch.long)
+        cross_distances = torch.zeros(M_CR, dtype=torch.float32)
+        cross_dist_mask = torch.zeros(M_CR, dtype=torch.bool)
+
+        cross_pairs_buf = []
+        atoms_center = aa_data[center_rid]['atoms']
+        window_partners = set()
+
+        for off in range(-CONTEXT_WINDOW, CONTEXT_WINDOW + 1):
+            if off == 0:
+                continue
+            nrid = center_rid + off
+            if nrid not in aa_data:
+                continue
+            window_partners.add(nrid)
+            other_atoms = aa_data[nrid]['atoms']
+            code = off + CONTEXT_WINDOW + 1   # -CW..+CW -> 1..2*CW+1 (CW+1=self unused)
+            for (a1_name, a2_name, d) in calc_cross_residue_distances(
+                atoms_center, other_atoms,
+                heavy_cutoff=CROSS_DIST_CUTOFF, h_cutoff=CROSS_H_CUTOFF,
+            ):
+                if a1_name in atom_to_idx and a2_name in atom_to_idx:
+                    cross_pairs_buf.append((
+                        atom_to_idx[a1_name], atom_to_idx[a2_name], code, d))
+
+        for k, nrid in enumerate(nb_info['ids']):
+            if nrid < 0 or nrid not in aa_data or nrid in window_partners:
+                continue
+            other_atoms = aa_data[nrid]['atoms']
+            code = 2 * CONTEXT_WINDOW + 2 + k   # spatial slot k -> 2*CW+2 + k
+            for (a1_name, a2_name, d) in calc_cross_residue_distances(
+                atoms_center, other_atoms,
+                heavy_cutoff=CROSS_DIST_CUTOFF, h_cutoff=CROSS_H_CUTOFF,
+            ):
+                if a1_name in atom_to_idx and a2_name in atom_to_idx:
+                    cross_pairs_buf.append((
+                        atom_to_idx[a1_name], atom_to_idx[a2_name], code, d))
+
+        # Distance-ascending priority pruning to M_CR
+        cross_pairs_buf.sort(key=lambda t: t[3])
+        cross_pairs_buf = cross_pairs_buf[:M_CR]
+        for i, (a1_i, a2_i, code, d) in enumerate(cross_pairs_buf):
+            cross_atom1_idx[i] = a1_i
+            cross_atom2_idx[i] = a2_i
+            cross_offset_idx[i] = code
+            cross_distances[i] = max(-5.0, min(d / 10.0, 10.0))
+            cross_dist_mask[i] = True
+
         residues.append({
             'residue_id': center_rid,
             'residue_name': res_name,
@@ -393,6 +455,11 @@ def extract_features_from_pdb(pdb_path, chain_id=None, atom_to_idx=None, dssp_st
             'neighbor_atom2_idx': neighbor_atom2_idx,
             'neighbor_distances': neighbor_distances,
             'neighbor_dist_mask': neighbor_dist_mask,
+            'cross_atom1_idx': cross_atom1_idx,
+            'cross_atom2_idx': cross_atom2_idx,
+            'cross_offset_idx': cross_offset_idx,
+            'cross_distances': cross_distances,
+            'cross_dist_mask': cross_dist_mask,
             'query_residue_code': query_residue_code,
             'query_struct': query_struct,
             'bond_geom': bond_geom,
