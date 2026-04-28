@@ -35,6 +35,7 @@ from config import (
     DATASET_DIRS, N_ATOM_TYPES, ATOM_TO_IDX,
     LEARNING_RATE, BATCH_SIZE, EPOCHS, HUBER_DELTA,
     WEIGHT_DECAY, K_SPATIAL_NEIGHBORS, K_RETRIEVED,
+    BIG_RUNS_DIR,
 )
 from dataset import CachedRetrievalDataset
 from model import create_model
@@ -79,8 +80,9 @@ def main():
     # Output
     parser.add_argument('--run_name', type=str, default=None,
                         help='Run name for output directory (default: auto)')
-    parser.add_argument('--output_dir', type=str, default='runs',
-                        help='Base output directory (default: runs/)')
+    parser.add_argument('--output_dir', type=str, default=BIG_RUNS_DIR,
+                        help=f'Base output directory (default: {BIG_RUNS_DIR}, '
+                             f'on 1TB drive to avoid filling main disk)')
 
     # System
     parser.add_argument('--device', type=str, default=None)
@@ -148,17 +150,29 @@ def main():
     if missing_folds:
         print(f"\n  Missing caches for folds: {missing_folds}")
         import subprocess
-        embeddings = os.path.join('data', 'esm_embeddings.h5')
-        index_dir = os.path.join('data', 'retrieval_indices')
+        # Use dataset-local embeddings/indices if they exist, else fall back to data/
+        embeddings = os.path.join(data_dir, 'struct_embeddings.h5')
+        if not os.path.exists(embeddings):
+            embeddings = os.path.join(data_dir, 'esm_embeddings.h5')
+        if not os.path.exists(embeddings):
+            embeddings = os.path.join('data', 'esm_embeddings.h5')
+        index_dir = os.path.join(data_dir, 'retrieval_indices')
+        if not os.path.isdir(index_dir):
+            index_dir = os.path.join('data', 'retrieval_indices')
+        # Note: don't pass --output_dir; let cache builder default to its
+        # 1TB-drive location and symlink <data_dir>/cache -> there. train.py
+        # reads from <data_dir>/cache afterwards either way.
         cmd = [
             sys.executable, '05_build_training_cache.py',
             '--data_dir', data_dir,
-            '--embeddings', embeddings,
-            '--index_dir', index_dir,
-            '--output_dir', cache_dir,
             '--folds', *[str(f) for f in missing_folds],
             '--device', args.cache_device,
         ]
+        # Only pass embeddings/index if they exist (otherwise --no_retrieval)
+        if os.path.exists(embeddings) and os.path.isdir(index_dir):
+            cmd.extend(['--embeddings', embeddings, '--index_dir', index_dir])
+        else:
+            cmd.append('--no_retrieval')
         print(f"  Building cache: {' '.join(cmd)}\n")
         result = subprocess.run(cmd)
         if result.returncode != 0:

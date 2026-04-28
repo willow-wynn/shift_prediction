@@ -105,7 +105,9 @@ def main():
         description='Extract structure model embeddings for retrieval')
     parser.add_argument('--checkpoint', default='data/checkpoints/best_fold1.pt')
     parser.add_argument('--cache_dir', default='data/cache')
-    parser.add_argument('--output', default='data/struct_retrieval/struct_embeddings.h5')
+    parser.add_argument('--output',
+                        default='/home/brooks/1TB/Wynn/struct_retrieval/struct_embeddings.h5',
+                        help='Output HDF5. Defaults to 1TB drive to avoid filling main disk.')
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--device', default=None)
     parser.add_argument('--folds', type=int, nargs='+', default=[1, 2, 3, 4, 5])
@@ -125,9 +127,46 @@ def main():
     print(f"  Device:     {device}")
     t0 = time.time()
 
-    # Load model
-    print("\nLoading model...")
-    model, info = load_model(args.checkpoint, device)
+    # Load model in structure-only mode (we only need base_encoding, not retrieval)
+    print("\nLoading model (structure-only mode)...")
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    clean_sd = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+    from model import create_model
+    from config import N_RESIDUE_TYPES, N_SS_TYPES, N_MISMATCH_TYPES
+
+    n_atom_types = clean_sd['distance_attention.atom_embed.weight'].shape[0] - 1
+    n_dssp = clean_sd['dssp_proj.weight'].shape[1] if 'dssp_proj.weight' in clean_sd else 0
+    struct_keys = sorted([k for k in clean_sd if k.startswith('struct_head.') and k.endswith('.weight')])
+    n_shifts = clean_sd[struct_keys[-1]].shape[0]
+    cnn_channels = []
+    for i in range(0, 10, 2):
+        key = f'cnn.{i}.conv1.weight'
+        if key in clean_sd:
+            cnn_channels.append(clean_sd[key].shape[0])
+    spatial_hidden = clean_sd.get('spatial_attention.fallback_embed', torch.zeros(192)).shape[0]
+
+    model = create_model(
+        n_atom_types=n_atom_types,
+        n_residue_types=N_RESIDUE_TYPES,
+        n_ss_types=N_SS_TYPES,
+        n_mismatch_types=N_MISMATCH_TYPES,
+        n_dssp=n_dssp,
+        n_shifts=n_shifts,
+        cnn_channels=cnn_channels,
+        spatial_hidden=spatial_hidden,
+        use_retrieval=False,
+    ).to(device)
+
+    # Load only the structure weights (ignore retrieval weights)
+    struct_keys_only = {k: v for k, v in clean_sd.items()
+                        if not any(k.startswith(p) for p in [
+                            'neighbor_encoder', 'self_attn_layers', 'cross_attn_layers',
+                            'cross_ffn_layers', 'direct_transfer', 'retrieval_gate',
+                            'physics_encoder'])}
+    model.load_state_dict(struct_keys_only, strict=False)
+    model.eval()
 
     # Extract from all folds
     all_protein_data = {}

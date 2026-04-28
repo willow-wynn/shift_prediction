@@ -80,7 +80,24 @@ DATASET_DIRS = {
     'hybrid': 'data',
     'alphafold': 'data_alphafold',
     'experimental': 'data_experimental',
+    'refdb': 'data_refdb',
+    'rereferenced': 'data_rereferenced',
 }
+
+# ============================================================================
+# Big-output storage root
+# ============================================================================
+# All scripts that write multi-GB outputs (training caches, embeddings, FAISS
+# indices, runs, per-protein benchmark files) should default to this root so
+# the main disk doesn't fill up. Main disk (/) is ~468 GB and constantly tight;
+# /home/brooks/1TB/ is the spinning disk with plenty of room.
+#
+# Pattern: use BIG_STORAGE as the default for any `--output_dir` CLI flag. If
+# an overriding path is passed, respect it (user knows what they're doing).
+BIG_STORAGE = '/home/brooks/1TB/Wynn'
+BIG_RUNS_DIR = f'{BIG_STORAGE}/runs'
+BIG_CACHES_DIR = f'{BIG_STORAGE}/caches'
+BIG_RESULTS_DIR = f'{BIG_STORAGE}/results'
 
 # ============================================================================
 # Inter-Residue Bond Geometry Columns
