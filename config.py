@@ -186,7 +186,16 @@ MAX_VALID_DISTANCES = 400
 # spatial neighbors. These give the model line-of-sight to ring-current
 # (TYR/PHE/TRP), disulfide (CYS/MET), and H-bond geometry that the intra-only
 # distance attention cannot see.
-MAX_CROSS_DISTANCES = 200            # per residue, distance-ascending priority pruning
+MAX_CROSS_DISTANCES = 600
+# Cap-rate sweep on v2 fold-1, 50-protein subset (data/struct_retrieval_v2):
+#   M_CR=200 → 68.7% of residues at cap (mean=186, signal-truncated)
+#   M_CR=400 → 44.3% at cap (mean=334)
+#   M_CR=600 →  4.3% at cap (mean=342, p99=600)
+#   M_CR=800 →  0.07% at cap (mean=345, p99=707)
+#   M_CR=1000 → 0.00% at cap (mean=345, max=824)
+# Mean stabilizes at ~345 by M_CR=600, so 600 captures essentially all
+# distinct structural signal under the 8 Å heavy / 6 Å H cutoffs. Cache
+# size delta: ~2.2 GB/fold hybrid, ~8.6 GB/fold AF.
 CROSS_DIST_CUTOFF   = 8.0            # Å — heavy-heavy cutoff
 CROSS_H_CUTOFF      = 6.0            # Å — H-to-heavy cutoff (H is closer)
 # Offset code space: 0=intra (reserved), 1..(2*CONTEXT_WINDOW+1)=window neighbors
