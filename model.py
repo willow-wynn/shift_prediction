@@ -580,6 +580,14 @@ class ShiftPredictor(nn.Module):
             dropout=0.25,
             shared_atom_embed=self.distance_attention.atom_embed,
         )
+        # Per-amino-acid sigmoid gate for the cross-residue residual.
+        # The model can downweight cross when it's noise (loop residues)
+        # and upweight it when it matters (aromatic-rich, disulfide,
+        # H-bond contexts). Init to logit=0 → gate=0.5 at start, so cross
+        # contributes at half strength and the model tunes per AA.
+        self.cross_gate = nn.Embedding(n_residue_types + 1, 1)
+        with torch.no_grad():
+            self.cross_gate.weight.zero_()
 
         self.residue_embed = nn.Embedding(n_residue_types + 1, 64)
         self.ss_embed = nn.Embedding(n_ss_types + 1, 32)
@@ -723,9 +731,16 @@ class ShiftPredictor(nn.Module):
             ).squeeze(1)                                     # (B, hidden_dim)
             W = dist_emb.size(1)
             center_w = W // 2
+            # Per-AA sigmoid gate on the cross residual
+            center_aa = residue_idx[:, center_w]              # (B,) long
+            gate = torch.sigmoid(self.cross_gate(center_aa)).squeeze(-1)  # (B,)
             mask_w = torch.zeros(W, device=dist_emb.device)
             mask_w[center_w] = 1.0
-            dist_emb = dist_emb + cross_emb.unsqueeze(1) * mask_w.view(1, -1, 1)
+            dist_emb = dist_emb + (
+                gate.view(B, 1, 1)
+                * cross_emb.unsqueeze(1)
+                * mask_w.view(1, -1, 1)
+            )
 
         res_emb = self.residue_embed(residue_idx)
         ss_emb = self.ss_embed(ss_idx)
