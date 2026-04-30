@@ -57,6 +57,9 @@ def main():
     # Data
     parser.add_argument('--data', choices=list(DATASET_DIRS.keys()), required=True)
     parser.add_argument('--fold', type=int, default=1, help='Test fold (1-5)')
+    parser.add_argument('--cache_dir', type=str, default=None,
+                        help='Override the cache directory (default: <data_dir>/cache). '
+                             'Use to point at struct_retrieval_v2/cache or other variants.')
 
     # Training
     parser.add_argument('--epochs', type=int, default=EPOCHS)
@@ -91,10 +94,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate flags
-    if args.freeze_base and args.structure_only:
-        print("ERROR: --freeze_base and --structure_only are mutually exclusive")
-        sys.exit(1)
+    # Validate flags.
+    # Note: --freeze_base + --structure_only is now allowed (Phase 1). It
+    # freezes the base encoder and the existing struct_head, leaving only
+    # cross_distance_attention + cross_gate trainable. Useful for isolating
+    # the contribution of the new cross-residue distance features on top of
+    # an already-trained struct-only baseline.
     if args.freeze_base and not args.base_checkpoint and not args.checkpoint:
         print("ERROR: --freeze_base requires --base_checkpoint or --checkpoint")
         sys.exit(1)
@@ -111,7 +116,9 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
 
     # Derive mode string
-    if args.structure_only:
+    if args.freeze_base and args.structure_only:
+        mode = 'frozen_struct_cross'   # Phase 1: only cross_* trainable
+    elif args.structure_only:
         mode = 'struct'
     elif args.freeze_base:
         mode = 'frozen_retrieval'
@@ -128,7 +135,7 @@ def main():
 
     # Resolve data paths
     data_dir = DATASET_DIRS[args.data]
-    cache_dir = os.path.join(data_dir, 'cache')
+    cache_dir = args.cache_dir or os.path.join(data_dir, 'cache')
 
     print("=" * 70)
     print(f"  Chemical Shift Prediction — {mode}")
