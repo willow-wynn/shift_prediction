@@ -60,6 +60,9 @@ def main():
     parser.add_argument('--cache_dir', type=str, default=None,
                         help='Override the cache directory (default: <data_dir>/cache). '
                              'Use to point at struct_retrieval_v2/cache or other variants.')
+    parser.add_argument('--mmap_structural', action='store_true',
+                        help='mmap the structural arrays (low RAM, slow on spinning '
+                             'disk). Default: load fully into RAM (~5 GB/fold).')
 
     # Training
     parser.add_argument('--epochs', type=int, default=EPOCHS)
@@ -198,7 +201,8 @@ def main():
 
     test_ds = CachedRetrievalDataset.load(
         os.path.join(cache_dir, f'fold_{args.fold}'),
-        n_shifts, K_RETRIEVED, stats=stats, shift_cols=shift_cols)
+        n_shifts, K_RETRIEVED, stats=stats, shift_cols=shift_cols,
+        mmap_structural=args.mmap_structural)
 
     train_parts = []
     for f in range(1, 6):
@@ -209,7 +213,8 @@ def main():
             print(f"ERROR: Cache not found at {fold_cache}")
             sys.exit(1)
         train_parts.append(CachedRetrievalDataset.load(
-            fold_cache, n_shifts, K_RETRIEVED, stats=stats, shift_cols=shift_cols))
+            fold_cache, n_shifts, K_RETRIEVED, stats=stats, shift_cols=shift_cols,
+            mmap_structural=args.mmap_structural))
     train_ds = ConcatDataset(train_parts)
     n_struct = getattr(train_parts[0], 'n_struct_features', 49)
 

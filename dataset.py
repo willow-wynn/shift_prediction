@@ -108,6 +108,7 @@ class CachedRetrievalDataset(Dataset):
         embedding_lookup=None,  # Only needed for create(), not load()
         stats: dict = None,     # Normalization stats for retrieved shifts
         shift_cols: list = None,  # Shift column names (for stats lookup)
+        mmap_structural: bool = False,  # If False, load all structural arrays into RAM
     ):
         """
         Load a cached dataset from disk.
@@ -118,6 +119,7 @@ class CachedRetrievalDataset(Dataset):
         self.embedding_lookup = embedding_lookup  # May be None for loaded datasets
         self.n_shifts = n_shifts
         self.k_retrieved = k_retrieved
+        self.mmap_structural = mmap_structural
 
         # Load config
         with open(self.cache_dir / 'config.json', 'r') as f:
@@ -251,19 +253,22 @@ class CachedRetrievalDataset(Dataset):
         self.protein_min_res = torch.from_numpy(np.load(sd / 'protein_min_res.npy'))
         self.protein_max_res = torch.from_numpy(np.load(sd / 'protein_max_res.npy'))
 
-        # Sparse distances - load as mmap for memory efficiency
-        self.flat_dist_atom1 = np.load(sd / 'dist_atom1.npy', mmap_mode='r')
-        self.flat_dist_atom2 = np.load(sd / 'dist_atom2.npy', mmap_mode='r')
-        self.flat_dist_values = np.load(sd / 'dist_values.npy', mmap_mode='r')
+        # Sparse distances. Default: load fully into RAM (≤ 5 GB / fold) so
+        # shuffled training doesn't thrash a spinning disk via mmap. Pass
+        # mmap_structural=True only if the host is RAM-constrained.
+        load_mode = 'r' if self.mmap_structural else None
+        self.flat_dist_atom1 = np.load(sd / 'dist_atom1.npy', mmap_mode=load_mode)
+        self.flat_dist_atom2 = np.load(sd / 'dist_atom2.npy', mmap_mode=load_mode)
+        self.flat_dist_values = np.load(sd / 'dist_values.npy', mmap_mode=load_mode)
 
         # Cross-residue distances (Phase 1). Backward-compat: if the cross
         # arrays don't exist, set to None and __getitem__ will zero-fill.
         cross_a1_path = sd / 'cross_atom1.npy'
         if cross_a1_path.exists():
-            self.flat_cross_atom1 = np.load(sd / 'cross_atom1.npy', mmap_mode='r')
-            self.flat_cross_atom2 = np.load(sd / 'cross_atom2.npy', mmap_mode='r')
-            self.flat_cross_offset = np.load(sd / 'cross_offset.npy', mmap_mode='r')
-            self.flat_cross_values = np.load(sd / 'cross_values.npy', mmap_mode='r')
+            self.flat_cross_atom1 = np.load(sd / 'cross_atom1.npy', mmap_mode=load_mode)
+            self.flat_cross_atom2 = np.load(sd / 'cross_atom2.npy', mmap_mode=load_mode)
+            self.flat_cross_offset = np.load(sd / 'cross_offset.npy', mmap_mode=load_mode)
+            self.flat_cross_values = np.load(sd / 'cross_values.npy', mmap_mode=load_mode)
             self.flat_cross_count = torch.from_numpy(np.load(sd / 'cross_count.npy'))
             self.has_cross_features = True
         else:
@@ -617,7 +622,8 @@ class CachedRetrievalDataset(Dataset):
 
     @classmethod
     def load(cls, cache_dir: str, n_shifts: int, k_retrieved: int = 32,
-             stats: dict = None, shift_cols: list = None):
+             stats: dict = None, shift_cols: list = None,
+             mmap_structural: bool = False):
         """Load a cached dataset from disk.
 
         Args:
@@ -626,8 +632,12 @@ class CachedRetrievalDataset(Dataset):
             k_retrieved: Number of retrieved neighbors
             stats: Normalization stats dict (REQUIRED for proper retrieval normalization)
             shift_cols: List of shift column names (REQUIRED for proper retrieval normalization)
+            mmap_structural: If True, mmap structural arrays (low RAM, slow on
+                spinning disk). Default False = load fully into RAM (~5 GB/fold).
         """
-        return cls(cache_dir, n_shifts, k_retrieved, stats=stats, shift_cols=shift_cols)
+        return cls(cache_dir, n_shifts, k_retrieved,
+                   stats=stats, shift_cols=shift_cols,
+                   mmap_structural=mmap_structural)
 
     @classmethod
     def exists(cls, cache_dir: str) -> bool:
