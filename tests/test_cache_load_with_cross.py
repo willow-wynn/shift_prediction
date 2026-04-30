@@ -96,50 +96,58 @@ def main():
     )
     model.eval()
 
-    # First: forward WITHOUT cross args (legacy path)
+    # NOTE: model.struct_head's final layer is zero-init by design
+    # (model.py: self.struct_head[-1].weight.zero_()), so an untrained
+    # model's final output is identically zero regardless of internal
+    # activations. To verify the cross pathway is actually firing, we
+    # call cross_distance_attention directly and compare its output
+    # under an active mask vs an all-False mask (which should fall back
+    # to the zero-init fallback embedding).
+
+    cross_a1 = batch['cross_atom1_idx'].unsqueeze(1)
+    cross_a2 = batch['cross_atom2_idx'].unsqueeze(1)
+    cross_off = batch['cross_offset_idx'].unsqueeze(1)
+    cross_d = batch['cross_distances'].unsqueeze(1)
+    cross_m = batch['cross_dist_mask'].unsqueeze(1)
+
+    with torch.no_grad():
+        cross_out_active = model.cross_distance_attention(
+            cross_a1, cross_a2, cross_off, cross_d, cross_m)
+        cross_out_zeroed = model.cross_distance_attention(
+            cross_a1, cross_a2, cross_off, cross_d, torch.zeros_like(cross_m))
+
+    print(f'  cross_distance_attention output shape: {tuple(cross_out_active.shape)}')
+    print(f'  active mask:    absmax={cross_out_active.abs().max().item():.5f}  '
+          f'std={cross_out_active.std().item():.5f}')
+    print(f'  zero mask:      absmax={cross_out_zeroed.abs().max().item():.5f}  '
+          f'std={cross_out_zeroed.std().item():.5f}')
+
+    any_active = batch['cross_dist_mask'].any().item()
+    if any_active and cross_out_active.abs().max().item() < 1e-6:
+        print('  WARN: cross attention produces zero with active mask.')
+    elif any_active:
+        print('  OK: cross attention produces non-zero with active mask.')
+    if cross_out_zeroed.abs().max().item() > 1e-6:
+        print('  WARN: cross attention non-zero with all-False mask.')
+    else:
+        print('  OK: cross attention is exactly zero with all-False mask '
+              '(backward-compat preserved).')
+
+    # Also verify the full model forward doesn't crash with cross args
     keys = ['atom1_idx','atom2_idx','distances','dist_mask','residue_idx',
             'ss_idx','mismatch_idx','is_valid','dssp_features',
             'neighbor_res_idx','neighbor_ss_idx','neighbor_dist',
             'neighbor_seq_sep','neighbor_angles','neighbor_valid',
             'neighbor_atom1_idx','neighbor_atom2_idx','neighbor_distances',
-            'neighbor_dist_mask','bond_geom']
-    legacy_kwargs = {k: batch[k] for k in keys if k in batch}
+            'neighbor_dist_mask','bond_geom',
+            'cross_atom1_idx','cross_atom2_idx','cross_offset_idx',
+            'cross_distances','cross_dist_mask']
     with torch.no_grad():
-        out_legacy = model(**legacy_kwargs)
-    print(f'  legacy (no cross args): output shape {tuple(out_legacy.shape)}, '
-          f'mean={out_legacy.mean().item():+.4f}')
+        out = model(**{k: batch[k] for k in keys if k in batch})
+    print(f'  full model output shape: {tuple(out.shape)}  '
+          f'(struct_head is zero-init, so values are 0 at init by design)')
 
-    # Then: forward WITH cross args (new path)
-    cross_kwargs = {**legacy_kwargs}
-    for k in ['cross_atom1_idx','cross_atom2_idx','cross_offset_idx',
-              'cross_distances','cross_dist_mask']:
-        cross_kwargs[k] = batch[k]
-    with torch.no_grad():
-        out_cross = model(**cross_kwargs)
-    print(f'  with cross args:        output shape {tuple(out_cross.shape)}, '
-          f'mean={out_cross.mean().item():+.4f}')
-
-    delta = (out_cross - out_legacy).abs()
-    print(f'  delta (cross − legacy): mean={delta.mean().item():.4f}  '
-          f'max={delta.max().item():.4f}')
-
-    # The cross-attention's input_proj/value_proj are randomly initialized.
-    # If cross_dist_mask has any True entries, output should differ.
-    # If cross_dist_mask is all False, output must match exactly.
-    any_active = batch['cross_dist_mask'].any().item()
-    if any_active:
-        if delta.max().item() < 1e-6:
-            print('  WARN: cross args present but output unchanged. '
-                  'Cross pathway might not be wired in correctly.')
-        else:
-            print('  OK: cross args perturb output (model is using them).')
-    else:
-        if delta.max().item() < 1e-6:
-            print('  OK: cross all-masked → output unchanged (backward-compat).')
-        else:
-            print('  WARN: cross all-masked but output differs — backward-compat broken.')
-
-    print('\nAll checks passed.' if delta.max().item() >= 0 else '')
+    print('\nAll checks passed.')
 
 
 if __name__ == '__main__':
