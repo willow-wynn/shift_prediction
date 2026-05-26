@@ -42,7 +42,7 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 import pandas as pd
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 N_FOLDS = 5
