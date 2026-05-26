@@ -28,8 +28,8 @@ from config import (
 # ============================================================================
 
 GRAD_CLIP = 1.0
-NUM_WORKERS = 4
-PREFETCH = 2
+NUM_WORKERS = 12
+PREFETCH = 4
 BACKBONE_SHIFTS = {'ca_shift', 'cb_shift', 'c_shift', 'n_shift', 'h_shift', 'ha_shift'}
 
 # Base encoder module prefixes (for freezing)
@@ -97,7 +97,19 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
 
     pbar = tqdm(loader, desc="  Train", leave=False)
 
+    # === PROFILE INSTRUMENTATION (env: CLAUDE_PROFILE=1) ===
+    import os as _os, time as _time
+    _profile = _os.environ.get('CLAUDE_PROFILE', '0') == '1'
+    _t_data = _t_h2d = _t_fwd = _t_bwd = _t_step = 0.0
+    _n_prof = 0
+    _t_iter_start = _time.perf_counter()
+    # =======================================================
+
     for batch_idx, batch in enumerate(pbar):
+        if _profile:
+            _t_after_data = _time.perf_counter()
+            _t_data += _t_after_data - _t_iter_start
+
         if device == 'cuda' and batch_idx > 0 and batch_idx % 50 == 0:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -106,7 +118,13 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
         target = batch.pop('shift_target')
         mask = batch.pop('shift_mask')
 
+        if _profile:
+            torch.cuda.synchronize() if device == 'cuda' else None
+            _t_after_h2d = _time.perf_counter()
+            _t_h2d += _t_after_h2d - _t_after_data
+
         if mask.sum() == 0:
+            if _profile: _t_iter_start = _time.perf_counter()
             continue
 
         optimizer.zero_grad(set_to_none=True)
@@ -117,8 +135,14 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
             loss = huber_loss_masked(pred, target, mask, delta=delta,
                                      shift_weights=shift_weights)
 
+        if _profile:
+            torch.cuda.synchronize() if device == 'cuda' else None
+            _t_after_fwd = _time.perf_counter()
+            _t_fwd += _t_after_fwd - _t_after_h2d
+
         if torch.isnan(loss) or torch.isinf(loss):
             nan_batches += 1
+            if _profile: _t_iter_start = _time.perf_counter()
             continue
 
         if scaler:
@@ -131,6 +155,21 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
+
+        if _profile:
+            torch.cuda.synchronize() if device == 'cuda' else None
+            _t_after_bwd = _time.perf_counter()
+            _t_bwd += _t_after_bwd - _t_after_fwd
+            _n_prof += 1
+            if _n_prof in (50, 100, 150, 200):
+                _total = _t_data + _t_h2d + _t_fwd + _t_bwd
+                print(f"\n[PROF n={_n_prof}] data_wait={_t_data*1000/_n_prof:.1f}ms  "
+                      f"h2d={_t_h2d*1000/_n_prof:.1f}ms  "
+                      f"fwd={_t_fwd*1000/_n_prof:.1f}ms  "
+                      f"bwd+step={_t_bwd*1000/_n_prof:.1f}ms  "
+                      f"|  total={_total*1000/_n_prof:.1f}ms/batch  "
+                      f"data_frac={100*_t_data/_total:.0f}%", flush=True)
+            _t_iter_start = _time.perf_counter()
 
         bs = mask.sum()
         total_loss = total_loss + loss.detach() * bs

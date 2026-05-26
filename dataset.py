@@ -109,6 +109,9 @@ class CachedRetrievalDataset(Dataset):
         stats: dict = None,     # Normalization stats for retrieved shifts
         shift_cols: list = None,  # Shift column names (for stats lookup)
         mmap_structural: bool = False,  # If False, load all structural arrays into RAM
+        load_retrieval: bool = True,    # If False, skip retrieval data entirely
+                                         # (use for --structure_only training; saves
+                                         # 4 GB/fold of mmap'd I/O the model ignores)
     ):
         """
         Load a cached dataset from disk.
@@ -120,6 +123,7 @@ class CachedRetrievalDataset(Dataset):
         self.n_shifts = n_shifts
         self.k_retrieved = k_retrieved
         self.mmap_structural = mmap_structural
+        self.load_retrieval = load_retrieval
 
         # Load config
         with open(self.cache_dir / 'config.json', 'r') as f:

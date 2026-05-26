@@ -196,16 +196,34 @@ def collect_predictions(model, loader, device, stats, shift_cols):
     retrieved_distances = torch.cat(all_retrieved_distances).numpy()
     retrieved_valid = torch.cat(all_retrieved_valid).numpy()
 
-    # Denormalize
-    predictions_denorm = predictions.copy()
-    targets_denorm = targets.copy()
+    # Denormalize. The dataset normalizes targets per-AA (with global fallback
+    # per cell when an AA lacks stats for a given shift), so we must invert
+    # the SAME mapping or MAEs will be wildly off. Build (n_aa, n_shifts)
+    # mean/std tensors to denorm vectorized.
+    from config import STANDARD_RESIDUES
+    per_aa_stats = stats.get('per_aa', {}) if isinstance(stats, dict) else {}
+    n_aa = len(STANDARD_RESIDUES)
+    n_shifts = len(shift_cols)
+    means = np.zeros((n_aa, n_shifts), dtype=np.float64)
+    stds  = np.ones ((n_aa, n_shifts), dtype=np.float64)
+    for ai, aa_name in enumerate(STANDARD_RESIDUES):
+        aa_block = per_aa_stats.get(aa_name, {})
+        for si, col in enumerate(shift_cols):
+            if col in aa_block:
+                means[ai, si] = aa_block[col]['mean']
+                stds [ai, si] = max(aa_block[col]['std'], 1e-6)
+            elif col in stats:
+                means[ai, si] = stats[col]['mean']
+                stds [ai, si] = max(stats[col]['std'], 1e-6)
 
-    for i, col in enumerate(shift_cols):
-        if col in stats:
-            mean = stats[col]['mean']
-            std = stats[col]['std']
-            predictions_denorm[:, i] = predictions[:, i] * std + mean
-            targets_denorm[:, i] = targets[:, i] * std + mean
+    # residue_codes is (N,) of AA indices; clamp out-of-range to 0 (means/stds
+    # for that slot fall back to global from the loop above).
+    safe_codes = np.clip(residue_codes, 0, n_aa - 1).astype(np.int64)
+    per_residue_means = means[safe_codes]   # (N, n_shifts)
+    per_residue_stds  = stds [safe_codes]   # (N, n_shifts)
+
+    predictions_denorm = predictions * per_residue_stds + per_residue_means
+    targets_denorm     = targets     * per_residue_stds + per_residue_means
 
     errors = np.abs(predictions_denorm - targets_denorm)
 

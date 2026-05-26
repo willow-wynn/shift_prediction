@@ -1,22 +1,42 @@
-# Data (large files, regenerable)
+# Data directories (large, regenerable, machine-local)
 data/
+data_alphafold/
+data_experimental/
+data_refdb/
+data_rereferenced/
 
-# Generated outputs
-cache/
-checkpoints/
-eval_results/
-eval_imputation_results/
+# Output dirs
+runs
+runs/
+results/
 wandb/
 wandb_runs/
+eval_results/
+eval_imputation_results/
+checkpoints/
+cache/
 
-# Python
+# Experimental / scratch
+claude/
+experiments/
+ucbshifty_repl/
+
+# Loose debug / scratch files
+AF-*.pdb
+06_train.py
+eval_both_folds.py
+run_benchmark*.py
+run_ucbshift_*.py
+*.log
+step05_*.txt
+
+# Python / IDE / OS
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
 .eggs/
-
-# IDE/OS
+.claude/
 .idea/
 .vscode/
 .DS_Store

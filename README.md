@@ -24,7 +24,10 @@ python 00_fetch_bmrb_shifts.py
 # 1. Build datasets: find PDB/AlphaFold structures, align, compute features
 python 01_build_datasets.py --online
 
-# 2. Extract ESM-2 embeddings (2560-dim per residue)
+# 2. Assign 5-fold splits with 90% sequence-identity clusters + UCBShift-200 hold-out
+python 02_dedupe_folds_by_identity90.py
+
+# 3. Extract ESM-2 embeddings (2560-dim per residue)
 python 03_extract_esm_embeddings.py
 ```
 
@@ -48,6 +51,7 @@ Caches are built automatically if missing. Step-by-step cache building:
 
 ```bash
 python 04_build_retrieval_index.py     # FAISS indices
+python 04c_compute_cross_arrays.py     # Cross-residue atom-pair distances
 python 05_build_training_cache.py      # Memory-mapped caches
 ```
 
@@ -78,6 +82,13 @@ python train.py --data hybrid --fold 1 --epochs 150 \
     --freeze_base --base_checkpoint runs/hybrid_struct_fold1/checkpoints/best.pt
 ```
 
+### Evaluation
+
+```bash
+python 07_evaluate.py --model runs/<run_name>/checkpoints/best.pt \
+    --data_dir data --cache_dir data/cache --fold 1 --output_dir eval_results
+```
+
 ### Inference
 
 ```bash
@@ -97,11 +108,13 @@ python inference.py --model checkpoint.pt --pdb protein.pdb -o results/shifts.cs
 
 ## Architecture
 
-**Base encoder:** Per-residue distance attention over all intramolecular atom pairs → 5-layer residual CNN over ±5 residue window → multi-head cross-attention over K=5 spatial neighbors (4 heads, min 4 residue separation; CNN center output queries against neighbor keys/values) → 1472-dim encoding
+**Base encoder:** Per-residue distance attention over all intramolecular atom pairs (88 atom types) → 5-layer residual CNN over ±5 residue window → multi-head cross-attention over K=5 spatial neighbors (4 heads, min 5 residue separation; CNN center output queries against neighbor keys/values) → 1472-dim encoding.
 
-**Retrieval pathway (optional):** FAISS nearest-neighbor retrieval (K=32, same-protein exclusion) → neighbor encoder → self-attention (2 layers) → shift-specific cross-attention (3 layers) → direct transfer head → learned gating blends retrieval with structure-only prediction
+**Cross-residue distance attention:** At the center residue, an additional attention head sees up to 600 heavy×heavy and H×heavy atom-pair distances between the center and its sequence neighbors (±5) plus 5 spatial neighbors. Pairs carry an offset embedding identifying which neighbor they belong to. The output is gated per amino-acid type and added as a residual to the center's intra-residue distance embedding.
 
-**Features per residue:** 88 atom-type distance pairs, residue/SS/mismatch embeddings, DSSP hydrogen bond geometry, phi/psi angles, inter-residue peptide bond lengths and CA-CA distances
+**Retrieval pathway (optional):** FAISS nearest-neighbor retrieval (K=32, same-protein exclusion) → neighbor encoder → self-attention (2 layers) → shift-specific cross-attention (3 layers) → direct transfer head → learned gating blends retrieval with structure-only prediction.
+
+**Per-residue features:** intramolecular atom-pair distances, cross-residue atom-pair distances (center only), residue/SS/mismatch embeddings, DSSP H-bond geometry, φ/ψ angles, inter-residue peptide bond lengths and CA-CA distances.
 
 ## Datasets
 
@@ -120,15 +133,17 @@ Three structure sources via `--data`:
 |--------|-------------|
 | `00_fetch_bmrb_shifts.py` | Download chemical shifts from BMRB |
 | `01_build_datasets.py` | Build structure datasets from PDB/AlphaFold |
+| `02_dedupe_folds_by_identity90.py` | 5-fold split with 90% identity-cluster dedup + UCBShift-200 hold-out |
 | `03_extract_esm_embeddings.py` | ESM-2 embedding extraction |
 | `03b_extract_struct_embeddings.py` | Structure model embedding extraction |
 | `04_build_retrieval_index.py` | FAISS index building |
+| `04c_compute_cross_arrays.py` | Cross-residue atom-pair distance arrays |
 | `05_build_training_cache.py` | Memory-mapped training cache |
 | `train.py` | Unified training (structure-only, retrieval, frozen-base) |
 | `07_evaluate.py` | Model evaluation with baselines and plots |
 | `inference.py` | Single-PDB prediction (file or PDB ID) |
-| `08_train_imputation.py` | Shift imputation model training |
-| `09_eval_imputation.py` | Imputation evaluation |
+| `08_train_imputation.py` | Shift imputation model training (research) |
+| `09_eval_imputation.py` | Imputation evaluation (research) |
 
 ### Libraries
 | Module | Description |
@@ -139,20 +154,23 @@ Three structure sources via `--data`:
 | `training_utils.py` | Training loop, loss functions, freeze helpers |
 | `retrieval.py` | FAISS retrieval with same-protein exclusion |
 | `pdb_utils.py` | PDB parsing, DSSP |
-| `distance_features.py` | Intramolecular distance computation |
+| `distance_features.py` | Intramolecular and cross-residue distance computation |
 | `spatial_neighbors.py` | KD-tree spatial neighbor finder |
 | `alignment.py` | Sequence alignment |
 | `structure_selection.py` | Best chain/model selection |
 | `alphafold_utils.py` | AlphaFold DB download |
+| `cluster_sequences.py` | 90% identity sequence clustering |
 | `data_quality.py` | Data filtering with provenance |
+| `analyze_data_quality.py` | Dataset statistics |
 | `random_coil.py` | Random coil shift tables |
-| `imputation_model.py` | Imputation network |
-| `imputation_dataset.py` | Imputation dataset |
+| `imputation_model.py` | Imputation network (research) |
+| `imputation_dataset.py` | Imputation dataset (research) |
 
 ## Configuration
 
 All in `config.py`. Key settings:
 
-- Model: CNN [256, 512, 768, 1024, 1280], K=5 spatial neighbors, K=32 retrieved
+- Model: CNN `[256, 512, 768, 1024, 1280]`, K=5 spatial neighbors, K=32 retrieved
+- Cross-residue: M=600 max pairs per center, 8 Å heavy-heavy / 6 Å H-heavy cutoff
 - Training: lr=2e-4, batch=1024, Huber δ=0.5, cosine annealing (T₀=50, T_mult=2)
 - 88 canonical atom types, 49 shift types
