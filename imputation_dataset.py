@@ -31,6 +31,8 @@ from torch.utils.data import Dataset
 from config import (
     N_RESIDUE_TYPES, N_SS_TYPES, N_MISMATCH_TYPES,
     DSSP_COLS,
+    N_BOND_GEOM,
+    MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES,
 )
 from dataset import CachedRetrievalDataset
 
@@ -210,6 +212,20 @@ class ImputationDataset(Dataset):
         neighbor_ss_idx = torch.full((k_spatial,), N_SS_TYPES, dtype=torch.long)
         neighbor_angles = torch.zeros(k_spatial, 4, dtype=torch.float32)
 
+        # Per-neighbor intra-residue distance arrays (for joint distance attention)
+        neighbor_atom1_idx = torch.full((k_spatial, M), base.n_atom_types, dtype=torch.long)
+        neighbor_atom2_idx = torch.full((k_spatial, M), base.n_atom_types, dtype=torch.long)
+        neighbor_distances = torch.zeros(k_spatial, M, dtype=torch.float32)
+        neighbor_dist_mask = torch.zeros(k_spatial, M, dtype=torch.bool)
+
+        # Per-neighbor observed shifts (the new "nearby shifts in space" signal).
+        # Looked up from the same shift_values / shift_masks arrays the
+        # ImputationDataset loads at the top level. Unmasked at the neighbor
+        # (target masking only happens at the CENTER residue).
+        n_shifts = self.n_shifts
+        spatial_neighbor_shifts = torch.zeros(k_spatial, n_shifts, dtype=torch.float32)
+        spatial_neighbor_shift_masks = torch.zeros(k_spatial, n_shifts, dtype=torch.float32)
+
         for k in range(k_spatial):
             nb_res_id = spatial_res_ids[k].item()
             if nb_res_id >= 0:
@@ -220,10 +236,54 @@ class ImputationDataset(Dataset):
                         neighbor_res_idx[k] = base.flat_residue_idx[nb_global]
                         neighbor_ss_idx[k] = base.flat_ss_idx[nb_global]
                         neighbor_angles[k] = base.flat_angles[nb_global]
+
+                        n_valid_nb = base.flat_dist_count[nb_global].item()
+                        if n_valid_nb > 0:
+                            neighbor_atom1_idx[k, :n_valid_nb] = torch.from_numpy(
+                                base.flat_dist_atom1[nb_global, :n_valid_nb].astype(np.int64))
+                            neighbor_atom2_idx[k, :n_valid_nb] = torch.from_numpy(
+                                base.flat_dist_atom2[nb_global, :n_valid_nb].astype(np.int64))
+                            neighbor_distances[k, :n_valid_nb] = torch.from_numpy(
+                                base.flat_dist_values[nb_global, :n_valid_nb].astype(np.float32))
+                            neighbor_dist_mask[k, :n_valid_nb] = True
+
+                        spatial_neighbor_shifts[k] = self.shift_values[nb_global].float()
+                        spatial_neighbor_shift_masks[k] = self.shift_masks[nb_global].float()
                     else:
                         neighbor_valid[k] = False
                 else:
                     neighbor_valid[k] = False
+
+        # Bond geometry (W positions)
+        if base.flat_bond_geom is not None:
+            bond_geom = torch.zeros(W, N_BOND_GEOM, dtype=torch.float32)
+            for w in range(W):
+                if is_valid[w]:
+                    bond_geom[w] = base.flat_bond_geom[safe_idx[w].item()]
+        else:
+            bond_geom = torch.zeros(W, N_BOND_GEOM, dtype=torch.float32)
+
+        # Cross-residue distance features at the center position (Phase 1).
+        # Zero-filled fallback when cross arrays are absent.
+        M_CR = base.max_cross_distances
+        cross_atom1_idx = torch.full((M_CR,), base.n_atom_types, dtype=torch.long)
+        cross_atom2_idx = torch.full((M_CR,), base.n_atom_types, dtype=torch.long)
+        cross_offset_idx = torch.full((M_CR,), base.n_cross_offset_types, dtype=torch.long)
+        cross_distances = torch.zeros(M_CR, dtype=torch.float32)
+        cross_dist_mask = torch.zeros(M_CR, dtype=torch.bool)
+        if base.has_cross_features and base.flat_cross_count is not None:
+            nc = int(base.flat_cross_count[global_idx].item())
+            if nc > 0:
+                nc = min(nc, M_CR)
+                cross_atom1_idx[:nc] = torch.from_numpy(
+                    base.flat_cross_atom1[global_idx, :nc].astype(np.int64))
+                cross_atom2_idx[:nc] = torch.from_numpy(
+                    base.flat_cross_atom2[global_idx, :nc].astype(np.int64))
+                cross_offset_idx[:nc] = torch.from_numpy(
+                    base.flat_cross_offset[global_idx, :nc].astype(np.int64))
+                cross_distances[:nc] = torch.from_numpy(
+                    base.flat_cross_values[global_idx, :nc].astype(np.float32))
+                cross_dist_mask[:nc] = True
 
         # Clean NaN
         neighbor_angles = torch.where(torch.isnan(neighbor_angles),
@@ -271,6 +331,18 @@ class ImputationDataset(Dataset):
             'neighbor_seq_sep': spatial_seq_sep,
             'neighbor_angles': neighbor_angles,
             'neighbor_valid': neighbor_valid,
+            'neighbor_atom1_idx': neighbor_atom1_idx,
+            'neighbor_atom2_idx': neighbor_atom2_idx,
+            'neighbor_distances': neighbor_distances,
+            'neighbor_dist_mask': neighbor_dist_mask,
+            'bond_geom': bond_geom,
+            'cross_atom1_idx': cross_atom1_idx,
+            'cross_atom2_idx': cross_atom2_idx,
+            'cross_offset_idx': cross_offset_idx,
+            'cross_distances': cross_distances,
+            'cross_dist_mask': cross_dist_mask,
+            'spatial_neighbor_shifts': spatial_neighbor_shifts,
+            'spatial_neighbor_shift_masks': spatial_neighbor_shift_masks,
             'query_residue_code': query_residue_code,
             'retrieved_shifts': retrieved_shifts,
             'retrieved_shift_masks': retrieved_shift_masks,

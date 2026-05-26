@@ -40,9 +40,12 @@ from config import (
     SPATIAL_ATTN_HIDDEN,
     RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
+    N_BOND_GEOM,
+    MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES, CROSS_OFFSET_EMBED_DIM,
 )
 from model import (
     DistanceAttentionPerPosition,
+    CrossDistanceAttention,
     ResidualBlock1D,
     SpatialNeighborAttention,
 )
@@ -126,6 +129,83 @@ class ShiftContextEncoder(nn.Module):
         # Extract center position
         x_center = x[:, center, :]  # (B, out_dim)
         return x_center
+
+
+# ============================================================================
+# Spatial Neighbor Shift Attention
+# ============================================================================
+
+class SpatialNeighborShiftAttention(nn.Module):
+    """Multi-head cross-attention from center query to spatial neighbors' observed shifts.
+
+    Complements ShiftContextEncoder. ShiftContextEncoder sees the ±W sequence
+    window; this module sees the K spatially-closest residues' chemical shifts.
+    Beta-sheet pairing partners, ring stacks, and disulfide contacts can be
+    distant in sequence but close in space — their shifts are highly
+    informative for imputing a target shift.
+
+    Per-neighbor feature: residue_emb + observed_shifts*mask + mask + CA_dist
+    Query: structural+context encoding at center (plus optional shift-type emb
+    appended upstream by the caller).
+    """
+
+    def __init__(self, n_shifts, n_residue_types, query_dim,
+                 hidden_dim=192, n_heads=4, dropout=0.25):
+        super().__init__()
+        assert hidden_dim % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = hidden_dim // n_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.residue_embed = nn.Embedding(n_residue_types + 1, 32)
+        per_nbr_dim = 32 + n_shifts + n_shifts + 1
+        self.neighbor_proj = nn.Sequential(
+            nn.Linear(per_nbr_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.q_proj = nn.Linear(query_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.fallback = nn.Parameter(torch.zeros(hidden_dim))
+        self.out_dim = hidden_dim
+
+    def forward(self, query, neighbor_res_idx, neighbor_shifts,
+                neighbor_shift_masks, neighbor_dist, neighbor_valid):
+        """
+        Args:
+            query: (B, query_dim)
+            neighbor_res_idx: (B, K) residue type indices at spatial neighbors
+            neighbor_shifts: (B, K, n_shifts) z-normalized observed shifts
+            neighbor_shift_masks: (B, K, n_shifts) 1.0 where shift is observed
+            neighbor_dist: (B, K) CA-CA distance
+            neighbor_valid: (B, K) which neighbor slots are filled
+        Returns:
+            (B, hidden_dim)
+        """
+        B, K = neighbor_res_idx.shape
+        H, HD = self.n_heads, self.head_dim
+
+        res_emb = self.residue_embed(neighbor_res_idx)
+        shifts_z = neighbor_shifts * neighbor_shift_masks
+        d_norm = (neighbor_dist / 15.0).unsqueeze(-1)
+        feat = torch.cat([res_emb, shifts_z, neighbor_shift_masks, d_norm], dim=-1)
+        kv = self.neighbor_proj(feat)
+
+        Q = self.q_proj(query).view(B, 1, H, HD).transpose(1, 2)
+        Kp = self.k_proj(kv).view(B, K, H, HD).transpose(1, 2)
+        Vp = self.v_proj(kv).view(B, K, H, HD).transpose(1, 2)
+
+        scores = torch.matmul(Q, Kp.transpose(-2, -1)) * self.scale
+        scores = scores.masked_fill(~neighbor_valid.unsqueeze(1).unsqueeze(2), -1e4)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, Vp).transpose(1, 2).contiguous().view(B, H * HD)
+        out = self.out_proj(out)
+
+        any_valid = neighbor_valid.any(dim=1)
+        fb = self.fallback.unsqueeze(0).expand(B, -1)
+        return torch.where(any_valid.unsqueeze(-1), out, fb)
 
 
 # ============================================================================
@@ -446,6 +526,22 @@ class ShiftImputationModel(nn.Module):
             dropout=0.25,
         )
 
+        # Cross-residue distance attention (Phase 1 sidechain-aware features).
+        # Shares atom_embed weights with the intra module. Output is added
+        # as a per-AA-gated residual to the center window position before CNN.
+        self.cross_distance_attention = CrossDistanceAttention(
+            n_atom_types=n_atom_types,
+            n_offset_types=N_CROSS_OFFSET_TYPES,
+            atom_embed_dim=dist_attn_embed,
+            offset_embed_dim=CROSS_OFFSET_EMBED_DIM,
+            hidden_dim=dist_attn_hidden,
+            dropout=0.25,
+            shared_atom_embed=self.distance_attention.atom_embed,
+        )
+        self.cross_gate = nn.Embedding(n_residue_types + 1, 1)
+        with torch.no_grad():
+            self.cross_gate.weight.zero_()
+
         self.residue_embed = nn.Embedding(n_residue_types + 1, 64)
         self.ss_embed = nn.Embedding(n_ss_types + 1, 32)
         self.mismatch_embed = nn.Embedding(n_mismatch_types + 1, 16)
@@ -458,7 +554,11 @@ class ShiftImputationModel(nn.Module):
             self.dssp_proj = None
             dssp_dim = 0
 
-        struct_cnn_input = dist_attn_hidden + 64 + 32 + 16 + 16 + dssp_dim
+        # Inter-residue bond geometry projection (CA-CA prev/next, peptide bonds)
+        self.bond_proj = nn.Linear(N_BOND_GEOM, 16)
+        bond_dim = 16
+
+        struct_cnn_input = dist_attn_hidden + 64 + 32 + 16 + 16 + dssp_dim + bond_dim
         self.struct_input_norm = nn.LayerNorm(struct_cnn_input)
         self.struct_input_dropout = nn.Dropout(input_dropout)
 
@@ -471,6 +571,9 @@ class ShiftImputationModel(nn.Module):
         self.struct_cnn = nn.Sequential(*struct_layers)
         struct_cnn_out = struct_cnn_channels[-1]
 
+        # Spatial neighbor attention with joint distance attention pathway
+        # (mirrors model.ShiftPredictor: the per-neighbor distance embedding
+        # combines query+CA-CA+neighbor atom-pair distances).
         self.spatial_attention = SpatialNeighborAttention(
             n_residue_types=n_residue_types,
             n_ss_types=n_ss_types,
@@ -478,6 +581,7 @@ class ShiftImputationModel(nn.Module):
             embed_dim=64,
             hidden_dim=spatial_hidden,
             dropout=0.30,
+            dist_attn_hidden=dist_attn_hidden,
             query_dim=struct_cnn_out,
         )
 
@@ -494,9 +598,27 @@ class ShiftImputationModel(nn.Module):
         )
         shift_context_dim = self.shift_context_encoder.out_dim
 
+        # ========== Spatial Neighbor Shift Attention (NEW) ==========
+        # Attends to observed shifts at the K spatially-closest residues.
+        # Complements ShiftContextEncoder (sequence window): catches shift
+        # signal from beta-sheet partners and other long-range contacts.
+        # Query carries the shift-type one-hot so attention can specialize
+        # per target shift type.
+        spatial_shift_query_dim = base_encoder_dim + shift_context_dim + n_shifts
+        self.spatial_shift_attention = SpatialNeighborShiftAttention(
+            n_shifts=n_shifts,
+            n_residue_types=n_residue_types,
+            query_dim=spatial_shift_query_dim,
+            hidden_dim=spatial_hidden,
+            n_heads=4,
+            dropout=retrieval_dropout,
+        )
+        spatial_shift_dim = self.spatial_shift_attention.out_dim
+
         # ========== Unified Retrieval Transfer ==========
-        # Query dim = base_encoder + shift_context + observed_shifts_at_center
-        retrieval_query_dim = base_encoder_dim + shift_context_dim + n_shifts
+        # Query dim = base_encoder + shift_context + spatial_shift_context + observed_shifts_at_center
+        retrieval_query_dim = (base_encoder_dim + shift_context_dim
+                               + spatial_shift_dim + n_shifts)
         self.retrieval = UnifiedRetrievalTransfer(
             query_dim=retrieval_query_dim,
             n_shifts=n_shifts,
@@ -507,7 +629,7 @@ class ShiftImputationModel(nn.Module):
         )
 
         # ========== Fusion + Prediction ==========
-        # fused = base_encoding + shift_context + retrieval_context + transferred_shifts + trust + shift_type_embed
+        # fused = base + shift_ctx + spatial_shift_ctx + retrieval_ctx + transferred + trust + shift_type_emb
         self.shift_type_proj = nn.Sequential(
             nn.Linear(n_shifts, 128),
             nn.GELU(),
@@ -515,7 +637,7 @@ class ShiftImputationModel(nn.Module):
             nn.Linear(128, 128),
         )
 
-        fused_dim = (base_encoder_dim + shift_context_dim +
+        fused_dim = (base_encoder_dim + shift_context_dim + spatial_shift_dim +
                      retrieval_hidden + n_shifts + n_shifts + 128)
 
         self.prediction_head = nn.Sequential(
@@ -535,46 +657,87 @@ class ShiftImputationModel(nn.Module):
 
     def forward(
         self,
-        # Structural inputs (same as model.py)
+        # Structural inputs (same as model.py ShiftPredictor)
         atom1_idx, atom2_idx, distances, dist_mask,
         residue_idx, ss_idx, mismatch_idx, is_valid,
         dssp_features,
         neighbor_res_idx, neighbor_ss_idx,
         neighbor_dist, neighbor_seq_sep, neighbor_angles,
         neighbor_valid,
+        # Spatial neighbor distance features (for joint distance attention)
+        neighbor_atom1_idx=None, neighbor_atom2_idx=None,
+        neighbor_distances=None, neighbor_dist_mask=None,
+        # Cross-residue distance features (center residue only)
+        cross_atom1_idx=None, cross_atom2_idx=None, cross_offset_idx=None,
+        cross_distances=None, cross_dist_mask=None,
+        # Inter-residue bond geometry
+        bond_geom=None,
         # Retrieval inputs
-        query_residue_code,
-        retrieved_shifts, retrieved_shift_masks,
-        retrieved_residue_codes, retrieved_distances, retrieved_valid,
-        # Shift context inputs
-        context_residue_idx,       # (B, W) residue types in context window
-        context_observed_shifts,   # (B, W, n_shifts) z-normalized shifts
-        context_shift_masks,       # (B, W, n_shifts) availability masks
-        context_is_valid,          # (B, W) position validity
+        query_residue_code=None,
+        retrieved_shifts=None, retrieved_shift_masks=None,
+        retrieved_residue_codes=None, retrieved_distances=None, retrieved_valid=None,
+        # Shift context inputs (sequence window)
+        context_residue_idx=None,
+        context_observed_shifts=None,
+        context_shift_masks=None,
+        context_is_valid=None,
+        # Spatial-neighbor observed shifts (NEW: nearby in space, possibly far in sequence)
+        spatial_neighbor_shifts=None,       # (B, K, n_shifts) z-normalized
+        spatial_neighbor_shift_masks=None,  # (B, K, n_shifts) availability
         # Shift type conditioning
-        shift_type,                # (B, n_shifts) one-hot shift type
+        shift_type=None,           # (B, n_shifts) one-hot shift type
         # Observed shifts at center (for retrieval conditioning)
-        center_observed_shifts,    # (B, n_shifts) shifts at center residue
-        center_shift_masks,        # (B, n_shifts) availability at center
-        # Deprecated: accepted but ignored (for old dataset compatibility)
+        center_observed_shifts=None,
+        center_shift_masks=None,
+        # Deprecated: accepted but ignored
         physics_features=None,
         **kwargs,
     ):
-        """Forward pass. Returns (B, 1) scalar prediction."""
+        """Forward pass. Returns (B,) scalar prediction."""
         B = distances.size(0)
+        W = distances.size(1)
+        center_w = W // 2
 
         # ========== 1. Structural Encoder ==========
         dist_emb = self.distance_attention(atom1_idx, atom2_idx, distances, dist_mask)
+
+        # Cross-residue features at the center position. When cross_* tensors
+        # are absent (legacy caches), CrossDistanceAttention is skipped and
+        # behavior matches the pre-cross checkpoint.
+        if cross_atom1_idx is not None and cross_distances is not None:
+            cross_a1 = cross_atom1_idx.unsqueeze(1)
+            cross_a2 = cross_atom2_idx.unsqueeze(1)
+            cross_off = cross_offset_idx.unsqueeze(1)
+            cross_d = cross_distances.unsqueeze(1)
+            cross_m = cross_dist_mask.unsqueeze(1)
+            cross_emb = self.cross_distance_attention(
+                cross_a1, cross_a2, cross_off, cross_d, cross_m
+            ).squeeze(1)
+            center_aa = residue_idx[:, center_w]
+            gate = torch.sigmoid(self.cross_gate(center_aa)).squeeze(-1)
+            mask_w = torch.zeros(W, device=dist_emb.device)
+            mask_w[center_w] = 1.0
+            dist_emb = dist_emb + (
+                gate.view(B, 1, 1)
+                * cross_emb.unsqueeze(1)
+                * mask_w.view(1, -1, 1)
+            )
+
         res_emb = self.residue_embed(residue_idx)
         ss_emb = self.ss_embed(ss_idx)
         mismatch_emb = self.mismatch_embed(mismatch_idx)
         valid_emb = self.valid_embed(is_valid.unsqueeze(-1))
 
+        # Bond geometry projection
+        if bond_geom is None:
+            bond_geom = torch.zeros(B, W, N_BOND_GEOM, device=distances.device)
+        bond_emb = self.bond_proj(bond_geom)
+
         if self.dssp_proj is not None:
             dssp_emb = self.dssp_proj(dssp_features)
-            x = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, dssp_emb], dim=-1)
+            x = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, dssp_emb, bond_emb], dim=-1)
         else:
-            x = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb], dim=-1)
+            x = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, bond_emb], dim=-1)
 
         x = self.struct_input_dropout(self.struct_input_norm(x))
         x = x.transpose(1, 2)
@@ -584,11 +747,46 @@ class ShiftImputationModel(nn.Module):
         center_idx = x.size(1) // 2
         x_center = x[:, center_idx, :]
 
+        # Joint distance attention for spatial neighbors (mirrors model.py).
+        # Combines query intra-pairs + CA-CA pair + neighbor intra-pairs into
+        # one attention set so the per-neighbor 256-d embedding encodes joint
+        # geometry. Falls back to None when neighbor distance arrays absent.
+        neighbor_dist_embeddings = None
+        if neighbor_atom1_idx is not None and neighbor_distances is not None:
+            K_sp = neighbor_atom1_idx.size(1)
+            M_sp = neighbor_atom1_idx.size(2)
+
+            q_a1 = atom1_idx[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+            q_a2 = atom2_idx[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+            q_d = distances[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+            q_m = dist_mask[:, center_w, :].unsqueeze(1).expand(-1, K_sp, -1)
+
+            ca_idx = 1  # CA in ATOM_TYPES
+            ca_a1 = torch.full((B, K_sp, 1), ca_idx, dtype=torch.long, device=distances.device)
+            ca_a2 = torch.full((B, K_sp, 1), ca_idx, dtype=torch.long, device=distances.device)
+            ca_d = neighbor_dist.unsqueeze(-1)
+            ca_m = neighbor_valid.unsqueeze(-1)
+
+            joint_a1 = torch.cat([q_a1, ca_a1, neighbor_atom1_idx], dim=-1)
+            joint_a2 = torch.cat([q_a2, ca_a2, neighbor_atom2_idx], dim=-1)
+            joint_d = torch.cat([q_d, ca_d, neighbor_distances], dim=-1)
+            joint_m = torch.cat([q_m, ca_m, neighbor_dist_mask], dim=-1)
+
+            D_joint = joint_a1.size(-1)
+            nb_a1 = joint_a1.reshape(B * K_sp, 1, D_joint)
+            nb_a2 = joint_a2.reshape(B * K_sp, 1, D_joint)
+            nb_d = joint_d.reshape(B * K_sp, 1, D_joint)
+            nb_m = joint_m.reshape(B * K_sp, 1, D_joint)
+
+            nb_dist_emb = self.distance_attention(nb_a1, nb_a2, nb_d, nb_m)
+            neighbor_dist_embeddings = nb_dist_emb.squeeze(1).view(B, K_sp, -1)
+
         x_spatial = self.spatial_attention(
             neighbor_res_idx, neighbor_ss_idx,
             neighbor_dist, neighbor_seq_sep, neighbor_angles,
             neighbor_valid,
             query_encoding=x_center,
+            neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
 
         base_encoding = torch.cat([x_center, x_spatial], dim=-1)
@@ -599,11 +797,33 @@ class ShiftImputationModel(nn.Module):
             context_shift_masks, context_is_valid,
         )
 
-        # ========== 3. Retrieval Transfer ==========
-        # Build retrieval query from structural + shift context + observed
+        # ========== 3. Spatial Neighbor Shift Attention (NEW) ==========
+        # Attends to observed shifts at the K spatial neighbors. Falls back
+        # to zero-filled tensors if not provided by the dataset.
+        if spatial_neighbor_shifts is None:
+            K_sp = neighbor_res_idx.size(1)
+            spatial_neighbor_shifts = torch.zeros(
+                B, K_sp, self.n_shifts, device=base_encoding.device)
+            spatial_neighbor_shift_masks = torch.zeros(
+                B, K_sp, self.n_shifts, device=base_encoding.device)
+
         center_shifts_clean = center_observed_shifts * center_shift_masks
+        spatial_shift_query = torch.cat([
+            base_encoding, shift_context, shift_type,
+        ], dim=-1)
+        spatial_shift_context = self.spatial_shift_attention(
+            query=spatial_shift_query,
+            neighbor_res_idx=neighbor_res_idx,
+            neighbor_shifts=spatial_neighbor_shifts,
+            neighbor_shift_masks=spatial_neighbor_shift_masks,
+            neighbor_dist=neighbor_dist,
+            neighbor_valid=neighbor_valid,
+        )
+
+        # ========== 4. Retrieval Transfer ==========
+        # Build retrieval query from structural + shift context + spatial shift + observed
         retrieval_query = torch.cat([
-            base_encoding, shift_context, center_shifts_clean,
+            base_encoding, shift_context, spatial_shift_context, center_shifts_clean,
         ], dim=-1)
 
         # Apply retrieval dropout during training
@@ -626,12 +846,13 @@ class ShiftImputationModel(nn.Module):
             retrieved_valid=retrieved_valid_use,
         )
 
-        # ========== 4. Fusion + Prediction ==========
+        # ========== 5. Fusion + Prediction ==========
         shift_type_emb = self.shift_type_proj(shift_type)
 
         fused = torch.cat([
             base_encoding,
             shift_context,
+            spatial_shift_context,
             retrieval_context,
             transferred_shifts,
             trust_scores,
@@ -653,13 +874,12 @@ class ShiftImputationModel(nn.Module):
 def create_imputation_model(
     n_atom_types: int,
     n_shifts: int = 6,
-    shift_cols: list = None,
+    shift_cols: list = None,  # kept for caller-API compat; not used in the model
     **kwargs,
 ) -> ShiftImputationModel:
     """Create imputation model with sensible defaults."""
     return ShiftImputationModel(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,
-        shift_cols=shift_cols,
         **kwargs,
     )
