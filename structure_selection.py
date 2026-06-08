@@ -13,7 +13,7 @@ Also provides Kabsch superposition utilities for NMR model selection.
 import numpy as np
 from alignment import align_sequences
 from config import AA_3_TO_1
-from pdb_utils import parse_pdb
+from pdb_utils import parse_pdb, parse_pdb_all_models
 
 
 def kabsch_superimpose(coords_mobile, coords_target):
@@ -172,3 +172,70 @@ def select_best_chain(candidates, shift_sequence):
     # Pick chain with highest identity, breaking ties by n_aligned
     best = max(chain_data, key=lambda x: (x[3], x[4]))
     return best[0], best[1], best[2]
+
+
+def select_best_nmr_model(pdb_path, chain_id):
+    """Select the NMR model closest to the median structure.
+
+    For multi-model PDB files (NMR):
+      1. Parse all models
+      2. Superimpose all onto Model 1 via Kabsch on shared CA atoms
+      3. Compute median CA coordinates
+      4. Return the model with lowest RMSD from median
+
+    For single-model files, returns the model directly.
+
+    Single source of truth: used by BOTH 01_build_datasets.process_protein
+    (cache build) and inference.extract_features_from_pdb (deployment), so
+    cache and inference pick the IDENTICAL conformer for NMR ensembles.
+
+    Args:
+        pdb_path: Path to PDB file
+        chain_id: Chain to use
+
+    Returns:
+        residues dict {(chain, res_id): {...}} for the best model, or None.
+    """
+    models = parse_pdb_all_models(pdb_path, chain_id=chain_id)
+    if not models:
+        return None
+    if len(models) == 1:
+        return models[0]
+
+    ref_keys = []
+    for key in sorted(models[0].keys()):
+        if 'CA' in models[0][key].get('atoms', {}):
+            ref_keys.append(key)
+    if len(ref_keys) < 10:
+        return models[0]
+
+    common_keys = set(ref_keys)
+    for model in models[1:]:
+        model_ca_keys = {k for k in model if 'CA' in model[k].get('atoms', {})}
+        common_keys &= model_ca_keys
+    common_keys = sorted(common_keys)
+    if len(common_keys) < 10:
+        return models[0]
+
+    n_models = len(models)
+    n_pos = len(common_keys)
+    all_coords = np.zeros((n_models, n_pos, 3))
+    for mi, model in enumerate(models):
+        for pi, key in enumerate(common_keys):
+            all_coords[mi, pi, :] = model[key]['atoms']['CA']
+
+    ref_coords = all_coords[0]
+    aligned_coords = np.zeros_like(all_coords)
+    aligned_coords[0] = ref_coords
+    for mi in range(1, n_models):
+        rot, trans = kabsch_superimpose(all_coords[mi], ref_coords)
+        aligned_coords[mi] = all_coords[mi] @ rot + trans
+
+    median_coords = np.median(aligned_coords, axis=0)
+    rmsds = np.zeros(n_models)
+    for mi in range(n_models):
+        diff = aligned_coords[mi] - median_coords
+        rmsds[mi] = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
+
+    best_idx = int(np.argmin(rmsds))
+    return models[best_idx]

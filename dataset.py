@@ -1,27 +1,16 @@
 #!/usr/bin/env python3
 """
-Memory-Efficient Dataset with Disk Caching for Retrieval-Augmented Shift Prediction
-(Better Data Pipeline)
+Memory-efficient structure-only shift-prediction dataset backed by the
+memory-mapped cache that 05_build_training_cache.py produces.
 
-Adapted from homologies/dataset_cached.py with the following modifications:
-
-1. Imports constants from config instead of redefining them:
-   - STANDARD_RESIDUES, RESIDUE_TO_IDX, N_RESIDUE_TYPES
-   - SS_TYPES, SS_TO_IDX, N_SS_TYPES
-   - MISMATCH_TYPES, MISMATCH_TO_IDX, N_MISMATCH_TYPES
-   - DSSP_COLS
-
-2. Keeps the same memory-mapped retrieval architecture (shifts.npy, shift_masks.npy, etc.)
-3. Keeps the same create() and load() classmethods with checkpoint/resume support
+Imports constants from config (STANDARD_RESIDUES, SS_TYPES, MISMATCH_TYPES,
+DSSP_COLS, ...). The class name CachedRetrievalDataset is retained for
+back-compatibility with existing checkpoints/callers; there is no retrieval
+pathway — it loads structural/cross/spatial/DSSP arrays only.
 
 Usage:
-    # First run: builds and saves dataset
-    dataset = CachedRetrievalDataset.create(
-        df=train_df, ..., cache_dir='cache/fold1_train'
-    )
-
-    # Subsequent runs: loads from cache
-    dataset = CachedRetrievalDataset.load('cache/fold1_train', ...)
+    dataset = CachedRetrievalDataset.load('cache/fold_1', n_shifts,
+                                          stats=stats, shift_cols=shift_cols)
 """
 
 import json
@@ -104,26 +93,14 @@ class CachedRetrievalDataset(Dataset):
         self,
         cache_dir: str,
         n_shifts: int,
-        k_retrieved: int = 32,
-        embedding_lookup=None,  # Only needed for create(), not load()
-        stats: dict = None,     # Normalization stats for retrieved shifts
+        stats: dict = None,     # Normalization stats (mean/std per shift, + per-AA)
         shift_cols: list = None,  # Shift column names (for stats lookup)
         mmap_structural: bool = False,  # If False, load all structural arrays into RAM
-        load_retrieval: bool = True,    # If False, skip retrieval data entirely
-                                         # (use for --structure_only training; saves
-                                         # 4 GB/fold of mmap'd I/O the model ignores)
     ):
-        """
-        Load a cached dataset from disk.
-
-        Use CachedRetrievalDataset.create() or CachedRetrievalDataset.load() instead.
-        """
+        """Load a cached dataset from disk. Use CachedRetrievalDataset.load()."""
         self.cache_dir = Path(cache_dir)
-        self.embedding_lookup = embedding_lookup  # May be None for loaded datasets
         self.n_shifts = n_shifts
-        self.k_retrieved = k_retrieved
         self.mmap_structural = mmap_structural
-        self.load_retrieval = load_retrieval
 
         # Load config
         with open(self.cache_dir / 'config.json', 'r') as f:
@@ -146,8 +123,9 @@ class CachedRetrievalDataset(Dataset):
         if shift_cols is None and 'shift_cols' in config:
             shift_cols = config['shift_cols']
 
-        # Store normalization stats for retrieved shifts
-        self._setup_retrieval_normalization(stats, shift_cols)
+        # Global per-shift normalization stats (mean/std), used to map cached
+        # global-z targets back to ppm before per-AA renormalization.
+        self._setup_shift_normalization(stats, shift_cols)
 
         # Per-AA normalization (if available in stats)
         self._setup_per_aa_normalization(stats, shift_cols)
@@ -158,16 +136,14 @@ class CachedRetrievalDataset(Dataset):
         # Load compact structural data (in memory)
         self._load_structural_data()
 
-        # Memory-map retrieval data (NOT in RAM)
-        self._mmap_retrieval_data()
 
-    def _setup_retrieval_normalization(self, stats, shift_cols):
-        """Setup normalization parameters for retrieved shifts."""
+    def _setup_shift_normalization(self, stats, shift_cols):
+        """Set up global per-shift mean/std (for global-z <-> ppm conversion)."""
         if stats is None or shift_cols is None:
             # No normalization - warn user
-            print("WARNING: No stats provided - retrieved shifts will NOT be normalized!")
-            self.retrieval_means = None
-            self.retrieval_stds = None
+            print("WARNING: No stats provided - shifts will NOT be normalized!")
+            self.shift_means = None
+            self.shift_stds = None
             return
 
         # Build mean/std tensors for fast normalization
@@ -181,12 +157,12 @@ class CachedRetrievalDataset(Dataset):
                 means.append(0.0)
                 stds.append(1.0)
 
-        self.retrieval_means = torch.tensor(means, dtype=torch.float32)
-        self.retrieval_stds = torch.tensor(stds, dtype=torch.float32)
-        self.retrieval_stds = torch.where(
-            self.retrieval_stds > 1e-6,
-            self.retrieval_stds,
-            torch.ones_like(self.retrieval_stds)
+        self.shift_means = torch.tensor(means, dtype=torch.float32)
+        self.shift_stds = torch.tensor(stds, dtype=torch.float32)
+        self.shift_stds = torch.where(
+            self.shift_stds > 1e-6,
+            self.shift_stds,
+            torch.ones_like(self.shift_stds)
         )
 
     def _setup_per_aa_normalization(self, stats, shift_cols):
@@ -283,7 +259,7 @@ class CachedRetrievalDataset(Dataset):
             self.flat_cross_count = None
             self.has_cross_features = False
 
-        # BMRB ID mapping for retrieval
+        # global index -> BMRB ID (used for same-protein grouping in analysis)
         with open(sd / 'bmrb_mapping.json', 'r') as f:
             self.idx_to_bmrb = json.load(f)
 
@@ -291,65 +267,12 @@ class CachedRetrievalDataset(Dataset):
         with open(sd / 'global_to_resid.json', 'r') as f:
             self.global_to_resid = json.load(f)
 
-        # Compact structural feature vector (for retrieval neighbor encoder)
-        query_struct_path = sd / 'query_struct.npy'
-        if query_struct_path.exists():
-            self.flat_query_struct = torch.from_numpy(np.load(query_struct_path))
-            self.n_struct_features = self.flat_query_struct.shape[1]
-        else:
-            self.flat_query_struct = None
-            self.n_struct_features = 0
-
-        # Inter-residue bond geometry
+        # Inter-residue bond geometry (4 features per residue)
         bond_geom_path = sd / 'bond_geom.npy'
         if bond_geom_path.exists():
             self.flat_bond_geom = torch.from_numpy(np.load(bond_geom_path))
         else:
             self.flat_bond_geom = None
-
-    def _mmap_retrieval_data(self):
-        """Memory-map retrieval data from disk.
-
-        If the retrieval files are missing (no_retrieval cache), all retrieval
-        attributes are set to None and __getitem__ synthesizes zero tensors.
-        This avoids allocating tens of GB of zero-filled mmaps for caches built
-        with --no_retrieval.
-        """
-        rd = self.cache_dir / 'retrieval'
-
-        if not (rd / 'shifts.npy').exists():
-            self.retrieved_shifts = None
-            self.retrieved_shift_masks = None
-            self.retrieved_residue_codes = None
-            self.retrieved_distances = None
-            self.retrieved_valid = None
-            self.retrieved_neighbor_struct = None
-            self.retrieval_compact = False
-            return
-
-        # Compact format (_compact.flag present): retrieval arrays are indexed by
-        # sample idx (0..n_samples) instead of global_idx, so only rows for
-        # shift-having samples are stored — ~4x smaller on disk, fits in RAM.
-        self.retrieval_compact = (rd / '_compact.flag').exists()
-
-        # For compact caches the full retrieval arrays are small enough to live
-        # in RAM (~3.5 GB per fold × 5 folds = ~17 GB total). Loading fully
-        # eliminates random HDD reads during shuffled training. For non-compact
-        # caches the arrays are 4x bigger and we stay on mmap.
-        load_mode = None if self.retrieval_compact else 'r'
-
-        self.retrieved_shifts = np.load(rd / 'shifts.npy', mmap_mode=load_mode)
-        self.retrieved_shift_masks = np.load(rd / 'shift_masks.npy', mmap_mode=load_mode)
-        self.retrieved_residue_codes = np.load(rd / 'residue_codes.npy', mmap_mode=load_mode)
-        self.retrieved_distances = np.load(rd / 'distances.npy', mmap_mode=load_mode)
-        self.retrieved_valid = np.load(rd / 'valid.npy', mmap_mode=load_mode)
-
-        # Neighbor structural features (may not exist in older caches)
-        nbr_struct_path = rd / 'neighbor_struct.npy'
-        if nbr_struct_path.exists():
-            self.retrieved_neighbor_struct = np.load(nbr_struct_path, mmap_mode=load_mode)
-        else:
-            self.retrieved_neighbor_struct = None
 
     def __len__(self):
         return len(self.samples)
@@ -361,7 +284,6 @@ class CachedRetrievalDataset(Dataset):
 
         W = self.window_size
         M = self.max_valid_distances
-        K = self.k_retrieved
 
         window_idx = self.flat_window_idx[global_idx]
         is_valid = (window_idx >= 0)
@@ -427,6 +349,11 @@ class CachedRetrievalDataset(Dataset):
             if nb_res_id >= 0:
                 lookup_idx = int(nb_res_id) - min_res
                 if 0 <= lookup_idx < span:
+                    # res_id_lookup maps (residue_id - min_res) -> global row.
+                    # For proteins with duplicate residue_ids it resolves to the
+                    # FIRST copy (05 builds it first-write-wins; see Finding #7),
+                    # so 05 and this consumer agree on which copy a neighbor id
+                    # points at.
                     nb_global = self.flat_res_id_lookup[lookup_offset + lookup_idx].item()
                     if nb_global >= 0:
                         neighbor_res_idx[k] = self.flat_residue_idx[nb_global]
@@ -493,7 +420,7 @@ class CachedRetrievalDataset(Dataset):
             aa_idx = self.flat_residue_idx[global_idx].item()
             if aa_idx < self.per_aa_means.shape[0]:
                 # Convert: global_z -> raw_ppm -> per_aa_z
-                raw = shift_target * self.retrieval_stds + self.retrieval_means
+                raw = shift_target * self.shift_stds + self.shift_means
                 shift_target = (raw - self.per_aa_means[aa_idx]) / self.per_aa_stds[aa_idx]
                 shift_target = torch.where(shift_mask, shift_target, torch.zeros_like(shift_target))
 
@@ -504,72 +431,6 @@ class CachedRetrievalDataset(Dataset):
                                     torch.zeros_like(spatial_dist), spatial_dist)
         dssp_features = torch.where(torch.isnan(dssp_features),
                                      torch.zeros_like(dssp_features), dssp_features)
-
-        # Query residue code
-        query_residue_code = self.flat_residue_idx[global_idx]
-
-        # Retrieval data (from mmap, or zero-filled for no_retrieval caches).
-        # When cache is compact, retrieval rows are indexed by sample idx
-        # (== the __getitem__ arg); otherwise by global_idx (legacy).
-        retr_idx = idx if self.retrieval_compact else global_idx
-
-        if self.retrieved_shifts is None:
-            retrieved_shifts = torch.zeros(K, self.n_shifts, dtype=torch.float32)
-            retrieved_shift_masks = torch.zeros(K, self.n_shifts, dtype=torch.bool)
-            retrieved_residue_codes = torch.zeros(K, dtype=torch.int64)
-            retrieved_distances = torch.zeros(K, dtype=torch.float32)
-            retrieved_valid = torch.zeros(K, dtype=torch.bool)
-        else:
-            retrieved_shifts = torch.from_numpy(
-                self.retrieved_shifts[retr_idx].astype(np.float32)
-            )
-            retrieved_shift_masks = torch.from_numpy(
-                self.retrieved_shift_masks[retr_idx].astype(bool)
-            )
-            retrieved_residue_codes = torch.from_numpy(
-                self.retrieved_residue_codes[retr_idx].astype(np.int64)
-            )
-            retrieved_distances = torch.from_numpy(
-                self.retrieved_distances[retr_idx].astype(np.float32)
-            )
-            retrieved_valid = torch.from_numpy(
-                self.retrieved_valid[retr_idx].astype(bool)
-            )
-
-            # Normalize retrieved shifts (CRITICAL: must match target normalization)
-            if self.retrieval_means is not None:
-                # Shape: (K, n_shifts) - normalize each shift column
-                retrieved_shifts = (retrieved_shifts - self.retrieval_means) / self.retrieval_stds
-                # Clamp to reasonable range and handle NaN
-                retrieved_shifts = torch.clamp(retrieved_shifts, -10, 10)
-                retrieved_shifts = torch.where(
-                    torch.isnan(retrieved_shifts),
-                    torch.zeros_like(retrieved_shifts),
-                    retrieved_shifts
-                )
-
-        # Query structural features
-        if self.flat_query_struct is not None:
-            query_struct = self.flat_query_struct[global_idx].float()
-            query_struct = torch.where(
-                torch.isnan(query_struct),
-                torch.zeros_like(query_struct),
-                query_struct
-            )
-        else:
-            query_struct = torch.zeros(max(self.n_struct_features, 1), dtype=torch.float32)
-
-        # Neighbor structural features
-        if self.retrieved_neighbor_struct is not None:
-            neighbor_struct = torch.from_numpy(
-                self.retrieved_neighbor_struct[retr_idx].astype(np.float32))
-            neighbor_struct = torch.where(
-                torch.isnan(neighbor_struct),
-                torch.zeros_like(neighbor_struct),
-                neighbor_struct
-            )
-        else:
-            neighbor_struct = torch.zeros(K, max(self.n_struct_features, 1), dtype=torch.float32)
 
         result = {
             # Structural features
@@ -604,18 +465,6 @@ class CachedRetrievalDataset(Dataset):
             # Targets
             'shift_target': shift_target,
             'shift_mask': shift_mask,
-
-            # Retrieval features
-            'query_residue_code': query_residue_code,
-            'retrieved_shifts': retrieved_shifts,
-            'retrieved_shift_masks': retrieved_shift_masks,
-            'retrieved_residue_codes': retrieved_residue_codes,
-            'retrieved_distances': retrieved_distances,
-            'retrieved_valid': retrieved_valid,
-
-            # Structural feature vectors (for retrieval neighbor encoder)
-            'query_struct': query_struct,
-            'neighbor_struct': neighbor_struct,
         }
 
         return result
@@ -625,7 +474,7 @@ class CachedRetrievalDataset(Dataset):
         return self.global_to_resid.get(str(global_idx), -1)
 
     @classmethod
-    def load(cls, cache_dir: str, n_shifts: int, k_retrieved: int = 32,
+    def load(cls, cache_dir: str, n_shifts: int,
              stats: dict = None, shift_cols: list = None,
              mmap_structural: bool = False):
         """Load a cached dataset from disk.
@@ -633,13 +482,12 @@ class CachedRetrievalDataset(Dataset):
         Args:
             cache_dir: Path to cached dataset
             n_shifts: Number of shift types
-            k_retrieved: Number of retrieved neighbors
-            stats: Normalization stats dict (REQUIRED for proper retrieval normalization)
-            shift_cols: List of shift column names (REQUIRED for proper retrieval normalization)
+            stats: Normalization stats dict (REQUIRED for proper normalization)
+            shift_cols: List of shift column names (REQUIRED for proper normalization)
             mmap_structural: If True, mmap structural arrays (low RAM, slow on
                 spinning disk). Default False = load fully into RAM (~5 GB/fold).
         """
-        return cls(cache_dir, n_shifts, k_retrieved,
+        return cls(cache_dir, n_shifts,
                    stats=stats, shift_cols=shift_cols,
                    mmap_structural=mmap_structural)
 

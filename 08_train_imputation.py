@@ -49,7 +49,7 @@ except ImportError:
 from config import (
     LEARNING_RATE, BATCH_SIZE, EPOCHS, HUBER_DELTA,
     WEIGHT_DECAY, OUTLIER_STD_THRESHOLD,
-    CONTEXT_WINDOW, K_SPATIAL_NEIGHBORS, K_RETRIEVED,
+    CONTEXT_WINDOW, K_SPATIAL_NEIGHBORS,
     MAX_VALID_DISTANCES,
 )
 from dataset import (
@@ -234,7 +234,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=LEARNING_RATE)
     parser.add_argument('--huber_delta', type=float, default=HUBER_DELTA)
-    parser.add_argument('--k_retrieved', type=int, default=K_RETRIEVED)
+    parser.add_argument('--k_retrieved', type=int, default=32, help='(unused; retrieval removed)')
     parser.add_argument('--save_every', type=int, default=25)
     parser.add_argument('--no_wandb', action='store_true')
     parser.add_argument('--build_cache_only', action='store_true',

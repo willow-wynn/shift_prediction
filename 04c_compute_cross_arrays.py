@@ -58,7 +58,60 @@ from config import (
     CROSS_DIST_CUTOFF, CROSS_H_CUTOFF, AA_3_TO_1, RESIDUE_TO_IDX,
 )
 from distance_features import build_cross_arrays_for_residue
-from pdb_utils import parse_pdb, resolve_pdb_path
+from pdb_utils import parse_pdb, parse_pdb_all_models, resolve_pdb_path
+from structure_selection import kabsch_superimpose
+
+
+def load_build_log(path: str, dataset: str) -> Dict[str, tuple]:
+    """build_log.csv: dataset, bmrb_id, pdb_path, chain_id, ... ->
+    bmrb -> (pdb_path, chain_id) for the requested dataset's successful rows.
+
+    This is the SAME (pdb_path, chain_id) that 01_build_datasets used to
+    compute the cache's intra distances, so cross arrays come from identical
+    coordinates."""
+    import pandas as pd
+    df = pd.read_csv(path, dtype={'bmrb_id': str})
+    df = df[(df['dataset'] == dataset) & (df['status'] == 'success')]
+    return {r['bmrb_id']: (r['pdb_path'], str(r['chain_id']))
+            for _, r in df.iterrows()}
+
+
+def select_best_nmr_model(pdb_path: str, chain_id: str):
+    """Deterministic NMR-model selection — mirrors
+    01_build_datasets.select_best_nmr_model exactly. Returns the model dict
+    keyed by (chain, res_id), or None. For single-model files returns model 0.
+
+    Picks the model whose CA coords are closest to the per-position median
+    over all superimposed models. Same input -> same output, so cross arrays
+    reproduce the intra arrays' coordinate frame."""
+    models = parse_pdb_all_models(pdb_path, chain_id=chain_id)
+    if not models:
+        return None
+    if len(models) == 1:
+        return models[0]
+    ref_keys = [k for k in sorted(models[0]) if 'CA' in models[0][k].get('atoms', {})]
+    if len(ref_keys) < 10:
+        return models[0]
+    common = set(ref_keys)
+    for m in models[1:]:
+        common &= {k for k in m if 'CA' in m[k].get('atoms', {})}
+    common = sorted(common)
+    if len(common) < 10:
+        return models[0]
+    n_models, n_pos = len(models), len(common)
+    ac = np.zeros((n_models, n_pos, 3))
+    for mi, m in enumerate(models):
+        for pi, k in enumerate(common):
+            ac[mi, pi, :] = m[k]['atoms']['CA']
+    ref = ac[0]
+    al = np.zeros_like(ac); al[0] = ref
+    for mi in range(1, n_models):
+        rot, trans = kabsch_superimpose(ac[mi], ref)
+        al[mi] = ac[mi] @ rot + trans
+    median = np.median(al, axis=0)
+    rmsds = np.array([np.sqrt(np.mean(np.sum((al[mi] - median) ** 2, axis=1)))
+                      for mi in range(n_models)])
+    return models[int(np.argmin(rmsds))]
 
 
 def load_pairs_csv(path: str) -> Dict[str, List[str]]:
@@ -78,13 +131,14 @@ def load_pairs_csv(path: str) -> Dict[str, List[str]]:
 def resolve_bmrb_pdb(bmrb_id: str,
                       pairs: Dict[str, List[str]],
                       uniprot_map: Dict[str, str],
-                      pdb_search_dirs: List[str]) -> Optional[str]:
-    """Try experimental first, then AlphaFold."""
-    # Experimental
-    for pdb_id in pairs.get(bmrb_id, []):
-        p = resolve_pdb_path(pdb_id, pdb_search_dirs)
-        if p:
-            return p
+                      pdb_search_dirs: List[str],
+                      af_only: bool = False) -> Optional[str]:
+    """Try experimental first, then AlphaFold. af_only=True skips experimental."""
+    if not af_only:
+        for pdb_id in pairs.get(bmrb_id, []):
+            p = resolve_pdb_path(pdb_id, pdb_search_dirs)
+            if p:
+                return p
     # AlphaFold
     up = uniprot_map.get(bmrb_id)
     if up:
@@ -98,14 +152,13 @@ def resolve_bmrb_pdb(bmrb_id: str,
     return None
 
 
-def parse_pdb_aa(path: str) -> Dict[int, dict]:
-    """Parse PDB and filter to standard amino acids, indexed by res_id."""
-    pdb_data = parse_pdb(path, chain_id=None)
+def model_to_aa(model: Dict[tuple, dict]) -> Dict[int, dict]:
+    """Convert a (chain, res_id)->info model dict (already chain-filtered by
+    select_best_nmr_model) into a res_id->info dict of standard amino acids."""
     aa = {}
-    for (chain, res_id), info in pdb_data.items():
+    for (chain, res_id), info in model.items():
         rn = info['residue_name']
         if rn in AA_3_TO_1 or rn in RESIDUE_TO_IDX:
-            # If the same res_id appears in multiple chains, keep the first.
             aa.setdefault(res_id, info)
     return aa
 
@@ -122,6 +175,18 @@ def main():
                     help='Process only N proteins (smoke test)')
     ap.add_argument('--dry_run', action='store_true',
                     help='Compute but do not save .npy files')
+    ap.add_argument('--af_only', action='store_true',
+                    help='[legacy] Skip experimental PDB lookup; use AF only. '
+                         'Ignored when --build_log + --dataset are given.')
+    ap.add_argument('--build_log',
+                    default='/home/brooks/1TB/Wynn/data_archive/build_log.csv',
+                    help='build_log.csv from 01_build_datasets: gives the exact '
+                         '(pdb_path, chain_id) used for this cache\'s intra '
+                         'distances, so cross arrays come from identical coords.')
+    ap.add_argument('--dataset', choices=['experimental', 'alphafold', 'hybrid'],
+                    required=True,
+                    help='Which dataset rows of build_log to use. Must match the '
+                         'cache being augmented (experimental/alphafold/hybrid).')
     args = ap.parse_args()
 
     cache_dir = Path(args.cache_dir)
@@ -149,11 +214,12 @@ def main():
         bmrbs = bmrbs[:args.limit]
         print(f'  --limit set: processing {len(bmrbs)}')
 
-    # PDB resolver state
-    pairs = load_pairs_csv(args.pairs_csv)
-    uniprot_map = json.load(open(args.uniprot_map)) if os.path.isfile(args.uniprot_map) else {}
-    print(f'  pairs.csv entries: {len(pairs):,}')
-    print(f'  bmrb→uniprot entries: {len(uniprot_map):,}')
+    # Authoritative (pdb_path, chain_id) per BMRB, exactly as used by
+    # 01_build_datasets for this cache's intra/spatial/dssp features.
+    build_log = load_build_log(args.build_log, args.dataset)
+    print(f'  build_log[{args.dataset}] entries: {len(build_log):,}')
+    n_in_log = sum(1 for b in bmrbs if b in build_log)
+    print(f'  cache BMRBs present in build_log: {n_in_log:,} / {len(bmrbs):,}')
 
     # Allocate output arrays
     pad_atom = len(ATOM_TO_IDX)
@@ -170,13 +236,32 @@ def main():
     pdb_failures: List[str] = []
     t0 = time.time()
     for bmrb in tqdm(bmrbs, desc='proteins'):
-        pdb_path = resolve_bmrb_pdb(bmrb, pairs, uniprot_map, args.pdb_search_dirs)
-        if pdb_path is None:
+        entry = build_log.get(bmrb)
+        if entry is None:
             n_pdb_miss += 1
-            pdb_failures.append(bmrb)
+            pdb_failures.append(f'{bmrb} not-in-build-log')
             continue
+        pdb_path, chain_id = entry
+        if not os.path.isfile(pdb_path):
+            # build_log path is from the build machine; relocate by basename.
+            base = os.path.basename(pdb_path)                 # e.g. AF-P01923-F1-model_v6.pdb or 2LLM.pdb
+            alt = None
+            for d in args.pdb_search_dirs:                    # exact filename in a search dir
+                cand = os.path.join(d, base)
+                if os.path.isfile(cand):
+                    alt = cand; break
+            if alt is None:                                   # last resort: PDB-ID resolver (exp 4-letter)
+                alt = resolve_pdb_path(os.path.splitext(base)[0], args.pdb_search_dirs)
+            if alt:
+                pdb_path = alt
+            else:
+                n_pdb_miss += 1
+                pdb_failures.append(f'{bmrb} pdb-not-found: {pdb_path}')
+                continue
         try:
-            aa_data = parse_pdb_aa(pdb_path)
+            # SAME model + chain that 01_build_datasets used for intra/spatial.
+            model = select_best_nmr_model(pdb_path, chain_id)
+            aa_data = model_to_aa(model) if model is not None else {}
         except Exception as e:
             n_pdb_miss += 1
             pdb_failures.append(f'{bmrb} parse-error: {e}')

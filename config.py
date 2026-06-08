@@ -8,8 +8,21 @@ import numpy as np
 # ============================================================================
 # Paths
 # ============================================================================
-DATA_DIR = 'data'
-PDB_DIR = 'data/pdbs'
+# Filesystem roots live in paths.py behind environment-variable overrides
+# (Finding #15a). They are re-exported here so every existing
+# `from config import DATA_DIR/PDB_DIR/BIG_STORAGE/...` keeps working unchanged.
+# With no env vars set these resolve to the historical hardcoded defaults.
+from paths import (
+    DATA_DIR,
+    PDB_DIR,
+    ALPHAFOLD_DIR,
+    BIG_STORAGE,
+    BIG_RUNS_DIR,
+    BIG_CACHES_DIR,
+    BIG_RESULTS_DIR,
+    DATASET_DIRS,
+)
+
 DSSP_PATH = os.environ.get('DSSP_PATH') or shutil.which('mkdssp') or shutil.which('dssp') or 'mkdssp'
 
 # ============================================================================
@@ -75,29 +88,14 @@ ATOM_TYPES = [
 ATOM_TO_IDX = {a: i for i, a in enumerate(ATOM_TYPES)}
 N_ATOM_TYPES = len(ATOM_TYPES)
 
-# Dataset paths: --data flag maps to these directories
-DATASET_DIRS = {
-    'hybrid': 'data',
-    'alphafold': 'data_alphafold',
-    'experimental': 'data_experimental',
-    'refdb': 'data_refdb',
-    'rereferenced': 'data_rereferenced',
-}
-
-# ============================================================================
-# Big-output storage root
-# ============================================================================
-# All scripts that write multi-GB outputs (training caches, embeddings, FAISS
-# indices, runs, per-protein benchmark files) should default to this root so
-# the main disk doesn't fill up. Main disk (/) is ~468 GB and constantly tight;
-# /home/brooks/1TB/ is the spinning disk with plenty of room.
-#
-# Pattern: use BIG_STORAGE as the default for any `--output_dir` CLI flag. If
-# an overriding path is passed, respect it (user knows what they're doing).
-BIG_STORAGE = '/home/brooks/1TB/Wynn'
-BIG_RUNS_DIR = f'{BIG_STORAGE}/runs'
-BIG_CACHES_DIR = f'{BIG_STORAGE}/caches'
-BIG_RESULTS_DIR = f'{BIG_STORAGE}/results'
+# Dataset paths (`--data` flag -> directory) and the big-output storage root
+# (caches/embeddings/indices/runs/results) are defined in paths.py and
+# re-exported above (Finding #15a). They are overridable via SHIFT_* env vars;
+# unset env vars reproduce the previous hardcoded defaults:
+#   DATASET_DIRS  -> {'hybrid': 'data', 'alphafold': 'data_alphafold', ...}
+#   BIG_STORAGE   -> '/home/brooks/1TB/Wynn'  (spinning disk, big outputs)
+# Use BIG_STORAGE as the default for any `--output_dir`; respect an explicit
+# override (user knows what they're doing).
 
 # ============================================================================
 # Inter-Residue Bond Geometry Columns
@@ -147,12 +145,6 @@ ESM_EMBED_DIM = 2560
 ESM_REPR_LAYER = 36
 
 # ============================================================================
-# FAISS Parameters
-# ============================================================================
-FAISS_NPROBE = 64
-K_RETRIEVED = 32
-
-# ============================================================================
 # Training Hyperparameters
 # ============================================================================
 LEARNING_RATE = 2e-4
@@ -173,9 +165,6 @@ INPUT_DROPOUT = 0.10
 LAYER_DROPOUTS = [0.40, 0.40, 0.40, 0.40, 0.40]
 HEAD_DROPOUT = 0.45
 SPATIAL_ATTN_HIDDEN = 192
-RETRIEVAL_HIDDEN = 320
-RETRIEVAL_HEADS = 8
-RETRIEVAL_DROPOUT = 0.3
 MAX_VALID_DISTANCES = 400
 
 # ============================================================================
@@ -211,5 +200,6 @@ CROSS_OFFSET_EMBED_DIM = 8
 # ============================================================================
 RCSB_SEARCH_URL = 'https://search.rcsb.org/rcsbsearch/v2/query'
 ALPHAFOLD_DB_URL = 'https://alphafold.ebi.ac.uk/files'
-ALPHAFOLD_DIR = 'data/alphafold'
+# ALPHAFOLD_DIR is re-exported from paths.py (overridable via SHIFT_ALPHAFOLD_DIR;
+# default '<DATA_DIR>/alphafold' == 'data/alphafold' when env unset).
 MIN_SEQUENCE_IDENTITY = 0.80

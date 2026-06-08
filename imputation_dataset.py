@@ -293,28 +293,6 @@ class ImputationDataset(Dataset):
         dssp_features = torch.where(torch.isnan(dssp_features),
                                      torch.zeros_like(dssp_features), dssp_features)
 
-        query_residue_code = base.flat_residue_idx[global_idx]
-
-        # Retrieval data
-        retrieved_shifts = torch.from_numpy(
-            base.retrieved_shifts[global_idx].astype(np.float32))
-        retrieved_shift_masks = torch.from_numpy(
-            base.retrieved_shift_masks[global_idx].astype(bool))
-        retrieved_residue_codes = torch.from_numpy(
-            base.retrieved_residue_codes[global_idx].astype(np.int64))
-        retrieved_distances = torch.from_numpy(
-            base.retrieved_distances[global_idx].astype(np.float32))
-        retrieved_valid = torch.from_numpy(
-            base.retrieved_valid[global_idx].astype(bool))
-
-        # Normalize retrieved shifts
-        if base.retrieval_means is not None:
-            retrieved_shifts = (retrieved_shifts - base.retrieval_means) / base.retrieval_stds
-            retrieved_shifts = torch.clamp(retrieved_shifts, -10, 10)
-            retrieved_shifts = torch.where(
-                torch.isnan(retrieved_shifts), torch.zeros_like(retrieved_shifts),
-                retrieved_shifts)
-
         return {
             'atom1_idx': atom1_idx,
             'atom2_idx': atom2_idx,
@@ -343,12 +321,6 @@ class ImputationDataset(Dataset):
             'cross_dist_mask': cross_dist_mask,
             'spatial_neighbor_shifts': spatial_neighbor_shifts,
             'spatial_neighbor_shift_masks': spatial_neighbor_shift_masks,
-            'query_residue_code': query_residue_code,
-            'retrieved_shifts': retrieved_shifts,
-            'retrieved_shift_masks': retrieved_shift_masks,
-            'retrieved_residue_codes': retrieved_residue_codes,
-            'retrieved_distances': retrieved_distances,
-            'retrieved_valid': retrieved_valid,
         }
 
 

@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Comprehensive Evaluation for Retrieval-Augmented Chemical Shift Prediction
-(Better Data Pipeline)
+Comprehensive evaluation for the structure-only chemical shift predictor.
 
-Adapted from homologies/evaluate_retrieval_model.py with improvements:
 - Auto-detects architecture params from checkpoint
 - Per-shift-type MAE, RMSE, R^2 metrics (CA, CB, C, N, H, HA)
 - Per-protein aggregated metrics
 - Baseline comparisons: mean predictor, random coil predictor
-- Trust score analysis (model confidence)
-- Retrieval contribution analysis (how much retrieval helps vs structure-only)
 - Provenance logging: which proteins evaluated, exclusions, checkpoint used
 
 Usage:
-    python 07_evaluate.py --model checkpoints/best_retrieval_fold1.pt \\
+    python 07_evaluate.py --model checkpoints/best.pt \\
         --data_dir data --cache_dir cache --fold 1 --output_dir eval_results
 
     # With plots
-    python 07_evaluate.py --model checkpoints/best_retrieval_fold1.pt \\
+    python 07_evaluate.py --model checkpoints/best.pt \\
         --data_dir data --cache_dir cache --fold 1 --plots
 """
 
@@ -43,11 +39,12 @@ from tqdm import tqdm
 
 from config import (
     N_RESIDUE_TYPES, N_SS_TYPES, N_MISMATCH_TYPES, DSSP_COLS,
-    K_RETRIEVED, STANDARD_RESIDUES, AA_3_TO_1,
+    STANDARD_RESIDUES, AA_3_TO_1,
 )
 from dataset import CachedRetrievalDataset
-from model import ShiftPredictorWithRetrieval
+from model import ShiftPredictor
 from random_coil import RC_SHIFTS
+from shift_norm import denormalize, load_model
 
 try:
     import matplotlib
@@ -65,96 +62,10 @@ BACKBONE_ATOMS = {'C', 'CA', 'CB', 'H', 'HA', 'N'}
 # Model Loading (auto-detect architecture)
 # ============================================================================
 
-def load_model(checkpoint_path, device):
-    """Load trained model from checkpoint with auto-detected architecture.
-
-    Returns:
-        (model, checkpoint_info_dict) or (None, None) on failure
-    """
-    if not os.path.exists(checkpoint_path):
-        print(f"  ERROR: Checkpoint not found: {checkpoint_path}")
-        return None, None
-
-    print(f"  Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-
-    # Remove _orig_mod. prefix from compiled model keys
-    clean_state_dict = {}
-    for k, v in state_dict.items():
-        new_key = k.replace('_orig_mod.', '')
-        clean_state_dict[new_key] = v
-
-    # Infer model dimensions from state dict
-    n_atom_types = clean_state_dict['distance_attention.atom_embed.weight'].shape[0] - 1
-    n_shifts = sum(1 for k in clean_state_dict
-                   if k.startswith('shift_heads.') and k.endswith('.0.weight'))
-
-    stats = checkpoint.get('stats', None)
-    shift_cols = checkpoint.get('shift_cols', None)
-    k_retrieved = checkpoint.get('k_retrieved', K_RETRIEVED)
-
-    # Detect query-conditioned transfer
-
-    # Get DSSP dimension
-    n_dssp = clean_state_dict['dssp_proj.weight'].shape[1] if 'dssp_proj.weight' in clean_state_dict else 0
-
-    # Infer CNN channels
-    cnn_channels = []
-    for i in range(0, 10, 2):
-        key = f'cnn.{i}.conv1.weight'
-        if key in clean_state_dict:
-            cnn_channels.append(clean_state_dict[key].shape[0])
-
-    # Infer spatial_hidden
-    spatial_hidden = (clean_state_dict['spatial_attention.fallback_embed'].shape[0]
-                      if 'spatial_attention.fallback_embed' in clean_state_dict else 192)
-
-    # Infer retrieval_hidden
-    retrieval_hidden = (clean_state_dict['retrieval_cross_attn.fallback'].shape[0]
-                        if 'retrieval_cross_attn.fallback' in clean_state_dict else 192)
-
-    print(f"  Auto-detected architecture:")
-    print(f"    n_atom_types:            {n_atom_types}")
-    print(f"    n_shifts:                {n_shifts}")
-    print(f"    n_dssp:                  {n_dssp}")
-    print(f"    cnn_channels:            {cnn_channels}")
-    print(f"    spatial_hidden:          {spatial_hidden}")
-    print(f"    retrieval_hidden:        {retrieval_hidden}")
-    print(f"    k_retrieved:             {k_retrieved}")
-
-    model = ShiftPredictorWithRetrieval(
-        n_atom_types=n_atom_types,
-        n_residue_types=N_RESIDUE_TYPES,
-        n_ss_types=N_SS_TYPES,
-        n_mismatch_types=N_MISMATCH_TYPES,
-        n_dssp=n_dssp,
-        n_shifts=n_shifts,
-        cnn_channels=cnn_channels,
-        spatial_hidden=spatial_hidden,
-        retrieval_hidden=retrieval_hidden,
-    ).to(device)
-
-    # Filter out deprecated physics_encoder keys from old checkpoints
-    filtered_sd = {k: v for k, v in clean_state_dict.items()
-                   if not k.startswith('physics_encoder.')}
-    model.load_state_dict(filtered_sd, strict=False)
-    model.eval()
-
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Loaded model with {n_params:,} parameters")
-
-    return model, {
-        'stats': stats,
-        'shift_cols': shift_cols,
-        'k_retrieved': k_retrieved,
-        'checkpoint_path': checkpoint_path,
-        'epoch': checkpoint.get('epoch', 'unknown'),
-    }
+# load_model now lives in shift_norm.py (single shared auto-detect loader,
+# imported above) — formerly duplicated here and in inference.py with diverging
+# n_shifts probing. The returned info dict is a superset of the keys this file
+# uses ('stats', 'shift_cols').
 
 
 # ============================================================================
@@ -170,8 +81,6 @@ def collect_predictions(model, loader, device, stats, shift_cols):
     all_target = []
     all_mask = []
     all_residue_codes = []
-    all_retrieved_distances = []
-    all_retrieved_valid = []
 
     for batch in tqdm(loader, desc="  Collecting predictions", leave=False):
         batch_dev = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
@@ -185,45 +94,21 @@ def collect_predictions(model, loader, device, stats, shift_cols):
         all_pred.append(pred.cpu())
         all_target.append(target.cpu())
         all_mask.append(mask.cpu())
-        all_residue_codes.append(batch_dev['query_residue_code'].cpu())
-        all_retrieved_distances.append(batch_dev['retrieved_distances'].cpu())
-        all_retrieved_valid.append(batch_dev['retrieved_valid'].cpu())
+        rid_ = batch_dev['residue_idx']
+        all_residue_codes.append(rid_[:, rid_.shape[1] // 2].cpu())
 
     predictions = torch.cat(all_pred).numpy()
     targets = torch.cat(all_target).numpy()
     masks = torch.cat(all_mask).numpy()
     residue_codes = torch.cat(all_residue_codes).numpy()
-    retrieved_distances = torch.cat(all_retrieved_distances).numpy()
-    retrieved_valid = torch.cat(all_retrieved_valid).numpy()
 
-    # Denormalize. The dataset normalizes targets per-AA (with global fallback
-    # per cell when an AA lacks stats for a given shift), so we must invert
-    # the SAME mapping or MAEs will be wildly off. Build (n_aa, n_shifts)
-    # mean/std tensors to denorm vectorized.
-    from config import STANDARD_RESIDUES
-    per_aa_stats = stats.get('per_aa', {}) if isinstance(stats, dict) else {}
-    n_aa = len(STANDARD_RESIDUES)
-    n_shifts = len(shift_cols)
-    means = np.zeros((n_aa, n_shifts), dtype=np.float64)
-    stds  = np.ones ((n_aa, n_shifts), dtype=np.float64)
-    for ai, aa_name in enumerate(STANDARD_RESIDUES):
-        aa_block = per_aa_stats.get(aa_name, {})
-        for si, col in enumerate(shift_cols):
-            if col in aa_block:
-                means[ai, si] = aa_block[col]['mean']
-                stds [ai, si] = max(aa_block[col]['std'], 1e-6)
-            elif col in stats:
-                means[ai, si] = stats[col]['mean']
-                stds [ai, si] = max(stats[col]['std'], 1e-6)
-
-    # residue_codes is (N,) of AA indices; clamp out-of-range to 0 (means/stds
-    # for that slot fall back to global from the loop above).
-    safe_codes = np.clip(residue_codes, 0, n_aa - 1).astype(np.int64)
-    per_residue_means = means[safe_codes]   # (N, n_shifts)
-    per_residue_stds  = stds [safe_codes]   # (N, n_shifts)
-
-    predictions_denorm = predictions * per_residue_stds + per_residue_means
-    targets_denorm     = targets     * per_residue_stds + per_residue_means
+    # Denormalize via the ONE canonical per-AA denorm (shift_norm.denormalize).
+    # The dataset normalizes targets per-AA (with global fallback per cell when
+    # an AA lacks stats for a given shift); denormalize inverts the SAME mapping.
+    # NOTE: out-of-range/unknown AA now falls back to GLOBAL stats (was: clamp
+    # to AA 0/ALA here) — only affects unknown residues, never valid ones.
+    predictions_denorm = denormalize(predictions, residue_codes, stats, shift_cols)
+    targets_denorm     = denormalize(targets,     residue_codes, stats, shift_cols)
 
     errors = np.abs(predictions_denorm - targets_denorm)
 
@@ -235,8 +120,6 @@ def collect_predictions(model, loader, device, stats, shift_cols):
         'errors': errors,
         'masks': masks,
         'residue_codes': residue_codes,
-        'retrieved_distances': retrieved_distances,
-        'retrieved_valid': retrieved_valid,
     }
 
 
@@ -417,59 +300,6 @@ def compute_baseline_metrics(results, shift_cols, stats):
 
 # ============================================================================
 # Retrieval Contribution Analysis
-# ============================================================================
-
-def analyze_retrieval_contribution(results):
-    """Analyze how retrieval quality correlates with prediction quality."""
-    retrieved_distances = results['retrieved_distances']
-    retrieved_valid = results['retrieved_valid']
-
-    # Mean cosine similarity of valid neighbors
-    valid_float = retrieved_valid.astype(float)
-    n_valid_per_sample = valid_float.sum(axis=1)
-    masked_dist = retrieved_distances * valid_float
-    mean_sim = np.where(n_valid_per_sample > 0,
-                        masked_dist.sum(axis=1) / (n_valid_per_sample + 1e-8),
-                        0.0)
-
-    # Per-sample MAE
-    masks = results['masks'].astype(bool)
-    sample_mae = np.zeros(len(results['predictions']))
-    for i in range(len(results['predictions'])):
-        if masks[i].any():
-            sample_mae[i] = np.mean(results['errors'][i][masks[i]])
-
-    # Correlation between retrieval similarity and prediction error
-    valid_samples = n_valid_per_sample > 0
-    if valid_samples.sum() > 1:
-        corr = float(np.corrcoef(mean_sim[valid_samples],
-                                  sample_mae[valid_samples])[0, 1])
-    else:
-        corr = 0.0
-
-    # MAE by retrieval quality bins
-    sim_bins = [0, 0.7, 0.8, 0.9, 0.95, 1.0]
-    mae_by_sim = {}
-    for j in range(len(sim_bins) - 1):
-        lo, hi = sim_bins[j], sim_bins[j + 1]
-        bin_mask = (mean_sim >= lo) & (mean_sim < hi)
-        if bin_mask.sum() > 0:
-            mae_by_sim[f'{lo:.2f}-{hi:.2f}'] = {
-                'mae': float(np.mean(sample_mae[bin_mask])),
-                'count': int(bin_mask.sum()),
-            }
-
-    return {
-        'mean_cosine_similarity': float(np.mean(mean_sim[valid_samples])) if valid_samples.sum() > 0 else 0,
-        'mean_valid_neighbors': float(np.mean(n_valid_per_sample)),
-        'pct_with_no_retrieval': float((n_valid_per_sample == 0).mean() * 100),
-        'correlation_similarity_vs_error': corr,
-        'mae_by_similarity_bin': mae_by_sim,
-    }
-
-
-# ============================================================================
-# Visualization
 # ============================================================================
 
 def generate_plots(results, shift_cols, stats, baselines, output_dir):
@@ -666,10 +496,10 @@ def _plot_per_protein(results, shift_cols, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Evaluate retrieval-augmented chemical shift predictor (better data pipeline)')
+        description='Evaluate the structure-only chemical shift predictor')
     parser.add_argument('--data_dir', type=str, required=True,
                         help='Directory containing data CSV file')
-    parser.add_argument('--cache_dir', type=str, default='dataset_cache',
+    parser.add_argument('--cache_dir', type=str, required=True,
                         help='Directory for dataset cache')
     parser.add_argument('--model', type=str, required=True,
                         help='Path to model checkpoint')
@@ -724,11 +554,9 @@ def main():
 
     stats = checkpoint_info['stats']
     shift_cols = checkpoint_info['shift_cols']
-    k_retrieved = checkpoint_info['k_retrieved']
 
     provenance['model_epoch'] = checkpoint_info.get('epoch', 'unknown')
     provenance['shift_cols'] = shift_cols
-    provenance['k_retrieved'] = k_retrieved
 
     if stats is None or shift_cols is None:
         print("ERROR: Stats and shift_cols not found in checkpoint.")
@@ -741,13 +569,12 @@ def main():
 
     if not CachedRetrievalDataset.exists(test_cache):
         print(f"ERROR: Cached test dataset not found at {test_cache}")
-        print("  Run 06_train.py first to build the dataset cache.")
+        print("  Run 05_build_training_cache.py first to build the dataset cache.")
         sys.exit(1)
 
     dataset = CachedRetrievalDataset.load(
         test_cache,
         n_shifts=len(shift_cols),
-        k_retrieved=k_retrieved,
         stats=stats,
         shift_cols=shift_cols,
     )
@@ -826,17 +653,6 @@ def main():
         print(f"    Improvement over RC:    {rc_improvement:.4f} ppm "
               f"({100*rc_improvement/baselines['random_coil_predictor']['overall_mae']:.1f}%)")
 
-    # ========== Retrieval contribution ==========
-    print("\nAnalyzing retrieval contribution...")
-    retrieval_analysis = analyze_retrieval_contribution(results)
-    print(f"  Mean cosine similarity:  {retrieval_analysis['mean_cosine_similarity']:.3f}")
-    print(f"  Mean valid neighbors:    {retrieval_analysis['mean_valid_neighbors']:.1f}")
-    print(f"  % with no retrieval:     {retrieval_analysis['pct_with_no_retrieval']:.1f}%")
-    print(f"  Similarity-error corr:   {retrieval_analysis['correlation_similarity_vs_error']:.3f}")
-    print(f"  MAE by similarity bin:")
-    for bin_name, data in retrieval_analysis['mae_by_similarity_bin'].items():
-        print(f"    {bin_name}: MAE={data['mae']:.3f} (n={data['count']:,})")
-
     # ========== Save results ==========
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -845,7 +661,6 @@ def main():
         'overall': overall,
         'per_shift': per_shift,
         'baselines': baselines,
-        'retrieval_analysis': retrieval_analysis,
         'provenance': provenance,
     }
 

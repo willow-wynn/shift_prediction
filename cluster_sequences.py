@@ -50,6 +50,47 @@ def extract_sequences(csv_path):
     return sequences
 
 
+def _run_mmseqs_easy_cluster(fasta_path, out_prefix, tmp_dir,
+                             identity_threshold, coverage, cov_mode):
+    """Run a single `mmseqs easy-cluster` and parse its cluster TSV.
+
+    Returns dict: representative -> set of members (members include the rep).
+    """
+    cmd = [
+        'mmseqs', 'easy-cluster',
+        fasta_path, out_prefix, tmp_dir,
+        '--min-seq-id', str(identity_threshold),
+        '-c', str(coverage),
+        '--cov-mode', str(cov_mode),
+        '--threads', '4',
+    ]
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        print(f"  MMseqs2 stderr: {result.stderr}")
+        raise RuntimeError(f"MMseqs2 failed with return code {result.returncode}")
+
+    cluster_tsv = out_prefix + '_cluster.tsv'
+    clusters = {}  # representative -> set of members
+    with open(cluster_tsv) as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2:
+                rep, member = parts[0], parts[1]
+                clusters.setdefault(rep, set()).add(member)
+    return clusters
+
+
+def _clusters_to_exclusion_map(clusters):
+    """rep->{members} dict to bmrb_id -> sorted [other members] exclusion map."""
+    exclusion_map = {}
+    for rep, members in clusters.items():
+        for m in members:
+            # Exclude all other cluster members (not self)
+            exclusion_map[m] = sorted(members - {m})
+    return exclusion_map
+
+
 def run_mmseqs2_clustering(sequences, identity_threshold=0.90, coverage=0.80):
     """Run MMseqs2 easy-cluster and return cluster membership.
 
@@ -72,42 +113,44 @@ def run_mmseqs2_clustering(sequences, identity_threshold=0.90, coverage=0.80):
         tmp_dir = os.path.join(tmpdir, 'tmp')
         os.makedirs(tmp_dir, exist_ok=True)
 
-        cmd = [
-            'mmseqs', 'easy-cluster',
+        clusters = _run_mmseqs_easy_cluster(
             fasta_path, out_prefix, tmp_dir,
-            '--min-seq-id', str(identity_threshold),
-            '-c', str(coverage),
-            '--cov-mode', '0',  # bidirectional coverage
-            '--threads', '4',
-        ]
+            identity_threshold, coverage, cov_mode=0)  # bidirectional coverage
+        return _clusters_to_exclusion_map(clusters)
 
-        print(f"  Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            print(f"  MMseqs2 stderr: {result.stderr}")
-            raise RuntimeError(f"MMseqs2 failed with return code {result.returncode}")
 
-        # Parse cluster TSV: representative\tmember
-        cluster_tsv = out_prefix + '_cluster.tsv'
-        clusters = {}  # representative -> set of members
+def run_mmseqs2_containment_clustering(sequences, identity_threshold=0.90,
+                                       coverage=0.80):
+    """Containment clustering: catch length-mismatched same-protein twins.
 
-        with open(cluster_tsv) as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 2:
-                    rep, member = parts[0], parts[1]
-                    if rep not in clusters:
-                        clusters[rep] = set()
-                    clusters[rep].add(member)
+    The default bidirectional-coverage clustering (`--cov-mode 0`) never groups
+    two sequences that are ~identical over the SHORTER one but differ in length
+    (tag/construct/peptide-vs-full). Those twins are the residual fold-split leak
+    (finding #1). Here we re-cluster with `--cov-mode 1` (coverage of the
+    TARGET, i.e. the shorter representative) at the same `--min-seq-id`, so a
+    short sequence contained in a longer one joins the longer one's cluster.
 
-        # Build exclusion map: each protein maps to all others in its cluster
-        exclusion_map = {}
-        for rep, members in clusters.items():
-            for m in members:
-                # Exclude all other cluster members (not self)
-                exclusion_map[m] = sorted(members - {m})
+    Kept SEPARATE from run_mmseqs2_clustering so the canonical 80%-bidirectional
+    identity_clusters_90.json stays byte-for-byte back-compatible; 02 unions
+    these containment edges in addition to the existing ones.
 
-        return exclusion_map
+    Returns:
+        dict: bmrb_id -> sorted [other members of its containment cluster]
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fasta_path = os.path.join(tmpdir, 'sequences.fasta')
+        with open(fasta_path, 'w') as f:
+            for bmrb_id, seq in sequences.items():
+                f.write(f'>{bmrb_id}\n{seq}\n')
+
+        out_prefix = os.path.join(tmpdir, 'cluster_contain')
+        tmp_dir = os.path.join(tmpdir, 'tmp')
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        clusters = _run_mmseqs_easy_cluster(
+            fasta_path, out_prefix, tmp_dir,
+            identity_threshold, coverage, cov_mode=1)  # coverage of target
+        return _clusters_to_exclusion_map(clusters)
 
 
 def main():
@@ -128,9 +171,14 @@ def main():
     )
     args = parser.parse_args()
 
+    pct = int(args.identity * 100)
     if args.output is None:
-        pct = int(args.identity * 100)
         args.output = os.path.join(args.data_dir, f'identity_clusters_{pct}.json')
+    # Containment-cluster output sits next to the main clusters file. 02 unions
+    # these edges so length-mismatched same-protein twins (substring twins)
+    # don't get split across folds (leak finding #1).
+    containment_output = os.path.join(
+        args.data_dir, f'containment_clusters_{pct}.json')
 
     # Find the dataset CSV
     csv_path = None
@@ -163,6 +211,20 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(exclusion_map, f, indent=2)
     print(f"\n  Saved to {args.output}")
+
+    # --- Containment clustering (finding #1: substring twins) ---
+    print(f"\nContainment clustering at {args.identity:.0%} identity "
+          f"(--cov-mode 1, coverage of shorter target)...")
+    containment_map = run_mmseqs2_containment_clustering(
+        sequences, identity_threshold=args.identity)
+    c_with_neighbors = sum(1 for v in containment_map.values() if v)
+    c_total = sum(len(v) for v in containment_map.values())
+    print(f"  Containment map:")
+    print(f"    Proteins with containment neighbors: {c_with_neighbors}")
+    print(f"    Total containment pairs: {c_total}")
+    with open(containment_output, 'w') as f:
+        json.dump(containment_map, f, indent=2)
+    print(f"  Saved to {containment_output}")
 
 
 if __name__ == '__main__':

@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """
-Chemical Shift Predictor with Retrieval Augmentation.
+Structure-only Chemical Shift Predictor.
 
-Architecture:
-  Base encoder:
-    - DistanceAttentionPerPosition (atom-pair distances → 256-dim per position)
-    - 5-layer residual CNN on 11-position window → 1280-dim center extraction
-    - SpatialNeighborAttention: K=5 spatial neighbors → 192-dim
-    - base_encoder_dim = 1280 + 128 + 192 = 1600
-
-  Retrieval pathway (adapted from V9 reranker):
-    - RetrievalNeighborEncoder: per-neighbor features → (B, K, retrieval_hidden)
-    - 2x SelfAttentionLayer: neighbors attend to each other
-    - 3x ShiftSpecificCrossAttention: per-shift query embeddings attend to neighbors
-    - DirectTransferHead: learned scoring → weighted shift average
-    - retrieval_gate: blends direct transfer with structure-only prediction
-
-  Prediction:
-    - struct_pred: structure-only MLP head
-    - retrieval_pred: direct shift transfer (learned weighted average of neighbor shifts)
-    - final_pred = rg * retrieval_pred + (1-rg) * struct_pred
+Architecture (single structure-only pathway; the retrieval pathway was removed —
+see legacy/ for the retired ESM+FAISS retrieval code):
+  - DistanceAttentionPerPosition (intra-residue atom-pair distances → per-position)
+  - CrossDistanceAttention: cross-residue (sidechain-aware) distances at the center,
+    added as a per-AA-gated residual (cross_gate)
+  - 5-layer residual CNN over the residue window → center extraction
+  - SpatialNeighborAttention: K=5 spatial neighbors → 192-dim
+  - struct_head: MLP → n_shifts
 """
 
 import os
@@ -40,7 +30,6 @@ from config import (
     CNN_CHANNELS, KERNEL_SIZE,
     INPUT_DROPOUT, LAYER_DROPOUTS, HEAD_DROPOUT,
     SPATIAL_ATTN_HIDDEN,
-    RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
     N_BOND_GEOM,
     MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES, CROSS_OFFSET_EMBED_DIM,
@@ -239,6 +228,7 @@ class SpatialNeighborAttention(nn.Module):
         self.k_proj = nn.Linear(combined_dim, hidden_dim)
         self.v_proj = nn.Linear(combined_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.ablate = set()  # feature-ablation flags (set externally before compile)
         self.attn_drop = nn.Dropout(dropout)
 
         self.fallback_embed = nn.Parameter(torch.zeros(hidden_dim))
@@ -264,6 +254,11 @@ class SpatialNeighborAttention(nn.Module):
 
         res_emb = self.residue_embed(neighbor_res_idx)
         ss_emb = self.ss_embed(neighbor_ss_idx)
+        # Feature ablation (zero a feature group's contribution at train/eval time)
+        if 'residue_type' in self.ablate:
+            res_emb = res_emb * 0.0
+        if 'ss' in self.ablate:
+            ss_emb = ss_emb * 0.0
 
         neighbor_dist = torch.where(torch.isnan(neighbor_dist), torch.zeros_like(neighbor_dist), neighbor_dist)
         neighbor_angles = torch.where(torch.isnan(neighbor_angles), torch.zeros_like(neighbor_angles), neighbor_angles)
@@ -327,196 +322,15 @@ class ResidualBlock1D(nn.Module):
 
 
 # ============================================================================
-# V9 Retrieval Components: Neighbor Encoder + Self-Attention + Cross-Attention
+# Full Model (structure-only)
 # ============================================================================
 
-class SafeMultiHeadAttention(nn.Module):
-    """Multi-head attention with validity masking."""
-
-    def __init__(self, d_model, n_heads, dropout=0.1):
-        super().__init__()
-        assert d_model % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.scale = self.head_dim ** -0.5
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-
-    def forward(self, query, key, value, valid_mask=None):
-        B, Lq, D = query.shape
-        Lk = key.shape[1]
-        H, HD = self.n_heads, self.head_dim
-        Q = self.q_proj(query).view(B, Lq, H, HD).transpose(1, 2)
-        K = self.k_proj(key).view(B, Lk, H, HD).transpose(1, 2)
-        V = self.v_proj(value).view(B, Lk, H, HD).transpose(1, 2)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        if valid_mask is not None:
-            scores = scores.masked_fill(~valid_mask.unsqueeze(1).unsqueeze(2), -1e4)
-        weights = self.attn_drop(F.softmax(scores, dim=-1))
-        out = torch.matmul(weights, V)
-        out = out.transpose(1, 2).contiguous().view(B, Lq, D)
-        out = self.out_proj(out)
-        if valid_mask is not None:
-            out = out * valid_mask.any(dim=1).float().unsqueeze(1).unsqueeze(2)
-        return out
-
-
-class SelfAttentionLayer(nn.Module):
-    """Pre-norm transformer self-attention layer with validity masking."""
-
-    def __init__(self, d_model, n_heads, dropout=0.1):
-        super().__init__()
-        self.attn = SafeMultiHeadAttention(d_model, n_heads, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(d_model * 2, d_model))
-        self.norm2 = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x, valid_mask):
-        xn = self.norm1(x)
-        x = x + self.drop(self.attn(xn, xn, xn, valid_mask))
-        x = x + self.drop(self.ffn(self.norm2(x)))
-        return x
-
-
-class RetrievalNeighborEncoder(nn.Module):
-    """Encode each retrieved neighbor into a d-dim vector.
-
-    Uses available features: AA type, rank position, cosine similarity,
-    same-AA indicator, shift values, deviation from neighbor consensus,
-    and mask coverage fraction.
-    """
-
-    def __init__(self, n_residue_types, n_shifts, n_struct, d_model, k=32, dropout=0.1):
-        super().__init__()
-        self.aa_embed = nn.Embedding(n_residue_types + 1, 48, padding_idx=n_residue_types)
-        self.rank_embed = nn.Embedding(k, 24)
-        # input: aa_emb(48) + rank(24) + cos_sim(1) + same_aa(1) + shifts(S) + deviation(S) + mask_frac(1)
-        #        + nbr_struct(n_struct) + struct_diff(n_struct) + struct_l2(1)
-        input_dim = 48 + 24 + 1 + 1 + n_shifts + n_shifts + 1 + n_struct + n_struct + 1
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, d_model),
-            nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-        )
-
-    def forward(self, ret_codes, ret_distances, ret_shifts, ret_masks,
-                ret_valid, query_aa, nbr_mean, ret_nbr_struct, query_struct):
-        B, K, S = ret_shifts.shape
-        codes = ret_codes.clamp(0, self.aa_embed.num_embeddings - 2) * ret_valid.long()
-        aa_emb = self.aa_embed(codes)
-        ranks = torch.arange(K, device=ret_codes.device).unsqueeze(0).expand(B, -1)
-        rank_emb = self.rank_embed(ranks)
-        same_aa = (ret_codes == query_aa.unsqueeze(1)).float().unsqueeze(-1)
-        cos_sim = ret_distances.unsqueeze(-1)
-        mf = ret_masks.float()
-        masked_shifts = ret_shifts * mf
-        deviation = ((ret_shifts - nbr_mean.unsqueeze(1)) * mf).clamp(-10, 10)
-        mask_frac = mf.sum(dim=-1, keepdim=True) / max(S, 1)
-        query_struct_exp = query_struct.unsqueeze(1).expand(-1, K, -1)
-        struct_diff = (query_struct_exp - ret_nbr_struct).clamp(-10, 10)
-        struct_l2 = torch.norm(struct_diff, dim=-1, keepdim=True) / 10.0
-        features = torch.cat([
-            aa_emb, rank_emb, cos_sim, same_aa,
-            masked_shifts, deviation, mask_frac,
-            ret_nbr_struct, struct_diff, struct_l2,
-        ], dim=-1)
-        enc = self.net(features)
-        return enc * ret_valid.unsqueeze(-1).float()
-
-
-class ShiftSpecificCrossAttention(nn.Module):
-    """Per-shift query embeddings attend to neighbor encodings.
-
-    Each shift type has its own learned query, allowing different shifts
-    to attend to different neighbors (e.g., CA cares about different
-    neighbors than N).
-    """
-
-    def __init__(self, d_model, n_shifts, n_heads=4, dropout=0.1):
-        super().__init__()
-        self.n_shifts = n_shifts
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.scale = self.head_dim ** -0.5
-        self.shift_embed = nn.Embedding(n_shifts, d_model)
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d_model)
-        self.cos_scale = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, neighbor_enc, ret_valid, ret_distances):
-        B, K, D = neighbor_enc.shape
-        S, H, HD = self.n_shifts, self.n_heads, self.head_dim
-        shift_ids = torch.arange(S, device=neighbor_enc.device)
-        shift_emb = self.shift_embed(shift_ids)
-        Q = self.q_proj(shift_emb).unsqueeze(0).expand(B, -1, -1)
-        Kp = self.k_proj(neighbor_enc)
-        Vp = self.v_proj(neighbor_enc)
-        Q = Q.view(B, S, H, HD).transpose(1, 2)
-        Kp = Kp.view(B, K, H, HD).transpose(1, 2)
-        Vp = Vp.view(B, K, H, HD).transpose(1, 2)
-        attn = torch.matmul(Q, Kp.transpose(-2, -1)) * self.scale
-        attn = attn + ret_distances.unsqueeze(1).unsqueeze(2) * self.cos_scale
-        attn = attn.masked_fill(~ret_valid.unsqueeze(1).unsqueeze(2), -1e4)
-        attn = self.dropout(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, Vp)
-        out = out.transpose(1, 2).contiguous().view(B, S, D)
-        out = self.out_proj(out)
-        out = self.norm(out + shift_emb.unsqueeze(0))
-        return out * ret_valid.any(dim=1).float().unsqueeze(1).unsqueeze(2)
-
-
-class DirectTransferHead(nn.Module):
-    """Learned per-neighbor per-shift scoring for direct shift transfer."""
-
-    def __init__(self, d_model, n_shifts, dropout=0.1):
-        super().__init__()
-        self.scorer = nn.Sequential(
-            nn.Linear(d_model, d_model), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(d_model, n_shifts))
-        self.temperature = nn.Parameter(torch.ones(n_shifts) * 2.0)
-        self.shift_scale = nn.Parameter(torch.ones(n_shifts))
-        self.shift_bias = nn.Parameter(torch.zeros(n_shifts))
-
-    def forward(self, neighbor_enc, ret_shifts, ret_masks, ret_valid):
-        B, K, S = ret_shifts.shape
-        scores = self.scorer(neighbor_enc) * self.temperature
-        valid_3d = ret_valid.unsqueeze(-1) & ret_masks
-        scores = scores.masked_fill(~valid_3d, -1e4)
-        weights = F.softmax(scores, dim=1) * valid_3d.float()
-        transferred = (weights * ret_shifts).sum(dim=1)
-        transferred = transferred * self.shift_scale + self.shift_bias
-        return transferred * valid_3d.any(dim=1).float()
-
-
-
-
-
-
-# ============================================================================
-# Full Model with Retrieval
-# ============================================================================
 
 class ShiftPredictor(nn.Module):
-    """Chemical shift prediction with optional retrieval augmentation.
+    """Structure-only chemical shift prediction.
 
-    Architecture:
-      Base encoder: Distance attention + CNN + spatial cross-attention
-      Retrieval (optional): Neighbor encoder + self-attn + shift-specific
-                 cross-attn + direct transfer + learned gating
-      Prediction: struct_pred (blended with retrieval_pred when retrieval enabled)
+    Encoder: intra + cross-residue distance attention, CNN over the residue
+    window, spatial-neighbor cross-attention; struct_head MLP → n_shifts.
     """
 
     def __init__(
@@ -536,15 +350,6 @@ class ShiftPredictor(nn.Module):
         head_dropout: float = HEAD_DROPOUT,
         spatial_hidden: int = SPATIAL_ATTN_HIDDEN,
         k_spatial: int = 5,
-        # Retrieval params (ignored when use_retrieval=False)
-        use_retrieval: bool = True,
-        retrieval_hidden: int = RETRIEVAL_HIDDEN,
-        retrieval_heads: int = RETRIEVAL_HEADS,
-        retrieval_dropout: float = RETRIEVAL_DROPOUT,
-        n_self_attn: int = 2,
-        n_cross_attn: int = 3,
-        k_retrieved: int = 32,
-        n_struct: int = 49,
     ):
         super().__init__()
 
@@ -553,8 +358,6 @@ class ShiftPredictor(nn.Module):
 
         self.n_shifts = n_shifts
         self.n_residue_types = n_residue_types
-        self.use_retrieval = use_retrieval
-        self.retrieval_dropout_rate = retrieval_dropout if use_retrieval else 0.0
 
         # ========== Base encoder ==========
         self.distance_attention = DistanceAttentionPerPosition(
@@ -603,6 +406,7 @@ class ShiftPredictor(nn.Module):
 
         # Inter-residue bond geometry (CA-CA distances, peptide bond lengths)
         self.bond_proj = nn.Linear(N_BOND_GEOM, 16)
+        self.ablate = set()  # feature-ablation flags (set externally before compile)
         bond_dim = 16
 
         cnn_input_dim = dist_attn_hidden + 64 + 32 + 16 + 16 + dssp_dim + bond_dim
@@ -641,46 +445,10 @@ class ShiftPredictor(nn.Module):
             nn.Linear(512, 256), nn.GELU(), nn.Dropout(head_dropout * 0.5),
             nn.Linear(256, n_shifts))
 
-        # ========== Retrieval pathway (optional) ==========
-        if use_retrieval:
-            self.neighbor_encoder = RetrievalNeighborEncoder(
-                n_residue_types, n_shifts, n_struct, retrieval_hidden,
-                k=k_retrieved, dropout=retrieval_dropout)
-
-            self.self_attn_layers = nn.ModuleList([
-                SelfAttentionLayer(retrieval_hidden, retrieval_heads, retrieval_dropout)
-                for _ in range(n_self_attn)])
-
-            self.cross_attn_layers = nn.ModuleList([
-                ShiftSpecificCrossAttention(
-                    retrieval_hidden, n_shifts, retrieval_heads, retrieval_dropout)
-                for _ in range(n_cross_attn)])
-            self.cross_ffn_layers = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(retrieval_hidden, retrieval_hidden * 2), nn.GELU(),
-                    nn.Dropout(retrieval_dropout),
-                    nn.Linear(retrieval_hidden * 2, retrieval_hidden),
-                    nn.LayerNorm(retrieval_hidden))
-                for _ in range(n_cross_attn)])
-
-            self.direct_transfer = DirectTransferHead(
-                retrieval_hidden, n_shifts, retrieval_dropout)
-
-            self.retrieval_gate = nn.Sequential(
-                nn.Linear(retrieval_hidden + base_encoder_dim + 1, 192), nn.GELU(),
-                nn.Linear(192, 1), nn.Sigmoid())
-
         # Initialize output layers to zero
         with torch.no_grad():
             self.struct_head[-1].weight.zero_()
             self.struct_head[-1].bias.zero_()
-
-    def _compute_nbr_mean(self, retrieved_shifts, retrieved_shift_masks, retrieved_valid):
-        """Precompute neighbor consensus (masked mean of retrieved shifts)."""
-        valid_3d = retrieved_valid.unsqueeze(-1) & retrieved_shift_masks
-        valid_count = valid_3d.float().sum(dim=1).clamp(min=1)
-        nbr_mean = (retrieved_shifts * valid_3d.float()).sum(dim=1) / valid_count
-        return nbr_mean
 
     def forward(
         self,
@@ -699,28 +467,23 @@ class ShiftPredictor(nn.Module):
         cross_distances=None, cross_dist_mask=None,
         # Inter-residue bond geometry
         bond_geom=None,
-        # Retrieval inputs
-        query_residue_code=None,
-        retrieved_shifts=None, retrieved_shift_masks=None,
-        retrieved_residue_codes=None, retrieved_distances=None, retrieved_valid=None,
-        # Deprecated: accepted but ignored (for old dataset compatibility)
+        # Deprecated / legacy keys accepted but ignored (old dataset compatibility)
         physics_features=None,
-        # Structural feature vectors for retrieval
-        query_struct=None,
-        neighbor_struct=None,
-        # Extra fields for compatibility
         **kwargs,
     ):
         B = distances.size(0)
+        _abl = self.ablate  # feature-ablation flags (empty set = no ablation)
 
         # ========== Base encoder ==========
         dist_emb = self.distance_attention(atom1_idx, atom2_idx, distances, dist_mask)
+        if 'intra' in _abl:
+            dist_emb = dist_emb * 0.0
 
         # Cross-residue features at the center position (Phase 1).
         # When cross_* tensors are absent (old caches) or all-masked, the
         # CrossDistanceAttention falls back to its (zero-initialized) fallback
         # embedding so this is identity for legacy checkpoints/caches.
-        if cross_atom1_idx is not None and cross_distances is not None:
+        if cross_atom1_idx is not None and cross_distances is not None and 'cross' not in _abl:
             cross_a1 = cross_atom1_idx.unsqueeze(1)         # (B, 1, M_CR)
             cross_a2 = cross_atom2_idx.unsqueeze(1)
             cross_off = cross_offset_idx.unsqueeze(1)
@@ -746,14 +509,22 @@ class ShiftPredictor(nn.Module):
         ss_emb = self.ss_embed(ss_idx)
         mismatch_emb = self.mismatch_embed(mismatch_idx)
         valid_emb = self.valid_embed(is_valid.unsqueeze(-1))
+        if 'residue_type' in _abl:
+            res_emb = res_emb * 0.0
+        if 'ss' in _abl:
+            ss_emb = ss_emb * 0.0
 
         # Bond geometry projection
         if bond_geom is None:
             bond_geom = torch.zeros(B, distances.size(1), N_BOND_GEOM, device=distances.device)
         bond_emb = self.bond_proj(bond_geom)
+        if 'bond_geom' in _abl:
+            bond_emb = bond_emb * 0.0
 
         if self.dssp_proj is not None:
             dssp_emb = self.dssp_proj(dssp_features)
+            if 'dssp' in _abl:
+                dssp_emb = dssp_emb * 0.0
             window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, dssp_emb, bond_emb], dim=-1)
         else:
             window_feat = torch.cat([dist_emb, res_emb, ss_emb, mismatch_emb, valid_emb, bond_emb], dim=-1)
@@ -817,75 +588,14 @@ class ShiftPredictor(nn.Module):
             query_encoding=x_center,
             neighbor_dist_embeddings=neighbor_dist_embeddings,
         )
+        if 'spatial' in _abl:
+            x_spatial = x_spatial * 0.0
 
         base_encoding = torch.cat([x_center, x_spatial], dim=-1)
 
         # ========== Structure-only prediction ==========
         struct_pred = self.struct_head(base_encoding)  # (B, n_shifts)
-
-        if not self.use_retrieval:
-            return struct_pred
-
-        # ========== Retrieval pathway ==========
-        # Only use neighbors of the same amino acid type as the query
-        same_aa_mask = (retrieved_residue_codes == query_residue_code.unsqueeze(1))
-        retrieved_valid = retrieved_valid & same_aa_mask
-
-        # Apply retrieval dropout (drop ALL retrieval for some training samples)
-        if self.training and self.retrieval_dropout_rate > 0:
-            drop_mask = torch.rand(B, device=base_encoding.device) < self.retrieval_dropout_rate
-            retrieved_valid = retrieved_valid.clone()
-            retrieved_valid[drop_mask] = False
-
-        # Neighbor consensus
-        nbr_mean = self._compute_nbr_mean(
-            retrieved_shifts, retrieved_shift_masks, retrieved_valid)
-
-        # Encode neighbors (with structural context)
-        K = retrieved_shifts.size(1)
-        if query_struct is None:
-            query_struct = torch.zeros(B, self.neighbor_encoder.net[0].in_features,
-                                       device=base_encoding.device)
-        if neighbor_struct is None:
-            neighbor_struct = torch.zeros(B, K, query_struct.size(-1),
-                                          device=base_encoding.device)
-        nbr_enc = self.neighbor_encoder(
-            retrieved_residue_codes, retrieved_distances,
-            retrieved_shifts, retrieved_shift_masks,
-            retrieved_valid, query_residue_code, nbr_mean,
-            neighbor_struct, query_struct)
-
-        # Self-attention over neighbors
-        for sa_layer in self.self_attn_layers:
-            nbr_enc = sa_layer(nbr_enc, retrieved_valid)
-
-        # Shift-specific cross-attention (accumulate across layers)
-        shift_ctx = None
-        for cross_layer, ffn_layer in zip(self.cross_attn_layers, self.cross_ffn_layers):
-            c = cross_layer(nbr_enc, retrieved_valid, retrieved_distances)
-            c = ffn_layer(c) + c
-            shift_ctx = c if shift_ctx is None else shift_ctx + c
-        # shift_ctx: (B, n_shifts, retrieval_hidden)
-
-        # Direct transfer prediction
-        retrieval_pred = self.direct_transfer(
-            nbr_enc, retrieved_shifts, retrieved_shift_masks, retrieved_valid)
-
-        # ========== Retrieval gate ==========
-        valid_3d = retrieved_valid.unsqueeze(-1) & retrieved_shift_masks
-        n_valid_norm = (valid_3d.float().sum(dim=1) / max(K, 1)).unsqueeze(-1)  # (B, n_shifts, 1)
-
-        S = self.n_shifts
-        ctx_exp = base_encoding.unsqueeze(1).expand(-1, S, -1)
-        rg = self.retrieval_gate(
-            torch.cat([shift_ctx, ctx_exp, n_valid_norm], dim=-1)).squeeze(-1)  # (B, n_shifts)
-        retrieval_pred = retrieval_pred * retrieved_valid.any(dim=1, keepdim=True).float()
-        predictions = rg * retrieval_pred + (1 - rg) * struct_pred
-
-        predictions = torch.where(
-            torch.isnan(predictions), torch.zeros_like(predictions), predictions)
-
-        return predictions
+        return struct_pred
 
 
 # ============================================================================
@@ -898,6 +608,12 @@ def create_model(
     **kwargs,
 ) -> ShiftPredictor:
     """Create model with sensible defaults from config."""
+    # Retrieval pathway removed; silently drop any legacy retrieval kwargs so
+    # old callers/checkpoint-metadata don't break.
+    for _k in ("use_retrieval", "retrieval_hidden", "retrieval_heads",
+               "retrieval_dropout", "n_self_attn", "n_cross_attn",
+               "k_retrieved", "n_struct"):
+        kwargs.pop(_k, None)
     return ShiftPredictor(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,

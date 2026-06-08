@@ -91,7 +91,6 @@ def main():
     model = create_model(
         n_atom_types=ds.n_atom_types,
         n_shifts=n_shifts,
-        use_retrieval=False,
         n_dssp=ds.n_dssp,
     )
     model.eval()

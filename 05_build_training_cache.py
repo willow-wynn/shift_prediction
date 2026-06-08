@@ -1,38 +1,24 @@
 #!/usr/bin/env python
 """
-05 - Training Cache Builder (Better Data Pipeline)
+05 - Training Cache Builder (structure-only)
 
-Pre-computes retrieval results and saves a memory-mapped cache so that
-training reads from disk (via numpy memmap) rather than hitting FAISS and
-HDF5 at every epoch.
-
-Adapted from the CachedRetrievalDataset.create() classmethod in
-homologies/dataset_cached.py (and homologies_better_data/dataset.py) with:
-- Constants imported from config.py
-- Full provenance logging: proteins cached, retrieval stats, failures
-- Checkpoint/resume for crash safety
-- Standalone argparse CLI
+Builds a memory-mapped cache so that training reads compact numpy arrays from
+disk rather than reparsing CSVs/PDBs every epoch.
 
 For each fold, this script:
 1. Loads the compiled CSV (filtering to proteins in that fold)
-2. Loads the FAISS index for that fold
-3. Builds compact structural arrays (residue types, distances, DSSP, etc.)
-4. Performs batch retrieval via FAISS (with same-protein exclusion)
-5. Saves everything as memory-mapped numpy arrays
+2. Builds compact structural arrays (residue types, distances, DSSP, spatial
+   neighbours, bond geometry, and cross-residue distance arrays via 04c)
+3. Saves everything as memory-mapped numpy arrays
 
 Cache layout (per fold):
     <output_dir>/fold_{k}/
         config.json
         samples.npy
-        structural/  (residue_idx.npy, ss_idx.npy, ...)
-        retrieval/   (shifts.npy, shift_masks.npy, residue_codes.npy, ...)
+        structural/  (residue_idx.npy, ss_idx.npy, dssp.npy, cross_*.npy, ...)
 
 Usage:
-    python 05_build_training_cache.py \\
-        --data_dir ./data \\
-        --embeddings ./data/esm_embeddings.h5 \\
-        --index_dir ./data/retrieval_indices \\
-        --output_dir ./data/cache
+    python 05_build_training_cache.py --data_dir ./data --output_dir ./data/cache
 """
 
 import argparse
@@ -57,8 +43,6 @@ from config import (
     SS_TYPES, SS_TO_IDX, N_SS_TYPES,
     MISMATCH_TYPES, MISMATCH_TO_IDX, N_MISMATCH_TYPES,
     DSSP_COLS,
-    K_RETRIEVED,
-    FAISS_NPROBE,
     CONTEXT_WINDOW,
     K_SPATIAL_NEIGHBORS,
     MAX_VALID_DISTANCES,
@@ -71,6 +55,25 @@ from dataset import (
     parse_shift_columns,
     get_dssp_columns,
 )
+
+# ----- Cross-residue distance features (Phase 1, Option A) -----
+# Build cross arrays inline so a fresh 01->05 yields a COMPLETE cache (intra +
+# cross + bond + dssp) with no out-of-band 04c patch. We reuse the EXACT
+# PDB-resolution + NMR-model-selection helpers that 04c_compute_cross_arrays.py
+# uses, so an integrated build produces byte-identical cross arrays to the
+# (validated) 04c patch. Loaded via importlib because the module name starts
+# with a digit. See claude/cross_features_full_rebuild_plan.md.
+from config import (
+    ATOM_TO_IDX, MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES,
+    CROSS_DIST_CUTOFF, CROSS_H_CUTOFF,
+)
+from distance_features import build_cross_arrays_for_residue
+import importlib.util as _ilu
+_cx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        '04c_compute_cross_arrays.py')
+_cx_spec = _ilu.spec_from_file_location('cross04c', _cx_path)
+cross04c = _ilu.module_from_spec(_cx_spec)
+_cx_spec.loader.exec_module(cross04c)
 
 
 def extract_struct_features(pdf, start_idx, n, flat_struct):
@@ -183,15 +186,14 @@ def build_cache_for_fold(
     dssp_cols: list,
     atom_to_idx: dict,
     stats: dict,
-    embedding_lookup,
-    retriever,
     cache_dir: str,
     context_window: int = CONTEXT_WINDOW,
     k_spatial: int = K_SPATIAL_NEIGHBORS,
-    k_retrieved: int = K_RETRIEVED,
     max_valid_distances: int = MAX_VALID_DISTANCES,
-    retrieval_batch_size: int = 5000,
     struct_lookup: dict = None,
+    build_cross: bool = False,
+    build_log: dict = None,
+    pdb_search_dirs: list = None,
 ):
     """Build a complete training cache for one fold.
 
@@ -199,19 +201,10 @@ def build_cache_for_fold(
     standalone function with full provenance logging and checkpoint/resume.
     """
     cache_path = Path(cache_dir)
-
-    # Check for resume
-    checkpoint_file = cache_path / 'retrieval' / '_checkpoint.txt'
-    is_resuming = checkpoint_file.exists()
-
-    if is_resuming:
-        print(f"    *** FOUND CHECKPOINT - RESUMING BUILD ***")
-    else:
-        if cache_path.exists():
-            shutil.rmtree(cache_path)
-        cache_path.mkdir(parents=True)
-        (cache_path / 'structural').mkdir()
-        (cache_path / 'retrieval').mkdir()
+    if cache_path.exists():
+        shutil.rmtree(cache_path)
+    cache_path.mkdir(parents=True)
+    (cache_path / 'structural').mkdir()
 
     n_shifts = len(shift_cols)
     n_atom_types = len(atom_to_idx)
@@ -223,7 +216,6 @@ def build_cache_for_fold(
     n_proteins = len(proteins)
 
     M = max_valid_distances
-    K = k_retrieved
 
     # Pre-compute atom indices
     col_to_atoms = []
@@ -241,7 +233,6 @@ def build_cache_for_fold(
     print(f"      DSSP columns: {n_dssp}")
     print(f"      Context window: {window_size}")
     print(f"      K spatial: {k_spatial}")
-    print(f"      K retrieved: {K}")
     print(f"      Max valid distances: {M}")
 
     # ========== Allocate structural arrays ==========
@@ -264,9 +255,6 @@ def build_cache_for_fold(
     flat_spatial_seq_sep = np.zeros((total_residues, k_spatial), dtype=np.int16)
 
     flat_window_idx = np.full((total_residues, window_size), -1, dtype=np.int32)
-
-    # Compact structural feature vector (for retrieval neighbor encoder)
-    flat_query_struct = np.zeros((total_residues, N_STRUCT_FEATURES), dtype=np.float32)
 
     # Inter-residue bond geometry (4 features per residue)
     flat_bond_geom = np.zeros((total_residues, N_BOND_GEOM), dtype=np.float32)
@@ -292,6 +280,16 @@ def build_cache_for_fold(
     idx_to_bmrb = {}
     global_to_resid = {}
 
+    # Finding #7: track proteins with duplicate residue_ids. The span-sized
+    # res_id_lookup is keyed by (residue_id - min_res); a duplicate residue_id
+    # would otherwise collapse last-write-wins, so window / spatial-neighbor
+    # resolution in dataset.py would silently point at only one copy (the wrong
+    # neighbor AA/SS/distances), while BOTH duplicate rows still train. We make
+    # the lookup deterministic FIRST-write-wins (rows are sorted by residue_id)
+    # and warn with the affected bmrb list so consumers (dataset.py) and 05
+    # agree on which copy a residue_id resolves to.
+    dup_resid_bmrbs = []
+
     # ========== Process structural features ==========
     for prot_idx, (protein_id, pdf) in enumerate(
         tqdm(proteins, desc="      Processing structure")
@@ -309,9 +307,19 @@ def build_cache_for_fold(
         protein_min_res.append(min_res)
         protein_max_res.append(max_res)
 
+        # Detect duplicate residue_ids within this protein (Finding #7).
+        _uniq, _counts = np.unique(residue_ids, return_counts=True)
+        if (_counts > 1).any():
+            dup_resid_bmrbs.append(str(protein_id))
+
         for local_idx, rid in enumerate(residue_ids):
             global_idx = start_idx + local_idx
-            flat_res_id_lookup[current_lookup_offset + (rid - min_res)] = global_idx
+            _slot = current_lookup_offset + (rid - min_res)
+            # FIRST-write-wins: only fill an empty slot so duplicate residue_ids
+            # deterministically resolve to their FIRST (lowest-row) copy in both
+            # 05 and dataset.py. (-1 == unfilled; the array is init'd to -1.)
+            if flat_res_id_lookup[_slot] < 0:
+                flat_res_id_lookup[_slot] = global_idx
             idx_to_bmrb[str(global_idx)] = str(protein_id)
             global_to_resid[str(global_idx)] = int(rid)
 
@@ -380,9 +388,16 @@ def build_cache_for_fold(
             if col in pdf.columns:
                 vals = pdf[col].values
                 valid = ~np.isnan(vals)
-                flat_shift_mask[start_idx:start_idx + n, si] = valid
 
+                # Finding #13: only mark observations as supervised targets if we
+                # also have normalization stats for this nucleus. If `shift_cols`
+                # and `stats` disagree on a column (e.g. a frozen stats table
+                # missing a nucleus), writing mask=True while leaving flat_shifts
+                # at 0.0 would feed real observations to the loss as the (z=0)
+                # mean. Gate the mask on `col in stats` so unstatted observations
+                # are simply unsupervised rather than silently corrupted.
                 if col in stats:
+                    flat_shift_mask[start_idx:start_idx + n, si] = valid
                     mean, std = stats[col]['mean'], stats[col]['std']
                     if std > 1e-6:
                         normalized = np.where(valid, (vals - mean) / std, 0.0)
@@ -390,6 +405,7 @@ def build_cache_for_fold(
                         normalized = np.where(valid, vals - mean, 0.0)
                     normalized = np.clip(normalized, -10, 10)
                     flat_shifts[start_idx:start_idx + n, si] = normalized
+                # else: leave mask False (default) — no stats, so unsupervised.
 
         # Angles
         for i, angle_col in enumerate(['phi', 'psi']):
@@ -432,9 +448,6 @@ def build_cache_for_fold(
                     if neighbor_global >= 0:
                         flat_window_idx[global_idx, w] = neighbor_global
 
-        # Compact structural feature vector
-        extract_struct_features(pdf, start_idx, n, flat_query_struct)
-
         # Inter-residue bond geometry
         for bi, col in enumerate(BOND_GEOM_COLS):
             if col in pdf.columns:
@@ -451,6 +464,165 @@ def build_cache_for_fold(
 
         current_offset += n
         current_lookup_offset += span
+
+    # Finding #7: warn about proteins with duplicate residue_ids. Their
+    # res_id_lookup entries deterministically resolve to the first copy (above);
+    # the remaining copies are still trained but cannot be reached as a window /
+    # spatial neighbor. Surface them so they can be cleaned upstream (in 01).
+    if dup_resid_bmrbs:
+        print(f"      WARNING: {len(dup_resid_bmrbs)} protein(s) have duplicate "
+              f"residue_ids; res_id_lookup resolves to the FIRST copy only "
+              f"(both rows still train). Affected bmrbs: "
+              f"{dup_resid_bmrbs[:20]}"
+              f"{' ...' if len(dup_resid_bmrbs) > 20 else ''}")
+
+    # ========== Cross-residue distances (Option A: PDB-aligned to intra) ==========
+    # Second pass over the same proteins. For each residue we re-parse the
+    # SAME PDB + chain + best-NMR-model that 01 recorded in build_log (so the
+    # coordinates are identical to the intra/spatial/bond features above) and
+    # compute the cross-pair arrays. flat_spatial_ids holds neighbour residue
+    # IDs and is still alive here (freed only after the save block).
+    flat_cross_atom1 = flat_cross_atom2 = flat_cross_offset = None
+    flat_cross_values = flat_cross_count = None
+    bmrb_pdb_used = {}
+    if build_cross and build_log:
+        print("      Computing cross-residue distance arrays (PDB-aligned)...")
+        pad_atom = len(ATOM_TO_IDX)
+        M_CR = MAX_CROSS_DISTANCES
+        flat_cross_atom1 = np.full((total_residues, M_CR), pad_atom, dtype=np.int16)
+        flat_cross_atom2 = np.full((total_residues, M_CR), pad_atom, dtype=np.int16)
+        flat_cross_offset = np.full((total_residues, M_CR), N_CROSS_OFFSET_TYPES, dtype=np.int8)
+        flat_cross_values = np.zeros((total_residues, M_CR), dtype=np.float16)
+        flat_cross_count = np.zeros(total_residues, dtype=np.int16)
+        # bond_geom column indices (recomputed from the same parsed coords)
+        _BG_CA_PREV = BOND_GEOM_COLS.index('bond_ca_prev')
+        _BG_CA_NEXT = BOND_GEOM_COLS.index('bond_ca_next')
+        _BG_PEP_FWD = BOND_GEOM_COLS.index('bond_peptide_fwd')
+        _BG_PEP_BKWD = BOND_GEOM_COLS.index('bond_peptide_bkwd')
+        psd = pdb_search_dirs or ['data/pdbs',
+                                  '/home/brooks/1TB/Wynn/data_archive/alphafold']
+        n_ok = n_miss = n_filled = 0
+        cross_fails = []
+        for prot_idx, (protein_id, pdf) in enumerate(
+                tqdm(proteins, desc="      Cross")):
+            bmrb = str(protein_id)
+            entry = build_log.get(bmrb)
+            if entry is None:
+                n_miss += 1; cross_fails.append(f'{bmrb} not-in-build-log'); continue
+            pdb_path, chain_id = entry
+            if not os.path.isfile(pdb_path):
+                # build_log path is from the build machine; relocate by basename.
+                base = os.path.basename(pdb_path); alt = None
+                for d in psd:
+                    cand = os.path.join(d, base)
+                    if os.path.isfile(cand):
+                        alt = cand; break
+                if alt is None:
+                    alt = cross04c.resolve_pdb_path(os.path.splitext(base)[0], psd)
+                if alt is None:
+                    n_miss += 1; cross_fails.append(f'{bmrb} pdb-not-found'); continue
+                pdb_path = alt
+            try:
+                model = cross04c.select_best_nmr_model(pdb_path, chain_id)
+                aa_data = cross04c.model_to_aa(model) if model is not None else {}
+            except Exception as e:
+                n_miss += 1; cross_fails.append(f'{bmrb} parse-error: {e}'); continue
+            if not aa_data:
+                n_miss += 1; cross_fails.append(f'{bmrb} no-aa-residues'); continue
+            n_ok += 1
+            bmrb_pdb_used[bmrb] = pdb_path
+            res_ids_in_order = sorted(aa_data.keys())
+            start = protein_offsets[prot_idx]
+            for local in range(len(pdf)):
+                g = start + local
+                rid = global_to_resid.get(str(g))
+                if rid is None or int(rid) not in aa_data:
+                    continue
+                sp_ids = flat_spatial_ids[g].tolist()
+                a1, a2, off, vals, ncr = build_cross_arrays_for_residue(
+                    center_rid=int(rid), aa_data=aa_data,
+                    res_ids_in_order=res_ids_in_order,
+                    spatial_neighbor_ids=sp_ids,
+                    atom_to_idx=ATOM_TO_IDX,
+                    context_window=context_window,
+                    max_cross_distances=MAX_CROSS_DISTANCES,
+                    n_cross_offset_types=N_CROSS_OFFSET_TYPES,
+                    heavy_cutoff=CROSS_DIST_CUTOFF,
+                    h_cutoff=CROSS_H_CUTOFF,
+                )
+                flat_cross_atom1[g] = a1; flat_cross_atom2[g] = a2
+                flat_cross_offset[g] = off; flat_cross_values[g] = vals
+                flat_cross_count[g] = ncr
+                n_filled += 1
+
+                # bond_geom from the SAME parsed coords (01's formula exactly).
+                # Finding #8: walk adjacency by TRUE SEQUENCE NEIGHBOR
+                # (residue_id +/- 1), NOT by consecutive cache rows. Cache-row
+                # adjacency bridges internal sequence gaps: at residues ...3,10,11
+                # row-adjacency made residue 3's bond_ca_next the ~15 A distance
+                # to residue 10 (stored as a ~1.5 bond), or silently 0 if the
+                # neighbor row was a CS-only residue absent from aa_data. By
+                # indexing aa_data directly at rid-1 / rid+1, a genuine sequence
+                # neighbor present in the structure is used, and an absent one
+                # leaves the bond at the missing convention (0.0, matching the
+                # CSV path's np.where(valid, .., 0.0) and the zero-init array).
+                # The id90 CSVs predate bond_geom, so this is the authoritative
+                # source and is aligned with cross/intra by construction.
+                # Overwrites the CSV value.
+                ri = int(rid)
+                atoms_i = aa_data[ri]['atoms']
+                ca_i = atoms_i.get('CA'); n_i = atoms_i.get('N'); c_i = atoms_i.get('C')
+                if ca_i is not None and np.all(np.isfinite(ca_i)):
+                    # Previous residue in sequence (rid - 1), if it has structure.
+                    prev_entry = aa_data.get(ri - 1)
+                    if prev_entry is not None:
+                        ap = prev_entry['atoms']
+                        cap, cprev = ap.get('CA'), ap.get('C')
+                        if cap is not None and np.all(np.isfinite(cap)):
+                            flat_bond_geom[g, _BG_CA_PREV] = np.linalg.norm(ca_i - cap) / 10.0
+                        if (n_i is not None and cprev is not None
+                                and np.all(np.isfinite(n_i)) and np.all(np.isfinite(cprev))):
+                            flat_bond_geom[g, _BG_PEP_BKWD] = np.linalg.norm(n_i - cprev) / 10.0
+                    # Next residue in sequence (rid + 1), if it has structure.
+                    next_entry = aa_data.get(ri + 1)
+                    if next_entry is not None:
+                        an = next_entry['atoms']
+                        can, nnext = an.get('CA'), an.get('N')
+                        if can is not None and np.all(np.isfinite(can)):
+                            flat_bond_geom[g, _BG_CA_NEXT] = np.linalg.norm(ca_i - can) / 10.0
+                        if (c_i is not None and nnext is not None
+                                and np.all(np.isfinite(c_i)) and np.all(np.isfinite(nnext))):
+                            flat_bond_geom[g, _BG_PEP_FWD] = np.linalg.norm(nnext - c_i) / 10.0
+        nzc = float((flat_cross_count > 0).mean())
+        print(f"      cross: proteins ok={n_ok} miss={n_miss}  "
+              f"residues filled={n_filled:,}/{total_residues:,}  nonzero={nzc:.3f}")
+        if cross_fails[:5]:
+            print(f"      sample cross fails: {cross_fails[:5]}")
+    elif build_cross:
+        print("      Cross requested but no build_log provided — skipping cross arrays.")
+
+    # ========== Loss-mask: drop gap_in_structure / mismatch residues ==========
+    # Exclude two residue classes from the supervised loss by clearing their
+    # shift mask AFTER both flat_mismatch_idx and flat_shift_mask are fully
+    # populated:
+    #   - gap_in_structure: structure-less insertions. These residues have NO
+    #     intramolecular distances of their own (dist_count == 0) yet still
+    #     carry shift targets — training their (empty) structure against real
+    #     shifts is meaningless.
+    #   - mismatch: structure != shift residue. The structure of one residue is
+    #     paired with another residue's shift values, so the supervision is
+    #     simply wrong.
+    # Use named MISMATCH_TO_IDX entries (not hardcoded ints) so this stays
+    # correct if MISMATCH_TYPES ordering changes in config.py.
+    _bad_mismatch = np.isin(
+        flat_mismatch_idx,
+        [MISMATCH_TO_IDX['gap_in_structure'], MISMATCH_TO_IDX['mismatch']],
+    )
+    _n_bad_res = int(_bad_mismatch.sum())
+    _n_bad_targets = int(flat_shift_mask[_bad_mismatch].sum())
+    flat_shift_mask[_bad_mismatch, :] = False
+    print(f"      Loss-mask: excluded {_n_bad_res:,} gap_in_structure/mismatch "
+          f"residues ({_n_bad_targets:,} shift targets) from the loss")
 
     # ========== Save structural data ==========
     print("      Saving structural data...")
@@ -477,8 +649,17 @@ def build_cache_for_fold(
     np.save(sd / 'protein_min_res.npy', np.array(protein_min_res, dtype=np.int32))
     np.save(sd / 'protein_max_res.npy', np.array(protein_max_res, dtype=np.int32))
 
-    np.save(sd / 'query_struct.npy', flat_query_struct)
     np.save(sd / 'bond_geom.npy', flat_bond_geom)
+
+    if build_cross and flat_cross_count is not None:
+        np.save(sd / 'cross_atom1.npy', flat_cross_atom1)
+        np.save(sd / 'cross_atom2.npy', flat_cross_atom2)
+        np.save(sd / 'cross_offset.npy', flat_cross_offset)
+        np.save(sd / 'cross_values.npy', flat_cross_values)
+        np.save(sd / 'cross_count.npy', flat_cross_count)
+        # Provenance: which PDB each BMRB's cross (and intra) coords came from.
+        with open(sd / 'bmrb_pdb_used.json', 'w') as f:
+            json.dump(bmrb_pdb_used, f)
 
     with open(sd / 'bmrb_mapping.json', 'w') as f:
         json.dump(idx_to_bmrb, f)
@@ -499,195 +680,6 @@ def build_cache_for_fold(
     del flat_dssp, flat_shifts, flat_shift_mask, flat_angles
     del flat_spatial_ids, flat_spatial_dist, flat_spatial_seq_sep
     del flat_window_idx, flat_res_id_lookup
-    # Keep flat_query_struct — needed for neighbor struct lookup during retrieval
-    gc.collect()
-
-    # ========== Build retrieval data (with checkpoint/resume) ==========
-    no_retrieval = (embedding_lookup is None or retriever is None)
-
-    rd = cache_path / 'retrieval'
-    checkpoint_file = rd / '_checkpoint.txt'
-
-    # Retrieval stats accumulators (always defined)
-    total_queries = 0
-    total_valid_queries = 0
-    total_valid_retrieved = 0
-    sim_sum = 0.0
-    retrieval_failures = 0
-
-    if no_retrieval:
-        # Skip allocating the multi-GB retrieval arrays entirely.
-        # The dataset will detect missing files and synthesize zeros in __getitem__.
-        print("      No-retrieval mode: skipping retrieval array allocation.")
-        # Make sure stale files from prior builds are removed so the dataset
-        # correctly detects "no retrieval".
-        for fname in ('shifts.npy', 'shift_masks.npy', 'residue_codes.npy',
-                      'distances.npy', 'valid.npy', 'neighbor_struct.npy',
-                      '_checkpoint.txt'):
-            fp = rd / fname
-            if fp.exists():
-                fp.unlink()
-    else:
-        print("      Building retrieval data (in batches)...")
-
-        resume_from = 0
-        if checkpoint_file.exists():
-            try:
-                resume_from = int(checkpoint_file.read_text().strip())
-                print(f"      RESUMING from batch starting at index {resume_from}")
-            except Exception:
-                resume_from = 0
-
-        mmap_mode = 'r+' if resume_from > 0 else 'w+'
-
-        retrieved_shifts = np.lib.format.open_memmap(
-            rd / 'shifts.npy', mode=mmap_mode, dtype=np.float16,
-            shape=(total_residues, K, n_shifts),
-        )
-        retrieved_shift_masks = np.lib.format.open_memmap(
-            rd / 'shift_masks.npy', mode=mmap_mode, dtype=bool,
-            shape=(total_residues, K, n_shifts),
-        )
-        retrieved_residue_codes = np.lib.format.open_memmap(
-            rd / 'residue_codes.npy', mode=mmap_mode, dtype=np.int16,
-            shape=(total_residues, K),
-        )
-        retrieved_distances = np.lib.format.open_memmap(
-            rd / 'distances.npy', mode=mmap_mode, dtype=np.float16,
-            shape=(total_residues, K),
-        )
-        retrieved_valid = np.lib.format.open_memmap(
-            rd / 'valid.npy', mode=mmap_mode, dtype=bool,
-            shape=(total_residues, K),
-        )
-        neighbor_struct = np.lib.format.open_memmap(
-            rd / 'neighbor_struct.npy', mode=mmap_mode, dtype=np.float16,
-            shape=(total_residues, K, N_STRUCT_FEATURES),
-        )
-        total_batches = (total_residues + retrieval_batch_size - 1) // retrieval_batch_size
-        start_batch = resume_from // retrieval_batch_size
-
-        # Precompute struct features aligned to FAISS index positions so the
-        # per-neighbor lookup can be pure fancy indexing (replaces an
-        # (n_valid × K) Python loop that was 1–2s/batch).
-        struct_by_faiss_idx = None
-        if struct_lookup is not None and retriever is not None:
-            n_meta = len(retriever.meta_bmrb_ids)
-            struct_by_faiss_idx = np.zeros((n_meta, N_STRUCT_FEATURES), dtype=np.float32)
-            meta_bmrb = retriever.meta_bmrb_ids
-            meta_resid = retriever.meta_residue_ids
-            for i in range(n_meta):
-                feat = struct_lookup.get((str(meta_bmrb[i]), int(meta_resid[i])))
-                if feat is not None:
-                    struct_by_faiss_idx[i] = feat
-
-        for batch_start in tqdm(
-            range(resume_from, total_residues, retrieval_batch_size),
-            desc="      Retrieval batches",
-            initial=start_batch,
-            total=total_batches,
-        ):
-            batch_end = min(batch_start + retrieval_batch_size, total_residues)
-            batch_indices = list(range(batch_start, batch_end))
-
-            batch_bmrb_ids = []
-            batch_res_ids = []
-
-            for global_idx in batch_indices:
-                bmrb_id = idx_to_bmrb[str(global_idx)]
-                rid = global_to_resid[str(global_idx)]
-                batch_bmrb_ids.append(bmrb_id)
-                batch_res_ids.append(rid)
-
-            total_queries += len(batch_indices)
-
-            try:
-                batch_embeddings, batch_valid_mask = embedding_lookup.get_batch(
-                    batch_bmrb_ids, batch_res_ids,
-                )
-            except Exception as e:
-                retrieval_failures += len(batch_indices)
-                print(f"      WARNING: Embedding lookup failed for batch "
-                      f"{batch_start}-{batch_end}: {e}")
-                checkpoint_file.write_text(str(batch_end))
-                continue
-
-            valid_indices = np.where(batch_valid_mask)[0]
-            total_valid_queries += len(valid_indices)
-
-            if len(valid_indices) > 0:
-                valid_embeddings = batch_embeddings[valid_indices]
-                valid_bmrb_ids = [batch_bmrb_ids[i] for i in valid_indices]
-
-                try:
-                    results = retriever.retrieve(
-                        query_embeddings=valid_embeddings,
-                        query_bmrb_ids=valid_bmrb_ids,
-                        k=K,
-                    )
-                except Exception as e:
-                    retrieval_failures += len(valid_indices)
-                    print(f"      WARNING: Retrieval failed for batch "
-                          f"{batch_start}-{batch_end}: {e}")
-                    checkpoint_file.write_text(str(batch_end))
-                    continue
-
-                # Store retrieval results
-                global_indices_arr = batch_start + valid_indices
-                retrieved_shifts[global_indices_arr] = results['shifts']
-                retrieved_shift_masks[global_indices_arr] = results['shift_masks']
-                retrieved_residue_codes[global_indices_arr] = results['residue_codes']
-                retrieved_distances[global_indices_arr] = results['distances']
-                retrieved_valid[global_indices_arr] = results['indices'] >= 0
-
-                # Look up structural features for retrieved neighbors via
-                # fancy indexing (was: 160k python dict.get() calls per batch).
-                if struct_by_faiss_idx is not None:
-                    result_idx = results['indices']  # (n_valid, K), -1 for invalid
-                    safe = np.where(result_idx >= 0, result_idx, 0)
-                    nbr_struct_batch = struct_by_faiss_idx[safe]
-                    nbr_struct_batch[result_idx < 0] = 0
-                    neighbor_struct[global_indices_arr] = nbr_struct_batch
-
-                # Accumulate retrieval stats
-                valid_mask = results['indices'] >= 0
-                total_valid_retrieved += valid_mask.sum()
-                if valid_mask.any():
-                    sim_sum += results['distances'][valid_mask].sum()
-
-            # Flush and checkpoint every batch
-            retrieved_shifts.flush()
-            retrieved_shift_masks.flush()
-            retrieved_residue_codes.flush()
-            retrieved_distances.flush()
-            retrieved_valid.flush()
-            neighbor_struct.flush()
-
-            checkpoint_file.write_text(str(batch_end))
-
-            if (batch_end % (retrieval_batch_size * 10)) == 0:
-                gc.collect()
-
-        # Final flush
-        retrieved_shifts.flush()
-        retrieved_shift_masks.flush()
-        retrieved_residue_codes.flush()
-        retrieved_distances.flush()
-        retrieved_valid.flush()
-        neighbor_struct.flush()
-
-        if checkpoint_file.exists():
-            checkpoint_file.unlink()
-            print("      Retrieval data complete - checkpoint removed")
-
-    # Retrieval stats
-    avg_sim = sim_sum / max(total_valid_retrieved, 1)
-    avg_coverage = total_valid_retrieved / max(total_valid_queries * K, 1)
-
-    if not no_retrieval:
-        del retrieved_shifts, retrieved_shift_masks, retrieved_residue_codes
-        del retrieved_distances, retrieved_valid, neighbor_struct
-    del flat_query_struct
     gc.collect()
 
     # ========== Save config ==========
@@ -711,8 +703,12 @@ def build_cache_for_fold(
         'n_shifts': n_shifts,
         'window_size': window_size,
         'k_spatial': k_spatial,
-        'k_retrieved': k_retrieved,
         'max_valid_distances': max_valid_distances,
+        'has_cross_features': bool(build_cross and flat_cross_count is not None),
+        'max_cross_distances': MAX_CROSS_DISTANCES if (build_cross and flat_cross_count is not None) else 0,
+        'n_cross_offset_types': N_CROSS_OFFSET_TYPES,
+        'cross_dist_cutoff': CROSS_DIST_CUTOFF,
+        'cross_h_cutoff': CROSS_H_CUTOFF,
         'total_residues': total_residues,
         'n_proteins': n_proteins,
         'n_samples': n_samples,
@@ -730,11 +726,6 @@ def build_cache_for_fold(
         'total_residues': total_residues,
         'n_samples': n_samples,
         'residues_no_shifts': residues_no_shifts,
-        'total_queries': total_queries,
-        'valid_queries': total_valid_queries,
-        'retrieval_failures': retrieval_failures,
-        'avg_cosine_similarity': float(avg_sim),
-        'retrieval_coverage': float(avg_coverage),
     }
 
     return provenance
@@ -746,43 +737,23 @@ def build_cache_for_fold(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Build memory-mapped training caches with pre-computed retrieval.',
+        description='Build memory-mapped structure-only training caches.',
     )
     parser.add_argument(
         '--data_dir', default='./data',
         help='Directory containing the compiled CSV (default: ./data)',
     )
     parser.add_argument(
-        '--embeddings', default=None,
-        help='Path to ESM embeddings HDF5 (default: <data_dir>/esm_embeddings.h5)',
-    )
-    parser.add_argument(
-        '--index_dir', default=None,
-        help='Directory with FAISS indices (default: <data_dir>/retrieval_indices)',
-    )
-    parser.add_argument(
         '--output_dir', default=None,
         help='Output directory for caches (default: <data_dir>/cache)',
-    )
-    parser.add_argument(
-        '--k', type=int, default=K_RETRIEVED,
-        help=f'Number of retrieved neighbors (default: {K_RETRIEVED})',
     )
     parser.add_argument(
         '--folds', type=int, nargs='+', default=[1, 2, 3, 4, 5],
         help='Which folds to build caches for (default: 1 2 3 4 5)',
     )
     parser.add_argument(
-        '--retrieval_batch_size', type=int, default=5000,
-        help='Batch size for retrieval queries (default: 5000)',
-    )
-    parser.add_argument(
         '--device', default='cpu',
-        help='Device for FAISS retrieval (default: cpu)',
-    )
-    parser.add_argument(
-        '--no_retrieval', action='store_true',
-        help='Build structure-only cache (zero-filled retrieval arrays, no embeddings/FAISS needed)',
+        help='Device for cache building (default: cpu)',
     )
     parser.add_argument(
         '--reuse_stats_from', default=None,
@@ -793,17 +764,85 @@ def main():
              'subdirs, in which case each fold_k uses its own stats (useful '
              'only for reproducing an exact prior build).',
     )
+    parser.add_argument(
+        '--no_cross', action='store_true',
+        help='Skip cross-residue distance arrays (legacy intra-only build).',
+    )
+    parser.add_argument(
+        '--build_log', default='/home/brooks/1TB/Wynn/data_archive/build_log.csv',
+        help='build_log.csv from 01: exact (pdb_path,chain) per BMRB so cross '
+             'distances use coords identical to intra. Required for cross.',
+    )
+    parser.add_argument(
+        '--dataset', choices=['experimental', 'alphafold', 'hybrid'], default=None,
+        help='Which build_log dataset rows to use for cross PDB resolution. '
+             'Default: inferred from data_dir basename.',
+    )
+    parser.add_argument(
+        '--pdb_search_dirs', nargs='+',
+        default=['data/pdbs', '/home/brooks/1TB/Wynn/data_archive/alphafold',
+                 '/home/brooks/1TB/Wynn/data_archive/pdbs', 'data/alphafold'],
+        help='Dirs to relocate build_log PDB paths by basename (cross pass).',
+    )
+    parser.add_argument(
+        '--allow_unstamped', action='store_true',
+        help='Finding #4: permit building on a split column that is NOT '
+             'stamp-provenanced (i.e. possibly the raw leaky MD5(bmrb_id)%%n+1 '
+             'split from 01, with no identity/UniProt dedup). By default 05 '
+             'REFUSES such a build. Only pass this for a deliberate quick/legacy '
+             'build where cross-fold leakage is acceptable.',
+    )
+    parser.add_argument(
+        '--train_only_stats', action='store_true',
+        help='Finding #5: compute per-fold TRAIN-ONLY normalization stats, '
+             'excluding the held-out fold k AND fold 0 (UCB-200) AND fold 6 '
+             '(holdout) from each fold_k\'s stats. Mutually exclusive with '
+             '--reuse_stats_from (frozen/global stats). Recommended for a '
+             'leak-free build; the default non-frozen path only excludes fold k.',
+    )
     args = parser.parse_args()
 
-    if args.embeddings is None:
-        args.embeddings = os.path.join(args.data_dir, 'esm_embeddings.h5')
-    if args.index_dir is None:
-        args.index_dir = os.path.join(args.data_dir, 'retrieval_indices')
+    # Finding #5: --train_only_stats and --reuse_stats_from are mutually
+    # exclusive — one computes per-fold train-only stats, the other loads a
+    # fixed (frozen/global) stats table.
+    if args.train_only_stats and args.reuse_stats_from:
+        raise SystemExit(
+            "ERROR: --train_only_stats and --reuse_stats_from are mutually "
+            "exclusive. --train_only_stats computes per-fold train-only stats; "
+            "--reuse_stats_from loads a fixed (frozen) stats table.")
+
     if args.output_dir is None:
-        # Default to 1TB drive — retrieval caches are ~30 GB per fold, main disk
-        # is chronically tight. A symlink at <data_dir>/cache is created below.
+        # Default to 1TB drive — caches are large, main disk is chronically
+        # tight. A symlink at <data_dir>/cache is created below.
         ds_name = os.path.basename(os.path.abspath(args.data_dir))
         args.output_dir = f'/home/brooks/1TB/Wynn/{ds_name}_cache'
+
+    # Cross-residue features: load build_log once (maps BMRB -> exact PDB+chain
+    # used for intra distances, so cross uses identical coords). Disabled
+    # gracefully if --no_cross or build_log missing.
+    build_cross = not args.no_cross
+    cross_build_log = None
+    if build_cross:
+        ds_for_log = args.dataset
+        if ds_for_log is None:
+            _b = os.path.basename(os.path.abspath(args.data_dir)).lower()
+            ds_for_log = ('alphafold' if 'alphafold' in _b else
+                          'experimental' if 'experimental' in _b else 'hybrid')
+        if os.path.isfile(args.build_log):
+            cross_build_log = cross04c.load_build_log(args.build_log, ds_for_log)
+            print(f"  Cross features ON: build_log[{ds_for_log}] = "
+                  f"{len(cross_build_log):,} entries")
+        else:
+            # Finding #12: a missing build_log used to silently degrade to an
+            # intra-only cache (build_cross=False, has_cross_features=false) with
+            # only a warning — a strictly worse model trained with no red flag.
+            # Fail loudly instead: an intra-only build must be requested
+            # explicitly with --no_cross.
+            raise FileNotFoundError(
+                f"build_log not found at {args.build_log}, so cross-residue "
+                f"features cannot be built. Provide a valid --build_log, or pass "
+                f"--no_cross to deliberately build a legacy intra-only cache. "
+                f"Refusing to silently disable cross features.")
         # Create symlink from <data_dir>/cache → output_dir so train.py picks it up
         link_path = os.path.join(args.data_dir, 'cache')
         if not os.path.exists(link_path):
@@ -811,15 +850,11 @@ def main():
             os.symlink(args.output_dir, link_path)
 
     print("=" * 60)
-    print("Training Cache Builder (Better Data Pipeline)")
+    print("Training Cache Builder (structure-only)")
     print("=" * 60)
     print(f"  Data directory:        {args.data_dir}")
-    print(f"  Embeddings:            {args.embeddings}")
-    print(f"  Index directory:       {args.index_dir}")
     print(f"  Output directory:      {args.output_dir}")
-    print(f"  K retrieved:           {args.k}")
     print(f"  Folds:                 {args.folds}")
-    print(f"  Retrieval batch size:  {args.retrieval_batch_size}")
     print(f"  Device:                {args.device}")
     print()
 
@@ -860,6 +895,81 @@ def main():
     if fold_col not in all_columns:
         raise ValueError("CSV must contain a 'split' or 'fold' column")
 
+    # ======================================================================
+    # Finding #4: refuse to build on an un-stamped (leaky MD5) split.
+    # 01 writes split = MD5(bmrb_id) % n + 1 (no identity/UniProt/AF-vs-exp
+    # dedup) and marks it un-stamped; the `stamp` stage rewrites split with the
+    # leak-free identity90 map and flips the provenance to "stamped". Building a
+    # cache on an un-stamped split puts same-protein duplicates in train+test.
+    # We detect "stamped" provenance via (any of):
+    #   - a CSV `split_provenance` column whose values are all "stamped", or
+    #   - a sidecar "<source_csv>.split_provenance.json" with
+    #     {"split_provenance": "stamped"}.
+    # If no definitive "stamped" marker is found, ERROR unless --allow_unstamped.
+    def _read_provenance_marker():
+        # Gather every CSV this build might read (combined + per-fold) and check
+        # for a definitive stamped/un-stamped marker. Returns one of:
+        #   'stamped', 'unstamped', or None (no marker found at all).
+        sources = [csv_path]
+        for f in range(1, 6):
+            ff = os.path.join(args.data_dir, f'structure_data_hybrid_fold_{f}.csv')
+            if os.path.exists(ff):
+                sources.append(ff)
+        saw_unstamped = False
+        saw_stamped = False
+        saw_any_marker = False
+        for src in sources:
+            # 1) Sidecar JSON
+            sidecar = src + '.split_provenance.json'
+            if os.path.exists(sidecar):
+                try:
+                    with open(sidecar) as _sf:
+                        prov = json.load(_sf).get('split_provenance')
+                    if prov is not None:
+                        saw_any_marker = True
+                        if prov == 'stamped':
+                            saw_stamped = True
+                        else:
+                            saw_unstamped = True
+                except Exception:
+                    pass
+            # 2) CSV column (cheap: header tells us if it exists; read just it)
+            try:
+                src_cols = pd.read_csv(src, nrows=0).columns
+            except Exception:
+                src_cols = []
+            if 'split_provenance' in src_cols:
+                saw_any_marker = True
+                col = pd.read_csv(src, usecols=['split_provenance'])['split_provenance']
+                uniq = set(col.dropna().astype(str).unique())
+                if uniq and uniq.issubset({'stamped'}):
+                    saw_stamped = True
+                if uniq - {'stamped'}:
+                    saw_unstamped = True
+        if not saw_any_marker:
+            return None
+        # Any un-stamped marker anywhere is disqualifying; only all-stamped passes.
+        return 'unstamped' if (saw_unstamped or not saw_stamped) else 'stamped'
+
+    _prov = _read_provenance_marker()
+    if _prov == 'stamped':
+        print("  Split provenance: STAMPED (leak-free identity90 map). OK.")
+    elif args.allow_unstamped:
+        print(f"  Split provenance: {_prov or 'NO MARKER'} — proceeding anyway "
+              f"because --allow_unstamped was passed. WARNING: this split may be "
+              f"the raw leaky MD5(bmrb_id) fold (same-protein duplicates split "
+              f"across train/test).")
+    else:
+        raise SystemExit(
+            "ERROR (Finding #4): the split column is not stamp-provenanced as "
+            f"leak-free (found provenance: {_prov or 'NO MARKER'}). The raw 01 "
+            "split is MD5(bmrb_id) % n + 1 with no identity/UniProt dedup, so "
+            "building on it leaks same-protein duplicates across train/test.\n"
+            "  Run the `stamp` stage to rewrite the split with the leak-free "
+            "identity90 map (it sets split_provenance='stamped'), then re-run 05.\n"
+            "  To deliberately build on a possibly-leaky split, pass "
+            "--allow_unstamped.")
+
     print(f"  Shift columns:    {len(shift_cols)}")
     print(f"  Distance columns: {len(dist_col_info)}")
     print(f"  DSSP columns:     {len(dssp_cols)}")
@@ -896,8 +1006,18 @@ def main():
         del light_parts
         gc.collect()
     else:
-        light_df = pd.read_csv(csv_path, usecols=light_cols, dtype={'bmrb_id': str},
-                               low_memory=False)
+        # Chunked read: the C parser materializes ALL columns before applying
+        # usecols, so a plain read_csv(usecols=...) on the full wide CSV
+        # (~1556 cols x millions of rows) OOMs. Reading in row-chunks keeps only
+        # the light columns per chunk, bounding peak memory. Result is identical.
+        _usecols = [c for c in light_cols if c in pd.read_csv(csv_path, nrows=0).columns]
+        _parts = []
+        for _chunk in pd.read_csv(csv_path, usecols=_usecols, dtype={'bmrb_id': str},
+                                  low_memory=False, chunksize=200000):
+            _parts.append(_chunk)
+        light_df = pd.concat(_parts, ignore_index=True)
+        del _parts
+        gc.collect()
     n_residues = len(light_df)
     n_proteins = light_df['bmrb_id'].nunique()
     print(f"  {n_residues:,} residues from {n_proteins:,} proteins")
@@ -922,17 +1042,6 @@ def main():
     del all_struct, bmrb_ids_arr, residue_ids_arr
     gc.collect()
     print(f"  Built lookup for {len(struct_lookup):,} residues in {time.time()-t0:.1f}s")
-
-    if not args.no_retrieval:
-        # Import retrieval module
-        from retrieval import Retriever, EmbeddingLookup
-
-        # Load embedding lookup once
-        print(f"\nLoading embedding lookup from {args.embeddings}...")
-        embedding_lookup = EmbeddingLookup(args.embeddings)
-    else:
-        print("\n*** NO-RETRIEVAL MODE: skipping embeddings/FAISS ***")
-        embedding_lookup = None
 
     all_provenance = {}
     os.makedirs(args.output_dir, exist_ok=True)
@@ -962,13 +1071,38 @@ def main():
                 _ref = json.load(_f)
             stats = _ref['stats']
             print(f"    Stats LOADED FROM {ref_cfg}")
+            # Finding #5: the reuse/frozen path applies ONE stats table (typically
+            # the global frozen_stats over ALL data) to every fold. If those
+            # stats were fit including the test fold / fold 0 (UCB-200) / fold 6
+            # (holdout), they are methodologically a leak (mean/std, per-AA, DSSP
+            # all see held-out data). Magnitude is small (~0.005 ppm) but it
+            # taints the holdout/R2 claim. Prefer --train_only_stats for a
+            # leak-free per-fold-train-only build. Kept for back-compat / exact
+            # reproduction of prior builds.
+            print("    WARNING (Finding #5): reusing frozen/global stats — these "
+                  "may include test+holdout data (methodological leak). Use "
+                  "--train_only_stats for per-fold train-only stats.")
             if _ref.get('shift_cols') and _ref['shift_cols'] != shift_cols:
                 raise ValueError(
                     f"shift_cols mismatch between reference cache and current CSV.\n"
                     f"  ref: {_ref['shift_cols'][:5]}... ({len(_ref['shift_cols'])})\n"
                     f"  cur: {shift_cols[:5]}... ({len(shift_cols)})")
         else:
-            train_mask = light_df[fold_col] != fold
+            # Finding #5 (compute side): stats must be fit on TRAIN-ONLY data.
+            # The default non-frozen behavior excluded only the held-out fold k,
+            # leaking fold 0 (UCB-200) and fold 6 (holdout) into the stats. With
+            # --train_only_stats we exclude folds {k, 0, 6} so mean/std, per-AA,
+            # and DSSP stats see strictly the training partition.
+            if args.train_only_stats:
+                _excluded = {fold, 0, 6}
+                train_mask = ~light_df[fold_col].isin(_excluded)
+                print(f"    Train-only stats: excluding folds {sorted(_excluded)} "
+                      f"(held-out {fold} + UCB-200 fold 0 + holdout fold 6)")
+            else:
+                # Back-compat default: exclude only the held-out fold k. NOTE:
+                # this still includes fold 0 and fold 6 in the stats (a small
+                # methodological leak — see --train_only_stats).
+                train_mask = light_df[fold_col] != fold
             stats = compute_normalization_stats(
                 light_df[train_mask], shift_cols, dssp_cols)
             n_train = train_mask.sum()
@@ -995,35 +1129,6 @@ def main():
         print(f"    Loaded {fold_df['bmrb_id'].nunique()} proteins, "
               f"{len(fold_df):,} residues in {time.time()-t0:.1f}s")
 
-        if not args.no_retrieval:
-            # Each fold_k cache retrieves from ONLY fold k residues (intra-fold
-            # design). At training time, train.py loads the other folds' caches,
-            # so training samples never retrieve test-fold shifts — no leakage.
-            # Prefer the new 'only' index; fall back to legacy 'exclude' if
-            # that's all that exists (for old retrieval_indices dirs).
-            only_idx = os.path.join(args.index_dir, f'index_only_fold_{fold}.faiss')
-            if os.path.exists(only_idx):
-                print(f"    Loading intra-fold index (only fold {fold})...")
-                retriever = Retriever(
-                    index_dir=args.index_dir,
-                    only_fold=fold,
-                    k=args.k,
-                    nprobe=FAISS_NPROBE,
-                    device=args.device,
-                )
-            else:
-                print(f"    WARNING: no index_only_fold_{fold}.faiss found. "
-                      f"Falling back to legacy exclude-fold index.")
-                retriever = Retriever(
-                    index_dir=args.index_dir,
-                    exclude_fold=fold,
-                    k=args.k,
-                    nprobe=FAISS_NPROBE,
-                    device=args.device,
-                )
-        else:
-            retriever = None
-
         # Build cache
         cache_dir = os.path.join(args.output_dir, f'fold_{fold}')
         t0 = time.time()
@@ -1036,12 +1141,11 @@ def main():
             dssp_cols=dssp_cols,
             atom_to_idx=atom_to_idx,
             stats=stats,
-            embedding_lookup=embedding_lookup,
-            retriever=retriever,
             cache_dir=cache_dir,
-            k_retrieved=args.k,
-            retrieval_batch_size=args.retrieval_batch_size,
             struct_lookup=struct_lookup,
+            build_cross=build_cross,
+            build_log=cross_build_log,
+            pdb_search_dirs=args.pdb_search_dirs,
         )
 
         elapsed = time.time() - t0
@@ -1049,18 +1153,11 @@ def main():
         all_provenance[fold] = provenance
         print(f"    Cache built in {elapsed:.1f}s")
 
-        # Free fold data and retriever
         del fold_df
-        if retriever is not None:
-            del retriever
         gc.collect()
 
     # Cleanup
     del light_df, struct_lookup
-
-    # Close embedding lookup
-    if embedding_lookup is not None:
-        embedding_lookup.close()
 
     # ---- Final Provenance Report ----
     print("\n" + "=" * 60)
@@ -1072,11 +1169,6 @@ def main():
         print(f"    Total residues:          {prov['total_residues']:,}")
         print(f"    Samples (with shifts):   {prov['n_samples']:,}")
         print(f"    Residues excluded (no shifts): {prov['residues_no_shifts']:,}")
-        print(f"    Retrieval queries:       {prov['total_queries']:,}")
-        print(f"    Valid queries:           {prov['valid_queries']:,}")
-        print(f"    Retrieval failures:      {prov['retrieval_failures']:,}")
-        print(f"    Avg cosine similarity:   {prov['avg_cosine_similarity']:.4f}")
-        print(f"    Retrieval coverage:      {prov['retrieval_coverage']:.4f}")
         print(f"    Build time:              {prov['build_time_seconds']:.1f}s")
     print("=" * 60)
 

@@ -38,7 +38,7 @@ from tqdm import tqdm
 
 from config import (
     N_RESIDUE_TYPES, N_SS_TYPES, N_MISMATCH_TYPES,
-    DSSP_COLS, K_RETRIEVED, STANDARD_RESIDUES, AA_3_TO_1,
+    DSSP_COLS, STANDARD_RESIDUES, AA_3_TO_1,
     OUTLIER_STD_THRESHOLD, CONTEXT_WINDOW, K_SPATIAL_NEIGHBORS,
 )
 from dataset import (
@@ -75,7 +75,7 @@ def load_imputation_model(checkpoint_path, device):
 
     stats = checkpoint.get('stats', None)
     shift_cols = checkpoint.get('shift_cols', None)
-    k_retrieved = checkpoint.get('k_retrieved', K_RETRIEVED)
+    k_retrieved = checkpoint.get('k_retrieved', 32)
     n_atom_types = checkpoint.get('n_atom_types', None)
     dssp_cols = checkpoint.get('dssp_cols', [])
 
@@ -102,13 +102,11 @@ def load_imputation_model(checkpoint_path, device):
 
     spatial_hidden = clean_sd.get(
         'spatial_attention.fallback_embed', torch.zeros(192)).shape[0]
-    retrieval_hidden = clean_sd.get(
-        'retrieval.fallback_context', torch.zeros(192)).shape[0]
 
     print(f"  Auto-detected: n_atoms={n_atom_types}, n_shifts={n_shifts}, "
           f"n_dssp={n_dssp}")
     print(f"  struct_cnn={struct_cnn_channels}, shift_ctx={shift_context_channels}")
-    print(f"  spatial={spatial_hidden}, retrieval={retrieval_hidden}")
+    print(f"  spatial={spatial_hidden}")
 
     model = ShiftImputationModel(
         n_atom_types=n_atom_types,
@@ -117,7 +115,6 @@ def load_imputation_model(checkpoint_path, device):
         struct_cnn_channels=struct_cnn_channels or None,
         shift_context_channels=shift_context_channels or None,
         spatial_hidden=spatial_hidden,
-        retrieval_hidden=retrieval_hidden,
     ).to(device)
 
     # Filter out deprecated physics_encoder keys from old checkpoints

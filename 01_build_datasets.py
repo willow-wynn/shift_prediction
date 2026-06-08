@@ -196,16 +196,35 @@ def get_structure_sequence(residues):
 
 
 def get_shift_sequence(shifts_df):
-    """Extract sequence from a single protein's shift DataFrame."""
-    sub = shifts_df[['residue_id', 'residue_code']].drop_duplicates().sort_values('residue_id')
-    valid = sub['residue_code'].apply(lambda x: str(x).upper() in AA_3_TO_1)
-    sub = sub[valid]
+    """Extract sequence from a single protein's shift DataFrame.
+
+    DETERMINISTIC: exactly one residue_code per residue_id. The raw shift data
+    can contain >1 row per residue_id (data noise, or — for multi-entity BMRB
+    entries — different entities sharing the same Seq_ID numbering). The old code
+    used drop_duplicates() on the (residue_id, residue_code) PAIR, which KEPT
+    multiple codes for a residue_id, producing a sequence with duplicate residue
+    positions that corrupted alignment-based chain selection (and was sensitive
+    to row order). Here we collapse to one code per residue_id with a stable,
+    order-independent rule (most frequent code; ties broken by lexicographic
+    code) so the sequence — and the chain it selects — are reproducible.
+    """
+    sub = shifts_df[['residue_id', 'residue_code']].copy()
+    sub = sub[sub['residue_code'].apply(lambda x: str(x).upper() in AA_3_TO_1)]
     if len(sub) == 0:
         return None
+    # one code per residue_id: pick the most common, tie-break lexicographically
+    def _pick(codes):
+        vc = codes.value_counts()
+        top = vc[vc == vc.max()].index.tolist()
+        return sorted(top)[0]
+    chosen = (sub.groupby('residue_id')['residue_code'].apply(_pick)
+              .sort_index())
+    rids = chosen.index.tolist()
+    names = chosen.tolist()
     return {
-        'residue_ids': sub['residue_id'].tolist(),
-        'residue_names': sub['residue_code'].tolist(),
-        'sequence': to_single_letter(sub['residue_code'].tolist()),
+        'residue_ids': rids,
+        'residue_names': names,
+        'sequence': to_single_letter(names),
     }
 
 
@@ -709,8 +728,57 @@ def process_protein(bmrb_id, shifts_df, pdb_path, chain_id):
     # Spatial neighbors
     neighbors = find_neighbors(struct_data)
 
-    # Index shift data
-    shift_indexed = shifts_df.drop_duplicates(subset='residue_id').set_index('residue_id')
+    # Index shift data.
+    #
+    # CORRECTNESS (chain-selection bug class, review #10): a residue_id can have
+    # >1 row when, for multi-entity BMRB entries, two entities share the same
+    # Seq_ID numbering. The alignment above used the residue_code that
+    # get_shift_sequence() picked for each residue_id (most-frequent, then
+    # lexicographic). A plain drop_duplicates(subset='residue_id') keeps the
+    # FIRST row by storage order, which can belong to the OTHER entity — so the
+    # shift VALUES pulled for an aligned position could come from a residue whose
+    # code differs from the one the chain was aligned against (e.g. an ALA shift
+    # written against a GLY position). To stay consistent, index shifts by the
+    # SAME (residue_id -> chosen residue_code) the aligner used, and among rows
+    # with that code keep the first (deterministic for the single-entity case,
+    # where there is exactly one code per residue_id so this is a no-op).
+    chosen_code_by_rid = dict(zip(shift_seq['residue_ids'], shift_seq['residue_names']))
+
+    shift_work = shifts_df.copy()
+    # Build the per-row "code matches the alignment-chosen code for this rid" flag.
+    _norm_code = shift_work['residue_code'].astype(str).str.upper()
+    _chosen_upper = {rid: str(c).upper() for rid, c in chosen_code_by_rid.items()}
+    _matches_chosen = [
+        (_chosen_upper.get(rid) is not None and code == _chosen_upper.get(rid))
+        for rid, code in zip(shift_work['residue_id'], _norm_code)
+    ]
+    shift_work = shift_work.assign(_matches_chosen=_matches_chosen)
+
+    # Count residue_ids that carry >1 distinct residue_code (multi-entity / noisy
+    # collision) so reconciliation is auditable rather than silent.
+    _codes_per_rid = (
+        shift_work[shift_work['residue_code'].astype(str).str.upper().isin(AA_3_TO_1)]
+        .groupby('residue_id')['residue_code']
+        .apply(lambda s: s.astype(str).str.upper().nunique())
+    )
+    _n_multicode = int((_codes_per_rid > 1).sum())
+    if _n_multicode > 0:
+        print(f"    WARNING: {bmrb_id}: {_n_multicode} residue_id(s) with multiple "
+              f"residue_codes; pulling shift rows by the alignment-chosen code.")
+
+    # Prefer rows whose code matches the alignment-chosen code. A stable sort on
+    # the match flag (descending) keeps matching rows first; drop_duplicates then
+    # keeps the matching row per residue_id. residue_ids whose chosen code has no
+    # corresponding row (or that were not in shift_seq) fall back to their first
+    # row, preserving prior behavior for those.
+    shift_work = shift_work.sort_values(
+        '_matches_chosen', ascending=False, kind='stable'
+    )
+    shift_indexed = (
+        shift_work.drop_duplicates(subset='residue_id')
+        .drop(columns='_matches_chosen')
+        .set_index('residue_id')
+    )
     shift_cols = sorted([c for c in shifts_df.columns if c.endswith('_shift')])
     ambig_cols = sorted([c for c in shifts_df.columns if c.endswith('_ambiguity_code')])
 
@@ -1164,8 +1232,17 @@ def main():
 
             if batch_rows:
                 batch_df = pd.DataFrame(batch_rows)
+                # LEAK WARNING (review #4): this `split` is the RAW per-BMRB MD5
+                # fold and is NOT leak-free. It does no identity/UniProt/AF-vs-
+                # experimental dedup, so same-protein duplicates can land in
+                # different folds. It is only a default placeholder; the separate
+                # `stamp` stage MUST overwrite this column with the leak-free
+                # identity90 fold map before any training-cache (05) build.
+                # The `split_provenance` column below marks this as un-stamped so
+                # downstream stages (05) can detect and refuse an un-stamped split.
                 batch_df['split'] = batch_df['bmrb_id'].apply(
                     lambda bid: assign_fold(bid, n_folds=args.n_folds))
+                batch_df['split_provenance'] = 'md5_unstamped'
                 all_batch_dfs.append(batch_df)
                 del batch_rows
                 print(f"    Batch done: {len(batch_df):,} residues, "
@@ -1191,6 +1268,23 @@ def main():
             total_rows += len(batch_df)
         del all_batch_dfs
         import gc; gc.collect()
+
+        # Provenance sidecar (review #4): record that the split column written
+        # here is the raw, un-stamped MD5 fold. The `stamp` stage flips
+        # split_provenance to "stamped" (in both this JSON and the CSV column)
+        # after it rewrites the split with the leak-free identity90 map. 05 can
+        # read this sidecar (or the CSV column) and refuse to build a cache on a
+        # split that is still "md5_unstamped".
+        sidecar_path = output_path + '.split_provenance.json'
+        with open(sidecar_path, 'w') as f:
+            json.dump({
+                'split_provenance': 'md5_unstamped',
+                'n_folds': args.n_folds,
+                'note': ('Raw per-BMRB MD5 fold (split = MD5(bmrb_id) % n_folds + 1). '
+                         'NOT leak-free: no identity/UniProt/AF-vs-experimental dedup. '
+                         'Must be overwritten by the stamp stage (identity90 map) '
+                         'before any training-cache (05) build.'),
+            }, f, indent=2)
 
         print(f"    Saved: {output_path}")
         print(f"    Total: {succeeded} proteins, {total_rows:,} residues, "

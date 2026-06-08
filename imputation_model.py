@@ -38,7 +38,6 @@ from config import (
     KERNEL_SIZE,
     INPUT_DROPOUT, HEAD_DROPOUT,
     SPATIAL_ATTN_HIDDEN,
-    RETRIEVAL_HIDDEN, RETRIEVAL_HEADS, RETRIEVAL_DROPOUT,
     MAX_VALID_DISTANCES,
     N_BOND_GEOM,
     MAX_CROSS_DISTANCES, N_CROSS_OFFSET_TYPES, CROSS_OFFSET_EMBED_DIM,
@@ -212,266 +211,6 @@ class SpatialNeighborShiftAttention(nn.Module):
 # Unified Retrieval Transfer
 # ============================================================================
 
-class UnifiedRetrievalTransfer(nn.Module):
-    """Single retrieval mechanism producing both latent context and transferred shifts.
-
-    Replaces the twin RetrievalCrossAttention + QueryConditionedTransfer from model.py.
-
-    Query = concat(base_encoding, shift_context, observed_shifts_at_center)
-    attends to K retrieved neighbors via multi-head cross-attention.
-
-    Outputs:
-    - retrieval_context: (B, hidden_dim) latent retrieval features
-    - transferred_shifts: (B, n_shifts) RC-corrected weighted shift transfer
-    - trust_scores: (B, n_shifts) per-shift confidence in transfer
-
-    Shift-aware re-ranking: when observed shifts are available for the query,
-    neighbors with similar shifts get upweighted.
-    """
-
-    def __init__(
-        self,
-        query_dim: int,
-        n_shifts: int,
-        n_residue_types: int = N_RESIDUE_TYPES,
-        hidden_dim: int = 192,
-        n_heads: int = 4,
-        dropout: float = 0.25,
-    ):
-        super().__init__()
-
-        self.n_shifts = n_shifts
-        self.n_residue_types = n_residue_types
-        self.hidden_dim = hidden_dim
-        self.n_heads = n_heads
-        self.head_dim = hidden_dim // n_heads
-        self.scale = self.head_dim ** -0.5
-
-        # Query projection: takes structural encoding + shift context + observed shifts
-        self.query_proj = nn.Sequential(
-            nn.Linear(query_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        # Neighbor representation
-        self.residue_embed = nn.Embedding(n_residue_types + 1, 16)
-        # neighbor input: shifts (n_shifts) + shift_masks (n_shifts) + res_embed (16) + cosine_sim (1) + same_type (1)
-        neighbor_input_dim = n_shifts + n_shifts + 16 + 1 + 1
-        self.neighbor_proj = nn.Sequential(
-            nn.Linear(neighbor_input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        # Cross-attention Q/K/V
-        self.attn_q = nn.Linear(hidden_dim, hidden_dim)
-        self.attn_k = nn.Linear(hidden_dim, hidden_dim)
-        self.attn_v = nn.Linear(hidden_dim, hidden_dim)
-
-        # Shift-aware re-ranking: project observed shifts to attention bias
-        # When query has observed shifts, bias attention toward neighbors with similar shifts
-        self.shift_similarity_proj = nn.Sequential(
-            nn.Linear(n_shifts * 2, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, n_heads),
-        )
-
-        # Output projections
-        self.context_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # Per-shift transfer weights from attention output
-        self.to_shift_weights = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_shifts),
-        )
-
-        # Trust gate
-        self.trust_residue_embed = nn.Embedding(n_residue_types + 1, 32)
-        self.trust_query_proj = nn.Sequential(
-            nn.Linear(query_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-
-        # Per-shift stats: coverage, variance, mean_dist, same_type_coverage
-        per_shift_stats_dim = 4
-        global_stats_dim = 4
-
-        trust_context_dim = hidden_dim + 32 + global_stats_dim
-        self.trust_context_proj = nn.Sequential(
-            nn.Linear(trust_context_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        self.trust_per_shift = nn.Sequential(
-            nn.Linear(hidden_dim + per_shift_stats_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),
-        )
-
-        # Per-shift scaling
-        self.shift_scale = nn.Parameter(torch.ones(n_shifts))
-        self.fallback_shift = nn.Parameter(torch.zeros(n_shifts))
-        self.fallback_context = nn.Parameter(torch.zeros(hidden_dim))
-
-        self.out_dim = hidden_dim
-
-    def forward(
-        self,
-        query_encoding: torch.Tensor,          # (B, query_dim)
-        query_residue_code: torch.Tensor,      # (B,)
-        query_observed_shifts: torch.Tensor,   # (B, n_shifts) observed shifts at center
-        query_shift_masks: torch.Tensor,       # (B, n_shifts) which are available
-        retrieved_shifts: torch.Tensor,        # (B, K, n_shifts)
-        retrieved_shift_masks: torch.Tensor,   # (B, K, n_shifts)
-        retrieved_residue_codes: torch.Tensor, # (B, K)
-        retrieved_distances: torch.Tensor,     # (B, K) cosine similarities
-        retrieved_valid: torch.Tensor,         # (B, K)
-    ):
-        """
-        Returns:
-            retrieval_context: (B, hidden_dim)
-            transferred_shifts: (B, n_shifts)
-            trust_scores: (B, n_shifts)
-        """
-        B, K, S = retrieved_shifts.shape
-
-        any_valid = retrieved_valid.any(dim=1)  # (B,)
-        same_type = (retrieved_residue_codes == query_residue_code.unsqueeze(1)).float()
-
-        # Build query
-        q = self.query_proj(query_encoding)  # (B, hidden_dim)
-
-        # Build neighbor representations
-        res_emb = self.residue_embed(retrieved_residue_codes)  # (B, K, 16)
-        neighbor_input = torch.cat([
-            retrieved_shifts,
-            retrieved_shift_masks.float(),
-            res_emb,
-            retrieved_distances.unsqueeze(-1),
-            same_type.unsqueeze(-1),
-        ], dim=-1)
-        kv = self.neighbor_proj(neighbor_input)  # (B, K, hidden_dim)
-
-        # Multi-head cross-attention
-        Q = self.attn_q(q).unsqueeze(1).view(B, 1, self.n_heads, self.head_dim).transpose(1, 2)
-        K_attn = self.attn_k(kv).view(B, K, self.n_heads, self.head_dim).transpose(1, 2)
-        V = self.attn_v(kv).view(B, K, self.n_heads, self.head_dim).transpose(1, 2)
-
-        attn_scores = torch.matmul(Q, K_attn.transpose(-2, -1)) * self.scale  # (B, H, 1, K)
-
-        # Shift-aware re-ranking bias
-        # Compare query observed shifts with each neighbor's shifts
-        query_shifts_expanded = query_observed_shifts.unsqueeze(1).expand(-1, K, -1)  # (B, K, S)
-        shift_diff = torch.cat([
-            (query_shifts_expanded - retrieved_shifts) * query_shift_masks.unsqueeze(1),
-            query_shift_masks.unsqueeze(1).expand(-1, K, -1),
-        ], dim=-1)  # (B, K, 2*S)
-        shift_bias = self.shift_similarity_proj(shift_diff)  # (B, K, n_heads)
-        shift_bias = shift_bias.permute(0, 2, 1).unsqueeze(2)  # (B, H, 1, K)
-        attn_scores = attn_scores + shift_bias
-
-        # Mask invalid neighbors
-        attn_mask = ~retrieved_valid.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, K)
-        # Handle all-masked case
-        all_masked = ~any_valid
-        if all_masked.any():
-            attn_mask = attn_mask.clone()
-            attn_mask[all_masked, :, :, 0] = False
-
-        attn_scores = attn_scores.masked_fill(attn_mask, -1e4)
-        attn_weights = F.softmax(attn_scores, dim=-1)  # (B, H, 1, K)
-
-        attn_out = torch.matmul(attn_weights, V)  # (B, H, 1, head_dim)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.hidden_dim)
-
-        # Retrieval context output
-        retrieval_context = self.context_proj(attn_out)
-        fallback_ctx = self.fallback_context.unsqueeze(0).expand(B, -1)
-        retrieval_context = torch.where(any_valid.unsqueeze(-1), retrieval_context, fallback_ctx)
-
-        # Transferred shifts via learned per-shift weights
-        shift_weight_bias = self.to_shift_weights(attn_out)  # (B, S)
-        base_weights = retrieved_distances.unsqueeze(-1).expand(-1, -1, S)
-        same_type_bonus = same_type.unsqueeze(-1) * 0.5
-        weights = base_weights + same_type_bonus + shift_weight_bias.unsqueeze(1) * 0.1
-
-        valid_mask = retrieved_valid.unsqueeze(-1) & retrieved_shift_masks
-        weights = weights.masked_fill(~valid_mask, -1e4)
-        weights = F.softmax(weights, dim=1)  # (B, K, S)
-
-        transferred = (weights * retrieved_shifts).sum(dim=1) * self.shift_scale
-        fallback_s = self.fallback_shift.unsqueeze(0).expand(B, -1)
-        transferred = torch.where(any_valid.unsqueeze(-1), transferred, fallback_s)
-
-        # Trust gate with per-shift statistics
-        with torch.no_grad():
-            valid_float = retrieved_valid.float()
-            valid_mask_float = valid_mask.float()
-
-            per_shift_count = valid_mask_float.sum(dim=1)
-            per_shift_coverage = per_shift_count / (K + 1e-8)
-
-            masked_shifts = retrieved_shifts * valid_mask_float
-            per_shift_mean = masked_shifts.sum(dim=1) / (per_shift_count + 1e-8)
-            shift_diff_sq = (retrieved_shifts - per_shift_mean.unsqueeze(1)) ** 2
-            per_shift_var = (shift_diff_sq * valid_mask_float).sum(dim=1) / (per_shift_count + 1e-8)
-            per_shift_var_norm = torch.log1p(per_shift_var).clamp(0, 5) / 5
-
-            dist_expanded = retrieved_distances.unsqueeze(-1).expand(-1, -1, S)
-            per_shift_mean_dist = (dist_expanded * valid_mask_float).sum(dim=1) / (per_shift_count + 1e-8)
-
-            same_type_with_shift = same_type.unsqueeze(-1) * valid_mask_float
-            per_shift_same_type = same_type_with_shift.sum(dim=1) / (per_shift_count + 1e-8)
-
-            per_shift_stats = torch.stack([
-                per_shift_coverage, per_shift_var_norm,
-                per_shift_mean_dist, per_shift_same_type,
-            ], dim=-1)  # (B, S, 4)
-
-            n_valid = valid_float.sum(dim=1, keepdim=True) / K
-            n_same_type = (same_type.squeeze(-1) if same_type.dim() > 2 else same_type).sum(dim=1, keepdim=True) * valid_float.sum(dim=1, keepdim=True) / (K * K + 1e-8)
-            # Fix: same_type is (B, K), valid_float is (B, K)
-            n_same_type = (same_type * valid_float).sum(dim=1, keepdim=True) / K
-
-            masked_dist_global = retrieved_distances.masked_fill(~retrieved_valid, 0.0)
-            mean_dist = masked_dist_global.sum(dim=1, keepdim=True) / (valid_float.sum(dim=1, keepdim=True) + 1e-8)
-            max_dist = masked_dist_global.max(dim=1, keepdim=True)[0]
-
-            global_stats = torch.cat([mean_dist, max_dist, n_valid, n_same_type], dim=-1)
-
-        query_res_embed = self.trust_residue_embed(query_residue_code)
-        trust_query = self.trust_query_proj(query_encoding)
-
-        trust_context = self.trust_context_proj(
-            torch.cat([trust_query, query_res_embed, global_stats], dim=-1)
-        )
-
-        trust_context_expanded = trust_context.unsqueeze(1).expand(-1, S, -1)
-        trust_input = torch.cat([trust_context_expanded, per_shift_stats], dim=-1)
-        trust = self.trust_per_shift(trust_input).squeeze(-1)  # (B, S)
-
-        trust = torch.where(any_valid.unsqueeze(-1), trust, torch.zeros_like(trust))
-        has_any_neighbor = per_shift_count > 0
-        trust = torch.where(has_any_neighbor, trust, torch.zeros_like(trust))
-
-        return retrieval_context, transferred, trust
-
-
-# ============================================================================
-# Shift Imputation Model
-# ============================================================================
-
 class ShiftImputationModel(nn.Module):
     """Chemical shift imputation using structure + observed shifts + retrieval.
 
@@ -503,10 +242,8 @@ class ShiftImputationModel(nn.Module):
         # Shift context encoder
         shift_context_channels: list = None,
         shift_context_dropout: float = 0.15,
-        # Retrieval
-        retrieval_hidden: int = RETRIEVAL_HIDDEN,
-        retrieval_heads: int = RETRIEVAL_HEADS,
-        retrieval_dropout: float = RETRIEVAL_DROPOUT,
+        # Dropout for the spatial-neighbor-shift attention
+        attn_dropout: float = 0.3,
     ):
         super().__init__()
 
@@ -516,7 +253,6 @@ class ShiftImputationModel(nn.Module):
 
         self.n_shifts = n_shifts
         self.n_residue_types = n_residue_types
-        self.retrieval_dropout_rate = retrieval_dropout
 
         # ========== Structural Encoder ==========
         self.distance_attention = DistanceAttentionPerPosition(
@@ -611,22 +347,9 @@ class ShiftImputationModel(nn.Module):
             query_dim=spatial_shift_query_dim,
             hidden_dim=spatial_hidden,
             n_heads=4,
-            dropout=retrieval_dropout,
+            dropout=attn_dropout,
         )
         spatial_shift_dim = self.spatial_shift_attention.out_dim
-
-        # ========== Unified Retrieval Transfer ==========
-        # Query dim = base_encoder + shift_context + spatial_shift_context + observed_shifts_at_center
-        retrieval_query_dim = (base_encoder_dim + shift_context_dim
-                               + spatial_shift_dim + n_shifts)
-        self.retrieval = UnifiedRetrievalTransfer(
-            query_dim=retrieval_query_dim,
-            n_shifts=n_shifts,
-            n_residue_types=n_residue_types,
-            hidden_dim=retrieval_hidden,
-            n_heads=retrieval_heads,
-            dropout=retrieval_dropout,
-        )
 
         # ========== Fusion + Prediction ==========
         # fused = base + shift_ctx + spatial_shift_ctx + retrieval_ctx + transferred + trust + shift_type_emb
@@ -637,8 +360,7 @@ class ShiftImputationModel(nn.Module):
             nn.Linear(128, 128),
         )
 
-        fused_dim = (base_encoder_dim + shift_context_dim + spatial_shift_dim +
-                     retrieval_hidden + n_shifts + n_shifts + 128)
+        fused_dim = (base_encoder_dim + shift_context_dim + spatial_shift_dim + 128)
 
         self.prediction_head = nn.Sequential(
             nn.Linear(fused_dim, 512),
@@ -672,10 +394,6 @@ class ShiftImputationModel(nn.Module):
         cross_distances=None, cross_dist_mask=None,
         # Inter-residue bond geometry
         bond_geom=None,
-        # Retrieval inputs
-        query_residue_code=None,
-        retrieved_shifts=None, retrieved_shift_masks=None,
-        retrieved_residue_codes=None, retrieved_distances=None, retrieved_valid=None,
         # Shift context inputs (sequence window)
         context_residue_idx=None,
         context_observed_shifts=None,
@@ -807,7 +525,6 @@ class ShiftImputationModel(nn.Module):
             spatial_neighbor_shift_masks = torch.zeros(
                 B, K_sp, self.n_shifts, device=base_encoding.device)
 
-        center_shifts_clean = center_observed_shifts * center_shift_masks
         spatial_shift_query = torch.cat([
             base_encoding, shift_context, shift_type,
         ], dim=-1)
@@ -820,32 +537,6 @@ class ShiftImputationModel(nn.Module):
             neighbor_valid=neighbor_valid,
         )
 
-        # ========== 4. Retrieval Transfer ==========
-        # Build retrieval query from structural + shift context + spatial shift + observed
-        retrieval_query = torch.cat([
-            base_encoding, shift_context, spatial_shift_context, center_shifts_clean,
-        ], dim=-1)
-
-        # Apply retrieval dropout during training
-        if self.training and self.retrieval_dropout_rate > 0:
-            drop_mask = torch.rand(B, device=base_encoding.device) < self.retrieval_dropout_rate
-            retrieved_valid_use = retrieved_valid.clone()
-            retrieved_valid_use[drop_mask] = False
-        else:
-            retrieved_valid_use = retrieved_valid
-
-        retrieval_context, transferred_shifts, trust_scores = self.retrieval(
-            query_encoding=retrieval_query,
-            query_residue_code=query_residue_code,
-            query_observed_shifts=center_shifts_clean,
-            query_shift_masks=center_shift_masks,
-            retrieved_shifts=retrieved_shifts,
-            retrieved_shift_masks=retrieved_shift_masks,
-            retrieved_residue_codes=retrieved_residue_codes,
-            retrieved_distances=retrieved_distances,
-            retrieved_valid=retrieved_valid_use,
-        )
-
         # ========== 5. Fusion + Prediction ==========
         shift_type_emb = self.shift_type_proj(shift_type)
 
@@ -853,9 +544,6 @@ class ShiftImputationModel(nn.Module):
             base_encoding,
             shift_context,
             spatial_shift_context,
-            retrieval_context,
-            transferred_shifts,
-            trust_scores,
             shift_type_emb,
         ], dim=-1)
 
@@ -878,6 +566,8 @@ def create_imputation_model(
     **kwargs,
 ) -> ShiftImputationModel:
     """Create imputation model with sensible defaults."""
+    for _k in ('retrieval_hidden', 'retrieval_heads', 'retrieval_dropout'):
+        kwargs.pop(_k, None)
     return ShiftImputationModel(
         n_atom_types=n_atom_types,
         n_shifts=n_shifts,

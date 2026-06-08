@@ -30,8 +30,19 @@ python 00_fetch_bmrb_shifts.py
 python 01_build_datasets.py --online
 python 03_extract_esm_embeddings.py       # or 03b for structure embeddings
 python 04_build_retrieval_index.py
-python 05_build_training_cache.py
+python 05_build_training_cache.py         # builds a COMPLETE cache in one pass
 ```
+
+`05` is now self-sufficient: it parses each protein's PDB (the exact
+`(pdb_path, chain)` + best-NMR-model recorded by `01` in `build_log.csv`) and
+computes the cross-residue distance arrays AND `bond_geom` from those same
+coordinates — so intra/spatial/cross/bond are all from one identical
+conformation. It writes `cross_*.npy` + `bmrb_pdb_used.json` and sets
+`has_cross_features` in `config.json`. Use `--no_cross` for a legacy
+intra-only build. `04c`/`04d`/`04f` are now **legacy incremental patches**
+kept only to repair pre-cross caches built before this integration; a fresh
+`05` run needs none of them. To verify a built cache has aligned conformations,
+the CA(i)-CA(i±1) cross distance must equal `bond_geom`'s `bond_ca_next/prev`.
 
 ### Benchmarks
 ```bash
