@@ -2,8 +2,7 @@
 Shared training utilities for chemical shift prediction.
 
 Contains the training loop, evaluation, loss functions, and helper functions
-used by train.py. Consolidates logic that was previously duplicated across
-main.py, 06_train.py, train_structure_only.py, and train_retrieval_frozen.py.
+used by train.py.
 """
 
 import gc
@@ -20,8 +19,9 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from config import (
-    BACKBONE_LOSS_WEIGHT, STANDARD_RESIDUES, ATOM_TO_IDX, K_RETRIEVED,
+    BACKBONE_LOSS_WEIGHT, STANDARD_RESIDUES, ATOM_TO_IDX,
 )
+from shift_norm import denormalize, BACKBONE_SHIFTS as _BACKBONE_SHIFTS_CANON
 
 # ============================================================================
 # Constants
@@ -79,12 +79,45 @@ def huber_loss_masked(pred, target, mask, delta=0.5, shift_weights=None):
     return loss
 
 
+def equiv_swap_huber_loss(pred, target, mask, aa_code, base_weights,
+                          group_weight, partner, delta=0.5):
+    """Huber loss with (a) magnetic-equivalence weighting (methyls/symmetric
+    aromatics weighted 1/N via group_weight so a group counts once) and
+    (b) swap-invariant scoring of prochiral pairs (min over the two label
+    assignments). See equiv_groups.py / fixed_norm.build_loss_tensors.
+
+    pred,target,mask: (B,S); aa_code:(B,) residue-type code; base_weights:(S,);
+    group_weight:(n_aa,S); partner:(n_aa,S) long (partner column idx or -1).
+    """
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    n_aa = group_weight.size(0)
+    aa = aa_code.clamp(0, n_aa - 1)
+    w = base_weights.unsqueeze(0) * group_weight[aa]          # (B,S)
+    part = partner[aa]                                        # (B,S), -1 = none
+    h_ii = F.huber_loss(pred, target, reduction='none', delta=delta)
+    has = part >= 0
+    safe = part.clamp(min=0)
+    t_part = torch.gather(target, 1, safe)
+    m_part = torch.gather(mask.to(torch.float32), 1, safe) > 0.5
+    h_ij = F.huber_loss(pred, t_part, reduction='none', delta=delta)
+    both = has & mask & m_part                                # pair, both observed
+    # direct = h(p_i,t_i)+h(p_j,t_j); swap = h(p_i,t_j)+h(p_j,t_i)
+    pair_cost = torch.minimum(h_ii + torch.gather(h_ii, 1, safe),
+                              h_ij + torch.gather(h_ij, 1, safe))
+    elem = torch.where(both, 0.5 * pair_cost, h_ii)           # each pair member gets half
+    loss = (elem * w)[mask].mean()
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+    return loss
+
+
 # ============================================================================
 # Training
 # ============================================================================
 
 def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
-                shift_weights=None):
+                shift_weights=None, group_weight=None, partner=None):
     """Run one training epoch.
 
     Returns:
@@ -117,6 +150,9 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         target = batch.pop('shift_target')
         mask = batch.pop('shift_mask')
+        # query AA code = center-window residue (residue_idx stays in batch for model)
+        _ridx = batch['residue_idx']
+        aa_code = _ridx[:, _ridx.size(1) // 2]
 
         if _profile:
             torch.cuda.synchronize() if device == 'cuda' else None
@@ -132,8 +168,13 @@ def train_epoch(model, loader, optimizer, device, scaler=None, delta=0.5,
         ctx = autocast('cuda') if scaler else nullcontext()
         with ctx:
             pred = model(**batch)
-            loss = huber_loss_masked(pred, target, mask, delta=delta,
-                                     shift_weights=shift_weights)
+            if group_weight is not None and partner is not None:
+                loss = equiv_swap_huber_loss(pred, target, mask, aa_code,
+                                             shift_weights, group_weight, partner,
+                                             delta=delta)
+            else:
+                loss = huber_loss_masked(pred, target, mask, delta=delta,
+                                         shift_weights=shift_weights)
 
         if _profile:
             torch.cuda.synchronize() if device == 'cuda' else None
@@ -199,7 +240,8 @@ def evaluate(model, loader, device, stats, shift_cols, delta=0.5):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         target = batch.pop('shift_target')
         mask = batch.pop('shift_mask')
-        aa_codes = batch['query_residue_code'].cpu()
+        _ridx = batch['residue_idx']
+        aa_codes = _ridx[:, _ridx.size(1) // 2].cpu()   # center-window residue = query AA code
         ctx = autocast('cuda') if device == 'cuda' else nullcontext()
         with ctx:
             pred = model(**batch)
@@ -213,44 +255,45 @@ def evaluate(model, loader, device, stats, shift_cols, delta=0.5):
     all_mask = torch.cat(all_mask)
     all_aa = torch.cat(all_aa)
 
-    per_aa_stats = stats.get('per_aa', {})
+    # Denormalize predictions and targets to ppm ONCE via the canonical
+    # per-AA denorm (shared with inference / 07_evaluate so the three can't
+    # drift). Center-window AA per row in all_aa; out-of-range AA falls back to
+    # global stats — identical to the previous scalar loop for valid residues.
+    pred_ppm_all = denormalize(all_pred.numpy(), all_aa.numpy(), stats, shift_cols)
+    true_ppm_all = denormalize(all_target.numpy(), all_aa.numpy(), stats, shift_cols)
+    abs_ppm_all = np.abs(pred_ppm_all - true_ppm_all)
+    mask_np = all_mask.numpy()
 
-    per_shift_mae = {}
+    per_shift_mae = {}   # ppm (per-AA denormalized) — for the full table
+    per_shift_z = {}     # z-units (model's normalized space) — for the single number
     for si, col in enumerate(shift_cols):
         m = all_mask[:, si]
         if m.sum() > 0 and col in stats:
-            pred_ppm = torch.zeros(m.sum())
-            true_ppm = torch.zeros(m.sum())
             masked_pred = all_pred[:, si][m]
             masked_target = all_target[:, si][m]
-            masked_aa = all_aa[m]
+            # z-space MAE: targets/preds are already per-AA z-scored, so this is
+            # the scale-free error (each nucleus weighted equally regardless of ppm range)
+            per_shift_z[col] = (masked_pred - masked_target).abs().mean().item()
+            col_mask = mask_np[:, si].astype(bool)
+            per_shift_mae[col] = float(abs_ppm_all[col_mask, si].mean())
 
-            for j in range(len(masked_pred)):
-                aa_idx = int(masked_aa[j])
-                aa_name = STANDARD_RESIDUES[aa_idx] if aa_idx < len(STANDARD_RESIDUES) else None
-                aa_s = per_aa_stats.get(aa_name, {}).get(col) if aa_name else None
-                if aa_s:
-                    pred_ppm[j] = masked_pred[j] * aa_s['std'] + aa_s['mean']
-                    true_ppm[j] = masked_target[j] * aa_s['std'] + aa_s['mean']
-                else:
-                    pred_ppm[j] = masked_pred[j] * stats[col]['std'] + stats[col]['mean']
-                    true_ppm[j] = masked_target[j] * stats[col]['std'] + stats[col]['mean']
+    # SINGLE NUMBER = mean z-MAE over the 6 BACKBONE nuclei only. NEVER include
+    # sidechain (it's a bonus output), and NEVER raw-average ppm across nuclei
+    # (different scales). This is the canonical checkpoint-selection objective;
+    # train.py selects best.pt by 'backbone_z_mae' (alias 'mae'/'backbone_z').
+    bb_cols = [c for c in shift_cols if c in _BACKBONE_SHIFTS_CANON and c in per_shift_z]
+    backbone_z = sum(per_shift_z[c] for c in bb_cols) / len(bb_cols) if bb_cols else 0.0
 
-            per_shift_mae[col] = (pred_ppm - true_ppm).abs().mean().item()
+    print(f"\n  Backbone-Z MAE (mean z over {len(bb_cols)} backbone nuclei): {backbone_z:.4f}")
+    print("  backbone per-nucleus (ppm | z):")
+    for col in _BACKBONE_SHIFTS_CANON:
+        if col in per_shift_mae:
+            print(f"    {col:10s}  {per_shift_mae[col]:.3f} ppm   {per_shift_z[col]:.3f} z")
 
-    overall = sum(per_shift_mae.values()) / len(per_shift_mae) if per_shift_mae else 0.0
-
-    bb = {k: v for k, v in per_shift_mae.items() if k in BACKBONE_SHIFTS}
-    sc = {k: v for k, v in per_shift_mae.items() if k not in BACKBONE_SHIFTS}
-    bb_mae = sum(bb.values()) / len(bb) if bb else 0.0
-    sc_mae = sum(sc.values()) / len(sc) if sc else 0.0
-
-    print(f"\n  Overall MAE: {overall:.4f}  |  Backbone: {bb_mae:.4f}  |  Sidechain: {sc_mae:.4f}")
-    for col, mae in sorted(per_shift_mae.items(), key=lambda x: x[1]):
-        marker = '*' if col in BACKBONE_SHIFTS else ' '
-        print(f"  {marker} {col:20s}: {mae:.3f}")
-
-    return {'mae': overall, 'per_shift_mae': per_shift_mae}
+    return {'mae': backbone_z,            # back-compat alias (logging)
+            'backbone_z': backbone_z,     # back-compat alias
+            'backbone_z_mae': backbone_z, # canonical checkpoint-selection key
+            'per_shift_mae': per_shift_mae, 'per_shift_z': per_shift_z}
 
 
 # ============================================================================
@@ -282,7 +325,7 @@ def load_base_checkpoint(model, checkpoint_path, device):
 
 
 def freeze_base_encoder(model):
-    """Freeze all base encoder parameters, leave retrieval trainable."""
+    """Freeze base encoder + struct_head, leave cross-residue features trainable (Phase 1)."""
     frozen = 0
     trainable = 0
 
@@ -295,5 +338,5 @@ def freeze_base_encoder(model):
             trainable += 1
 
     print(f"  Frozen: {frozen} parameters (base encoder)")
-    print(f"  Trainable: {trainable} parameters (retrieval)")
+    print(f"  Trainable: {trainable} parameters (cross-residue features)")
     return trainable

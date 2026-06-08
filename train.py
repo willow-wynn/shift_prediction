@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Unified training script for chemical shift prediction.
+Unified training script for chemical shift prediction (structure-only model).
 
 Modes:
-    # Full retrieval model (default)
+    # Structure-only model (default)
     python train.py --data hybrid --fold 1 --epochs 150
 
-    # Structure-only (no retrieval components)
-    python train.py --data hybrid --fold 1 --epochs 200 --structure_only
-
-    # Frozen base encoder, train retrieval only
+    # Phase 1: freeze base encoder + struct_head, train only the cross-residue
+    # distance features on top of an already-trained baseline
     python train.py --data hybrid --fold 1 --epochs 150 \
         --freeze_base --base_checkpoint runs/hybrid_struct_fold1/checkpoints/best.pt
 
@@ -29,12 +27,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import torch
 from torch.amp import GradScaler
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, Subset
 
 from config import (
     DATASET_DIRS, N_ATOM_TYPES, ATOM_TO_IDX,
     LEARNING_RATE, BATCH_SIZE, EPOCHS, HUBER_DELTA,
-    WEIGHT_DECAY, K_SPATIAL_NEIGHBORS, K_RETRIEVED,
+    WEIGHT_DECAY, K_SPATIAL_NEIGHBORS,
     BIG_RUNS_DIR,
 )
 from dataset import CachedRetrievalDataset
@@ -58,11 +56,17 @@ def main():
     parser.add_argument('--data', choices=list(DATASET_DIRS.keys()), required=True)
     parser.add_argument('--fold', type=int, default=1, help='Test fold (1-5)')
     parser.add_argument('--cache_dir', type=str, default=None,
-                        help='Override the cache directory (default: <data_dir>/cache). '
-                             'Use to point at struct_retrieval_v2/cache or other variants.')
+                        help='Override the cache directory (default: <data_dir>/cache).')
     parser.add_argument('--mmap_structural', action='store_true',
                         help='mmap the structural arrays (low RAM, slow on spinning '
                              'disk). Default: load fully into RAM (~5 GB/fold).')
+    parser.add_argument('--protein_subset', type=str, default=None,
+                        help='JSON list of BMRB IDs; restrict train+test to these '
+                             'proteins (matched-set comparisons). Default: use all.')
+    parser.add_argument('--ablate', type=str, default=None,
+                        help='Comma-separated feature group(s) to ZERO OUT at train+eval '
+                             'time (true ablation). Valid: intra, cross, spatial, dssp, ss, '
+                             'bond_geom, residue_type. Default: none.')
 
     # Training
     parser.add_argument('--epochs', type=int, default=EPOCHS)
@@ -72,10 +76,9 @@ def main():
     parser.add_argument('--save_every', type=int, default=25)
 
     # Architecture mode
-    parser.add_argument('--structure_only', action='store_true',
-                        help='Structure-only model (no retrieval components)')
     parser.add_argument('--freeze_base', action='store_true',
-                        help='Freeze base encoder, train retrieval only')
+                        help='Freeze base encoder + struct_head, train only cross-residue '
+                             'distance features (Phase 1)')
     parser.add_argument('--base_checkpoint', type=str, default=None,
                         help='Checkpoint to load base encoder from (for --freeze_base)')
 
@@ -93,16 +96,14 @@ def main():
     # System
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--cache_device', type=str, default='cpu',
-                        help='Device for cache building FAISS queries')
+                        help='Device for cache building')
 
     args = parser.parse_args()
 
-    # Validate flags.
-    # Note: --freeze_base + --structure_only is now allowed (Phase 1). It
-    # freezes the base encoder and the existing struct_head, leaving only
-    # cross_distance_attention + cross_gate trainable. Useful for isolating
-    # the contribution of the new cross-residue distance features on top of
-    # an already-trained struct-only baseline.
+    # Validate flags. --freeze_base (Phase 1) freezes the base encoder and the
+    # existing struct_head, leaving only cross_distance_attention + cross_gate
+    # trainable — isolates the contribution of the cross-residue distance
+    # features on top of an already-trained baseline.
     if args.freeze_base and not args.base_checkpoint and not args.checkpoint:
         print("ERROR: --freeze_base requires --base_checkpoint or --checkpoint")
         sys.exit(1)
@@ -118,15 +119,8 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # Derive mode string
-    if args.freeze_base and args.structure_only:
-        mode = 'frozen_struct_cross'   # Phase 1: only cross_* trainable
-    elif args.structure_only:
-        mode = 'struct'
-    elif args.freeze_base:
-        mode = 'frozen_retrieval'
-    else:
-        mode = 'retrieval'
+    # Derive mode string (model is always structure-only)
+    mode = 'frozen_struct_cross' if args.freeze_base else 'struct'
 
     # Auto-generate run name
     if args.run_name is None:
@@ -160,15 +154,6 @@ def main():
     if missing_folds:
         print(f"\n  Missing caches for folds: {missing_folds}")
         import subprocess
-        # Use dataset-local embeddings/indices if they exist, else fall back to data/
-        embeddings = os.path.join(data_dir, 'struct_embeddings.h5')
-        if not os.path.exists(embeddings):
-            embeddings = os.path.join(data_dir, 'esm_embeddings.h5')
-        if not os.path.exists(embeddings):
-            embeddings = os.path.join('data', 'esm_embeddings.h5')
-        index_dir = os.path.join(data_dir, 'retrieval_indices')
-        if not os.path.isdir(index_dir):
-            index_dir = os.path.join('data', 'retrieval_indices')
         # Note: don't pass --output_dir; let cache builder default to its
         # 1TB-drive location and symlink <data_dir>/cache -> there. train.py
         # reads from <data_dir>/cache afterwards either way.
@@ -178,11 +163,6 @@ def main():
             '--folds', *[str(f) for f in missing_folds],
             '--device', args.cache_device,
         ]
-        # Only pass embeddings/index if they exist (otherwise --no_retrieval)
-        if os.path.exists(embeddings) and os.path.isdir(index_dir):
-            cmd.extend(['--embeddings', embeddings, '--index_dir', index_dir])
-        else:
-            cmd.append('--no_retrieval')
         print(f"  Building cache: {' '.join(cmd)}\n")
         result = subprocess.run(cmd)
         if result.returncode != 0:
@@ -192,6 +172,16 @@ def main():
         print(f"\n  All fold caches exist in {cache_dir}")
 
     # ========== Load datasets ==========
+    # Normalization stats: read from fold_{args.fold}/config.json, which is the
+    # config of the HELD-OUT (test) fold for this run. DEPENDENCY (review #5):
+    # after the 05 fix, each fold_k/config.json carries TRAIN-ONLY stats for
+    # fold k (i.e. computed from all folds EXCEPT k, the leave-one-fold-out
+    # train set). Since args.fold IS the held-out fold here, those train-only
+    # stats are exactly the right ones to apply to train+test for this run — no
+    # test/holdout leakage. We must NOT instead build stats from the test fold's
+    # own data. These stats are applied to BOTH train and test loaders below, so
+    # they MUST be train-only; assert the cache advertises that provenance once
+    # 05 stamps it (see TODO). Until 05 writes the flag, this is a soft check.
     config_path = os.path.join(cache_dir, f'fold_{args.fold}', 'config.json')
     with open(config_path) as f:
         cache_config = json.load(f)
@@ -199,9 +189,25 @@ def main():
     shift_cols = cache_config['shift_cols']
     n_shifts = len(shift_cols)
 
+    # ---- FIXED normalization (2026-06-08): replace per-fold data-derived per-AA
+    # z-norm with citation-grounded constants (random-coil centers + BMRB-filtered
+    # sigma) so normalization has ZERO cross-fold / held-out leakage and is identical
+    # for every fold. Cache global stats are kept (used only to recover raw ppm from
+    # the cache's global-z storage, exact). See fixed_norm.py / project_normalization_redesign.
+    import fixed_norm
+    stats = fixed_norm.build_fixed_per_aa(stats, shift_cols)
+    print("  Normalization: FIXED random-coil + BMRB-filtered sigma (per-AA,nucleus); no data-derived stats")
+
+    # TODO(05): once 05_build_training_cache.py stamps train-only provenance into
+    # config.json (e.g. cache_config['stats_train_only'] = True for fold k), turn
+    # this into a hard assert. For now warn if a global-stats marker is present.
+    if cache_config.get('stats_train_only') is False or cache_config.get('stats_scope') == 'global':
+        print("  WARNING: fold config stats are NOT train-only (global/all-data) -- "
+              "normalization leak (review #5); rebuild caches with per-fold train-only stats.")
+
     test_ds = CachedRetrievalDataset.load(
         os.path.join(cache_dir, f'fold_{args.fold}'),
-        n_shifts, K_RETRIEVED, stats=stats, shift_cols=shift_cols,
+        n_shifts, stats=stats, shift_cols=shift_cols,
         mmap_structural=args.mmap_structural)
 
     train_parts = []
@@ -213,10 +219,20 @@ def main():
             print(f"ERROR: Cache not found at {fold_cache}")
             sys.exit(1)
         train_parts.append(CachedRetrievalDataset.load(
-            fold_cache, n_shifts, K_RETRIEVED, stats=stats, shift_cols=shift_cols,
+            fold_cache, n_shifts, stats=stats, shift_cols=shift_cols,
             mmap_structural=args.mmap_structural))
-    train_ds = ConcatDataset(train_parts)
     n_struct = getattr(train_parts[0], 'n_struct_features', 49)
+    if args.protein_subset:
+        with open(args.protein_subset) as f:
+            _subset = set(str(b) for b in json.load(f))
+        def _filt(ds, name):
+            keep = [i for i in range(len(ds))
+                    if str(ds.idx_to_bmrb.get(str(int(ds.samples[i][0])))) in _subset]
+            print(f"  [protein_subset] {name}: kept {len(keep)}/{len(ds)} samples")
+            return Subset(ds, keep)
+        test_ds = _filt(test_ds, f'test fold{args.fold}')
+        train_parts = [_filt(p, f'train part {k}') for k, p in enumerate(train_parts)]
+    train_ds = ConcatDataset(train_parts)
 
     nw = NUM_WORKERS if device == 'cuda' else 0
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
@@ -233,15 +249,25 @@ def main():
     print(f"  Test:       {len(test_ds):,} samples ({len(test_loader)} batches)")
 
     # ========== Create model ==========
-    use_retrieval = not args.structure_only
     model = create_model(
         n_atom_types=N_ATOM_TYPES,
         n_shifts=n_shifts,
         n_struct=n_struct,
         n_dssp=cache_config.get('n_dssp', 9),
         k_spatial=K_SPATIAL_NEIGHBORS,
-        use_retrieval=use_retrieval,
     ).to(device)
+
+    # ---- Feature ablation: zero a feature group at train+eval time ----
+    _VALID_ABLATE = {'intra', 'cross', 'spatial', 'dssp', 'ss', 'bond_geom', 'residue_type'}
+    if args.ablate:
+        _abl = {a.strip() for a in args.ablate.split(',') if a.strip()}
+        bad = _abl - _VALID_ABLATE
+        if bad:
+            raise SystemExit(f"--ablate: unknown feature(s) {sorted(bad)}; "
+                             f"valid: {sorted(_VALID_ABLATE)}")
+        model.ablate = _abl
+        model.spatial_attention.ablate = _abl
+        print(f"\n  ABLATION (zeroed at train+eval): {sorted(_abl)}")
 
     start_epoch = 1
 
@@ -303,6 +329,14 @@ def main():
 
     # ========== Training loop ==========
     shift_weights = build_shift_weights(shift_cols, device)
+    # Equivalence-weighted + swap-invariant loss structure (methyls/aromatics 1/N;
+    # prochiral pairs scored swap-invariant). Per-residue, indexed by AA code.
+    from config import STANDARD_RESIDUES
+    _gw, _partner = fixed_norm.build_loss_tensors(shift_cols, STANDARD_RESIDUES)
+    group_weight = _gw.to(device)
+    partner = _partner.to(device)
+    print(f"  Loss: equivalence-weighted + swap-invariant prochiral "
+          f"({int((_partner >= 0).any(0).sum())} cols paired in some residue)")
     best_mae = float('inf')
     training_log = []
 
@@ -315,7 +349,8 @@ def main():
         print(f"\nEpoch {epoch}/{args.epochs}")
 
         loss = train_epoch(model, train_loader, optimizer, device, scaler,
-                           delta=args.huber_delta, shift_weights=shift_weights)
+                           delta=args.huber_delta, shift_weights=shift_weights,
+                           group_weight=group_weight, partner=partner)
         scheduler.step()
 
         if device == 'cuda':
@@ -341,32 +376,52 @@ def main():
                 'stats': stats,
                 'shift_cols': shift_cols,
                 'atom_to_idx': ATOM_TO_IDX,
-                'k_retrieved': K_RETRIEVED,
                 'dataset': args.data,
                 'mode': mode,
             }, path)
             print(f"  Saved: {path}")
 
+        # Always-current checkpoint (every epoch) for fine-grained mid-train resume
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'epoch': epoch,
+            'train_loss': loss,
+            'stats': stats,
+            'shift_cols': shift_cols,
+            'atom_to_idx': ATOM_TO_IDX,
+            'dataset': args.data,
+            'mode': mode,
+        }, os.path.join(ckpt_dir, 'last.pt'))
+
         # Evaluate
         if epoch % 5 == 0 or epoch == args.epochs:
             results = evaluate(model, test_loader, device, stats, shift_cols,
                                args.huber_delta)
+            # Checkpoint-selection objective = backbone-z-MAE (mean z over the 6
+            # backbone nuclei), matching the canonical tree. Do NOT select on an
+            # all-49 raw-ppm metric (dominated by wide-range sidechain carbons,
+            # incomparable to canonical CV numbers). 'mae' is kept as a logging
+            # alias of the same value for back-compat.
+            select_metric = results['backbone_z_mae']
             epoch_log['mae'] = results['mae']
+            epoch_log['backbone_z_mae'] = select_metric
             epoch_log['per_shift_mae'] = results['per_shift_mae']
 
-            if results['mae'] < best_mae:
-                best_mae = results['mae']
+            if select_metric < best_mae:
+                best_mae = select_metric
                 best_path = os.path.join(ckpt_dir, 'best.pt')
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'epoch': epoch,
                     'mae': results['mae'],
+                    'backbone_z_mae': select_metric,
                     'per_shift_mae': results['per_shift_mae'],
                     'stats': stats,
                     'shift_cols': shift_cols,
                     'atom_to_idx': ATOM_TO_IDX,
-                    'k_retrieved': K_RETRIEVED,
-                    'dataset': args.data,
+                        'dataset': args.data,
                     'mode': mode,
                 }, best_path)
                 print(f"  *** New best: {best_mae:.4f} ***")
